@@ -443,7 +443,7 @@ def status():
         "last_ts": st.get("last_ts"), "guard_active": rc == 0,
         "outages": outages(st, c),
         "features": {
-            "split": "split-light" in tags,
+            "split": any((t or "").startswith("split-") for t in tags),
             "split_check": split_check(),
             "dns_cache": any(o.get("protocol") == "dns" for o in cfg.get("outbounds", [])),
             "ad_block": any(r.get("domain") == ["geosite:category-ads-all"] for r in rules),
@@ -772,9 +772,6 @@ def lint():
     if ir and "dns-upstream" in rules and max(ir) > rules.index("dns-upstream"):
         add("bad", "ترتیب قانون‌های مسیریابی",
             "قانون‌های ir-direct باید بالاتر از dns-upstream باشند، وگرنه DNS سایت‌های ایرانی هم از تانل می‌رود.")
-    if "split-light" in rules and "split-heavy" in rules and rules.index("split-heavy") > rules.index("split-light"):
-        add("warn", "ترتیب تقسیم ترافیک",
-            "قانون split-heavy باید قبل از split-light باشد وگرنه دانلودهای سنگین هم روی Mux می‌افتند.")
     outs = {o.get("tag", "").lower() for o in cfg.get("outbounds", [])}
     orphan_probes = [i["tag"] for i in cfg.get("inbounds", [])
                      if (i.get("tag") or "").startswith("guard-") and i["tag"][6:] not in outs]
@@ -1011,8 +1008,8 @@ def action(name, body):
             return {"ok": False, "msg": "دیتابیسی داخل این بکاپ نیست"}
         make_backup()                                  # never overwrite without a way back
         shutil.copy2(chosen, DB)
-        rc, out = run("systemctl", "restart", "x-ui", timeout=120)
-        run("config-guard", "--save", timeout=30)     # the restored config is the one to keep
+        run("config-guard", "--save", timeout=30)     # the restored config is the one to keep - saved
+        rc, out = run("systemctl", "restart", "x-ui", timeout=120)   # before x-ui rewrites config.json
         return {"ok": rc == 0, "msg": "برگردانده شد: " + got}
     if name == "prune-backups":
         keep = {b["name"] for b in backups()[:10]}
@@ -1047,6 +1044,27 @@ def action(name, body):
         got = str(body.get("name") or "").strip()
         r = jrun_any("xui-path", "remove", got, "--json", timeout=180)
         return r or {"ok": False, "msg": "حذف نشد"}
+    if name == "split-set":                     # one exit's own settings, then build or repair
+        _split_cache[0] = 0
+        grp = str(body.get("group") or "")
+        if grp not in {g["out"] for g in (jrun("xui-split", "groups", "--json", timeout=30) or [])}:
+            return {"ok": False, "msg": "این خروجی پیدا نشد"}
+        cmd = ["xui-split", "set", grp, "--json"]
+        if "on" in body:
+            cmd.append("--on" if body.get("on") else "--off")
+        for key, flag in (("concurrency", "--concurrency"), ("xudp", "--xudp")):
+            if body.get(key) is not None:
+                cmd += [flag, str(int(body[key]))]
+        if body.get("label") is not None:
+            cmd += ["--label", str(body["label"])[:40]]
+        r = jrun_any(*cmd, timeout=30)
+        if not r or not r.get("ok"):
+            return r or {"ok": False, "msg": "ذخیره نشد"}
+        if "on" in body:          # rules change: the whole split is built again (restarts x-ui)
+            rc, out = run("xui-split", "apply", "--no-tg-backup", timeout=180)
+            _split_cache[0] = 0
+            return {"ok": rc == 0, "msg": out.splitlines()[-2] if rc == 0 and len(out.splitlines()) > 1 else out[-200:]}
+        return jrun_any("xui-split", "fix", "--json", "--no-tg-backup", timeout=180) or r   # mux settings: live
     if name == "split-fix":
         _split_cache[0] = 0
         return jrun_any("xui-split", "fix", "--json", "--no-tg-backup", timeout=180) or {"ok": False, "msg": "انجام نشد"}

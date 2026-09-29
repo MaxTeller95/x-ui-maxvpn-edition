@@ -102,6 +102,10 @@
   .tc button:hover { color: var(--accent); }
   .tc.add { border-style: dashed; padding: 2px 10px; color: var(--muted); cursor: pointer; }
   .tc.add:hover { border-color: var(--accent); color: var(--accent); }
+  .sg { padding: 6px 0; border-top: 1px solid var(--line); }
+  .sg .th { margin-bottom: 2px; }
+  .sg-label { width: 110px; padding: 2px 8px; font-size: 12px; }
+  .sg select { padding: 2px 6px; font-size: 12px; }
   .tf { padding: 6px 0; border-bottom: 1px solid var(--line); }
   .tf:last-child { border-bottom: 0; }
   .tf .th { margin-bottom: 2px; }
@@ -566,11 +570,25 @@ function renderStatus(s) {
   $("#f-tg").innerHTML = chip(s.features.tg_backup);
   if (!$("#ads").disabled) $("#ads").checked = !!s.features.ad_block;
   const sc = s.features.split_check;
-  $("#split-state").innerHTML = !sc || !sc.on ? ""
-    : sc.problems && sc.problems.length
-      ? `<span class="chip bad">mux کار نمی‌کند</span> <span class="muted">${esc(sc.problems[0].msg)}</span>
-         <button data-fix="split-fix" style="margin-top:4px">تعمیر خودکار</button>`
-      : `<span class="chip ok">mux روی ${esc(sc.mux)} فعال</span>${(sc.notes || []).length ? ` <span class="muted">${esc(sc.notes[0])}</span>` : ""}`;
+  const general = sc ? (sc.problems || []).filter((p) => !p.group) : [];
+  $("#split-state").innerHTML = !sc ? "" : (general.length ? `<div class="muted">${esc(general[0].msg)}
+      <button data-fix="split-fix">بساز</button></div>` : "")
+    + (sc.groups || []).map((g) => {
+      const st = !g.enabled ? '<span class="chip off">خاموش</span>'
+        : g.problems.length ? `<span class="chip bad">${g.built ? "mux کار نمی‌کند" : "ساخته نشده"}</span>`
+        : g.light === "direct" ? '<span class="chip warn">موقتاً بدون mux</span>'
+        : '<span class="chip ok">mux فعال</span>';
+      return `<div class="sg"><div class="th"><b dir="ltr">${esc(g.out)}</b>
+          <input class="sg-label" data-sglabel="${esc(g.out)}" value="${esc(g.label)}" placeholder="برچسب، مثل آلمان">
+          ${st}
+          <label class="mini"><input type="checkbox" data-sgon="${esc(g.out)}" ${g.enabled ? "checked" : ""}>فعال</label>
+          <select data-sgconc="${esc(g.out)}" title="concurrency: چند اتصال روی یک اتصال تانل">${[2, 4, 8, 16].map((n) =>
+            `<option value="${n}" ${+g.concurrency === n ? "selected" : ""}>mux ${n}</option>`).join("")}</select></div>
+        <div class="muted sm"><span dir="ltr">${esc(g.mux)}</span> · ${esc(g.inbounds.join("، "))}
+          ${g.problems.length ? " · " + esc(g.problems[0].msg) : g.note ? " · " + esc(g.note) : ""}</div></div>`;
+    }).join("")
+    + ((sc.problems || []).some((p) => p.group && p.hot)
+      ? '<button data-fix="split-fix" style="margin-top:4px">تعمیر خودکار</button>' : "");
   const d = s.cert.days;
   $("#cert-days").innerHTML = d == null ? "—" : `<span style="color:var(--${d < 20 ? "bad" : d < 35 ? "warn" : "ok"})">${d} روز</span>`;
   $("#cert-note").textContent = d == null ? "" : (d < 20 ? "وقت تمدیده: رکورد TXT جدید لازمه." : "تا انقضا مونده. ۲۰ روز قبلش روی تلگرام هشدار می‌گیرید.");
@@ -1002,7 +1020,25 @@ $("#mux-run").onclick = async () => {
   await post("job", { job: "mux-bench" });
   muxPoll();
 };
-document.addEventListener("change", (e) => {
+document.addEventListener("change", async (e) => {
+  const sg = e.target.closest("[data-sgon],[data-sgconc],[data-sglabel]");
+  if (sg) {
+    const group = sg.dataset.sgon || sg.dataset.sgconc || sg.dataset.sglabel;
+    const body = { group };
+    if (sg.dataset.sgon) {
+      if (!confirm(`تقسیم ترافیک برای ${group} ${sg.checked ? "روشن" : "خاموش"} بشه؟ قانون‌ها دوباره ساخته می‌شن و x-ui ری‌استارت می‌شه (چند ثانیه قطعی).`)) {
+        sg.checked = !sg.checked; return;
+      }
+      body.on = sg.checked;
+    } else if (sg.dataset.sgconc) body.concurrency = +sg.value;     // only the mux copy: applied live
+    else body.label = sg.value.trim();
+    sg.disabled = true; toast("در حال اعمال...");
+    const r = await post("split-set", body);
+    sg.disabled = false;
+    toast(r.ok ? (r.msg || "انجام شد") : "خطا: " + (r.msg || ""));
+    loadStatus();
+    return;
+  }
   const t = e.target.closest("[data-tauto]");
   if (!t) return;
   const r0 = TN.find((x) => x.name === t.dataset.tauto);

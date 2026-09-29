@@ -113,10 +113,20 @@ download would share a connection with other people's chats. So `xui-split` send
 The hub's busiest hour averaged 26 Mbit/s, far below the mux cap. Run
 `mux-bench <OUTBOUND>` to check your own link before applying.
 
+**One split per exit.** A hub can send users to several servers in several countries. Every
+outbound a catch-all rule sends users to is a group of its own, with its own `<OUT>-mux`, its
+own rules (`split-<out>-udp/heavy/telegram` -> `<OUT>`, `split-<out>-light` -> `<OUT>-mux`,
+before `main-<out>`), its own probe port `guard-<out>-mux` and its own settings in
+`/etc/xui-split.json` (on/off, concurrency, xudp, a label such as the country, extra heavy
+domains). Other routes to the same server are not groups. tunnel-guard watches every mux on
+its own and moves only that exit's light traffic when its mux stalls.
+
 ```bash
 xui-split                 # test (default)
 xui-split apply           # also turns on the panel's daily Telegram backup
 xui-split remove
+xui-split groups                              # the exits, their inbounds and settings
+xui-split set BACKUP --label TR --concurrency 8   # one exit; then fix (mux only) or apply (on/off)
 ```
 
 `xui-split check` tells whether the split really works: `<MAIN>-mux` exists, has mux on,

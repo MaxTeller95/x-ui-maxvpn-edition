@@ -185,7 +185,7 @@ def main():
     if not any_missing(m):
         if now["tags"] != base["tags"] or now["outbounds"] != base["outbounds"]:
             save_baseline(t)                          # new pieces are fine, absorb them
-        if fix and "split-light" in now["tags"] and shutil.which("xui-split"):
+        if fix and any(t.startswith("split-") for t in now["tags"]) and shutil.which("xui-split"):
             # the panel's own editor can save the mux copy without its mux block: the rule then
             # still sends light traffic there, only without mux. Repaired live, never restarted.
             r = subprocess.run(["xui-split", "fix", "--auto", "--json"], capture_output=True, text=True, timeout=90)

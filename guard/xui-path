@@ -165,9 +165,11 @@ def apply(t, note):
     c.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
     c.commit()
     c.close()
+    # the new normal, saved before x-ui rewrites config.json: config-guard reacts to that write
+    # and would otherwise put a removed path straight back
+    subprocess.run(["config-guard", "--save"], capture_output=True)
     subprocess.run(["systemctl", "restart", "x-ui"], check=False)
     time.sleep(7)
-    subprocess.run(["config-guard", "--save"], capture_output=True)   # this is the new normal
     return backup
 
 
@@ -336,6 +338,7 @@ def prune(as_json):
     db.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
     db.commit()
     db.close()
+    subprocess.run(["config-guard", "--save"], capture_output=True)   # before config.json is written
     live = json.load(open(CFG))                 # take them out of the running Xray too, no restart
     api = next(("%s:%s" % (i.get("listen") or "127.0.0.1", i["port"]) for i in live.get("inbounds", [])
                 if i.get("tag") == (live.get("api") or {}).get("tag", "api")), "127.0.0.1:62789")
@@ -350,7 +353,6 @@ def prune(as_json):
         c["paths"].pop(n, None)
     c["backups"] = [b for b in c.get("backups", []) if b.lower() in outs]
     write_conf(c)
-    subprocess.run(["config-guard", "--save"], capture_output=True)
     gone = dead + ["guard:" + n for n in ghost]
     msg = "پاک شد: " + "، ".join(gone)
     print(json.dumps({"ok": True, "msg": msg, "removed": gone, "backup": backup}, ensure_ascii=False)

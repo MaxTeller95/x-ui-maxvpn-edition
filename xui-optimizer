@@ -162,10 +162,10 @@ def adblock_only(db_path, on, restart=True, dry=False):
         db.execute("update inbounds set sniffing=? where tag=?", (json.dumps(SNIFF, indent=2), tag))
     db.commit()
     db.close()
+    accept_in_config_guard()                             # before x-ui rewrites config.json
     if restart:                                          # position matters, and the API only appends
         subprocess.run(["systemctl", "restart", "x-ui"], check=True)
         time.sleep(5)
-    accept_in_config_guard()
     print(("ad block on for: " + ", ".join(sorted(abroad))) if on else "ad block off")
     print(f"backup in {backup}")
 

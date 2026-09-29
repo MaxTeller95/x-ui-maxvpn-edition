@@ -39,13 +39,12 @@ HANDSHAKE_STALE = C.get("handshake_stale_sec", 180)
 RESTART_COOLDOWN = C.get("restart_cooldown_sec", 600)
 REPORT_HOUR_UTC = C.get("report_hour_utc", 5)
 CERT, CERT_WARN_DAYS = C.get("cert"), C.get("cert_warn_days", 20)
-RESTORE = ["dns-upstream", "split-udp", "split-heavy", "split-telegram", "split-light",
-           f"main-{PRIMARY.lower()}"]
+LEGACY_SPLIT = ["split-udp", "split-heavy", "split-telegram", "split-light"]   # xui-split's one-group names
 
-# A "<name>-mux" path is watched but never failed over to: it is the same tunnel with mux on,
-# carrying the light traffic. When it stalls, only the light rule moves (see light_bypass).
-MUX = C.get("mux_path") or next((n for n in PATHS if n.lower().endswith("-mux")), None)
-MUX_FALL = C.get("mux_fallback") or (MUX.rsplit("-", 1)[0] if MUX else None)
+# Every "<name>-mux" path is watched but never failed over to: it is the same tunnel as <name>
+# with mux on, carrying that exit's light traffic (xui-split makes one per exit). When one
+# stalls, only that exit's light rule moves (see light_bypass); the other exits are untouched.
+MUXES = [n for n in PATHS if n.lower().endswith("-mux") and n[:-4] in PATHS]
 
 # Probe ports come from the live config (inbounds "guard-<name>" made by xui-split).
 _live = {i.get("tag"): i.get("port") for i in json.load(open(CFG)).get("inbounds", [])}
@@ -177,6 +176,27 @@ def rm_rules(tags):
     run(XRAY, "api", "rmrules", f"--server={API}", *tags)
 
 
+def group_tags(out, dns=False):
+    """The rules one exit is made of, as xui-split tagged them: its split rules and its
+    catch-all (plus the DNS cache's upstream when the primary moves)."""
+    g = out.lower()
+    tags = [f"split-{g}-udp", f"split-{g}-heavy", f"split-{g}-telegram", f"split-{g}-light", f"main-{g}"]
+    if out == PRIMARY:
+        tags += LEGACY_SPLIT
+    return (["dns-upstream"] if dns else []) + tags
+
+
+def in_config_order(tags):
+    """Those rules, in the order config.json has them: re-added at the end they only work in
+    this order (split rules before the catch-all)."""
+    rules = json.load(open(CFG))["routing"]["rules"]
+    want = set(tags)
+    return [r for r in rules if r.get("ruleTag") in want]
+
+
+RESTORE = group_tags(PRIMARY, dns=True)
+
+
 def failover(target):
     main = rules_from_config([f"main-{PRIMARY.lower()}"])
     if not main:
@@ -193,23 +213,29 @@ def failover(target):
 
 def failback():
     rm_rules(["fo-dns", "fo-main"])
-    ok = add_rules(rules_from_config(RESTORE))
+    ok = add_rules(in_config_order(RESTORE))
     log(f"failback to {PRIMARY}: {'ok' if ok else 'FAILED'}")
     return ok
 
 
-def light_bypass():
-    """Light traffic stops going through the mux outbound: with split-light gone it falls
-    through to the main rule, which is the same tunnel without mux."""
-    rm_rules(["split-light"])
-    log(f"light traffic moved off {MUX} to {MUX_FALL}")
+def light_tags(mux):
+    base = mux[:-4]
+    return [f"split-{base.lower()}-light"] + (["split-light"] if base == PRIMARY else [])
+
+
+def light_bypass(mux):
+    """This exit's light traffic stops going through its mux copy: with its light rule gone it
+    falls through to the exit's catch-all, which is the same tunnel without mux."""
+    rm_rules(light_tags(mux))
+    log(f"light traffic moved off {mux} to {mux[:-4]}")
     return True
 
 
-def light_restore():
-    rm_rules(RESTORE)
-    ok = add_rules(rules_from_config(RESTORE))
-    log(f"light traffic back on {MUX}: {'ok' if ok else 'FAILED'}")
+def light_restore(mux):
+    tags = group_tags(mux[:-4])
+    rm_rules(tags)
+    ok = add_rules(in_config_order(tags))
+    log(f"light traffic back on {mux}: {'ok' if ok else 'FAILED'}")
     return ok
 
 
@@ -301,7 +327,11 @@ def main():
         st = {}
     st.setdefault("fails", {}), st.setdefault("oks", {}), st.setdefault("restart", {})
     st.setdefault("outages", []), st.setdefault("down", {})
-    st.setdefault("light", "mux"), st.setdefault("hopwait", {}), st.setdefault("restart_told", {})
+    st.setdefault("hopwait", {}), st.setdefault("restart_told", {})
+    st.setdefault("lights", {})
+    if isinstance(st.get("light"), str):              # one-mux state from before: it was the primary's
+        st["lights"].setdefault(PRIMARY + "-mux", st.pop("light"))
+    st["lights"] = {m: v for m, v in st["lights"].items() if m in MUXES}
     if "on" not in st:  # older state files had a single backup
         st["on"] = BACKUPS[0] if st.get("failed_over") else PRIMARY
     forget_removed(st)
@@ -377,21 +407,27 @@ def main():
     # The mux path carries the light traffic. It can stall on its own while the tunnel under it
     # is perfectly healthy - one stuck carrier connection freezes every stream riding it - so it
     # is watched separately and only the light rule moves.
-    if MUX in res and st["on"] == PRIMARY:
-        if st["light"] == "mux" and st["fails"][MUX] >= FAILS_TO_SWITCH:
-            if light_bypass():
-                st["light"] = "direct"
-                send(f"⚠️ مسیر {MUX} جواب نمی‌دهد — ترافیک سبک "
-                     f"فعلاً از {MUX_FALL} می‌رود (بدون قطعی).")
-        elif st["light"] == "direct" and st["oks"][MUX] >= OKS_TO_RETURN:
-            if light_restore():
-                st["light"] = "mux"
-                send(f"✅ مسیر {MUX} برگشت — ترافیک سبک دوباره روی mux.")
-        elif st["light"] == "direct" and "split-light" in live_tags():
-            log("split-light came back after an Xray restart - moving light traffic off mux again")
-            light_bypass()
-    elif MUX and st["on"] != PRIMARY:
-        st["light"] = "mux"   # a full failover drops split-light anyway; decide again after failback
+    # Each exit's mux copy on its own: the primary's only while users are on the primary (a
+    # failover takes its split rules out anyway), every other exit's always.
+    for mux in MUXES:
+        if mux not in res:
+            continue
+        if mux[:-4] == PRIMARY and st["on"] != PRIMARY:
+            st["lights"][mux] = "mux"     # decide again after failback
+            continue
+        state = st["lights"].get(mux, "mux")
+        if state == "mux" and st["fails"][mux] >= FAILS_TO_SWITCH:
+            if light_bypass(mux):
+                st["lights"][mux] = "direct"
+                send(f"⚠️ مسیر {mux} جواب نمی‌دهد — ترافیک سبک این خروجی "
+                     f"فعلاً از {mux[:-4]} می‌رود (بدون قطعی).")
+        elif state == "direct" and st["oks"][mux] >= OKS_TO_RETURN:
+            if light_restore(mux):
+                st["lights"][mux] = "mux"
+                send(f"✅ مسیر {mux} برگشت — ترافیک سبک دوباره روی mux.")
+        elif state == "direct" and any(t in live_tags() for t in light_tags(mux)):
+            log(f"{light_tags(mux)[0]} came back after an Xray restart - moving light traffic off {mux} again")
+            light_bypass(mux)
 
     # Failover / failback of users' traffic.
     healthy = [b for b in BACKUPS if res[b]["ok"]]
