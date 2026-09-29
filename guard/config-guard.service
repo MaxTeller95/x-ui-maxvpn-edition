@@ -1,0 +1,7 @@
+[Unit]
+Description=Put back the Xray routing this hub depends on if the panel drops it
+After=x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/config-guard --fix

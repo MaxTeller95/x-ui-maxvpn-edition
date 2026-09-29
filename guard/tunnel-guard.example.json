@@ -1,0 +1,29 @@
+{
+  "primary": "MAIN",
+  "backups": [
+    "BACKUP",
+    "BACKUP-tcp"
+  ],
+  "paths": {
+    "MAIN": {
+      "iface": "awg0",
+      "peer": "10.77.1.1",
+      "probe": "tunnel1"
+    },
+    "BACKUP": {
+      "iface": "awg1",
+      "peer": "10.77.2.1",
+      "probe": "tunnel2"
+    },
+    "BACKUP-tcp": {
+      "peer": "203.0.113.10"
+    }
+  },
+  "fails_to_switch": 2,
+  "oks_to_return": 3,
+  "handshake_stale_sec": 180,
+  "restart_cooldown_sec": 600,
+  "report_hour_utc": 5,
+  "cert": "/root/cert/example.com/fullchain.pem",
+  "cert_warn_days": 20
+}

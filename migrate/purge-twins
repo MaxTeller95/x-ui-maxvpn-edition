@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Remove every twin for good: from the clients table, from the inbound links, from the
+traffic table AND from the legacy client list still stored inside each inbound (that copy
+is what the panel re-imported from, bringing the twins back).
+
+Each original keeps the twin's traffic and gains the twin's inbound, so it stays one
+client on several inbounds with one quota, one expiry and one usage counter.
+
+    xui-purge-twins            show what would happen
+    xui-purge-twins apply      back up, clean both places, restart x-ui
+"""
+import json, os, shutil, sqlite3, subprocess, sys, time
+
+DB = "/etc/x-ui/x-ui.db"
+MARK = "twin-of:"
+SUFFIX = ("-443", "-80", "-tls", "-ws", "-2087", "-2053")
+apply = sys.argv[1:] == ["apply"]
+db = sqlite3.connect(DB)
+tags = dict(db.execute("select id, tag from inbounds"))
+
+
+def is_twin(email, comment):
+    return str(comment or "").startswith(MARK) or (
+        str(email or "").endswith(SUFFIX) and any(
+            db.execute("select 1 from clients where email=?", (str(email).rsplit("-", 1)[0],)).fetchone()))
+
+
+# 1. twins in the clients table
+rows = db.execute("select id, email, comment from clients").fetchall()
+twins = [(cid, em, (cm or "")[len(MARK):] if str(cm or "").startswith(MARK) else str(em).rsplit("-", 1)[0])
+         for cid, em, cm in rows if is_twin(em, cm)]
+# 2. twins inside the legacy per-inbound client lists
+legacy = {}
+for tag, s in db.execute("select tag, settings from inbounds"):
+    st = json.loads(s)
+    bad = [c for c in st.get("clients", []) if is_twin(c.get("email"), c.get("comment"))]
+    if bad:
+        legacy[tag] = (st, bad)
+
+print(f"twin clients: {len(twins)} | inbounds whose legacy list still holds twins: "
+      + ", ".join(f"{t} ({len(b)})" for t, (_, b) in legacy.items()))
+plan = []
+for cid, email, orig in twins:
+    o = db.execute("select id from clients where email=?", (orig,)).fetchone()
+    inb = [r[0] for r in db.execute("select inbound_id from client_inbounds where client_id=?", (cid,))]
+    o_inb = [r[0] for r in db.execute("select inbound_id from client_inbounds where client_id=?", (o[0],))] if o else []
+    tr = db.execute("select up, down, all_time from client_traffics where email=?", (email,)).fetchone() or (0, 0, 0)
+    plan.append({"cid": cid, "email": email, "orig": orig, "oid": o[0] if o else None,
+                 "add": [i for i in inb if i not in o_inb], "tr": tr})
+gains = [p for p in plan if p["add"]]
+print(f"originals that gain an inbound: {len(gains)} | twins with traffic to move: {sum(1 for p in plan if p['tr'][0] or p['tr'][1])}"
+      f" | twins with no original left: {sum(1 for p in plan if not p['oid'])}")
+for p in plan[:4]:
+    print(f"   {p['orig']:<22} <- {p['email']:<26} adds {[tags.get(i) for i in p['add']] or '-'}")
+if not apply:
+    print("\nshow only - nothing changed. Run with 'apply' to do it.")
+    sys.exit(0)
+
+backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+os.makedirs(backup)
+shutil.copy2(DB, backup)
+now = int(time.time() * 1000)
+db.execute("begin immediate")
+for p in plan:
+    up, down, all_time = p["tr"]
+    if p["oid"] and (up or down):
+        db.execute("update client_traffics set up=up+?, down=down+?, all_time=all_time+? where email=?",
+                   (up, down, all_time or 0, p["orig"]))
+    for iid in p["add"]:
+        db.execute("insert into client_inbounds (client_id, inbound_id, flow_override, created_at) values (?,?,'',?)",
+                   (p["oid"], iid, now))
+    db.execute("delete from client_inbounds where client_id=?", (p["cid"],))
+    db.execute("delete from clients where id=?", (p["cid"],))
+    db.execute("delete from client_traffics where email=?", (p["email"],))
+for tag, (st, bad) in legacy.items():
+    st["clients"] = [c for c in st.get("clients", []) if c not in bad]
+    db.execute("update inbounds set settings=? where tag=?", (json.dumps(st, indent=2), tag))
+db.execute("delete from client_traffics where email not in (select email from clients)")
+db.commit()
+
+subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+time.sleep(9)
+state = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
+left = db.execute("select count(*) from clients where email like '%-443' or email like '%-tls'"
+                  " or email like '%-ws' or email like '%-2087' or comment like ?", (MARK + "%",)).fetchone()[0]
+legacy_left = sum(1 for _, s in db.execute("select tag, settings from inbounds")
+                  for c in json.loads(s).get("clients", []) if is_twin(c.get("email"), c.get("comment")))
+live = json.load(open("/usr/local/x-ui/bin/config.json"))
+live_twins = sum(1 for i in live["inbounds"] for c in i.get("settings", {}).get("clients", [])
+                 if str(c.get("email", "")).endswith(SUFFIX))
+print(f"\ndone. backup {backup} | x-ui {state}")
+print(f"clients: {db.execute('select count(*) from clients').fetchone()[0]}"
+      f" | traffic rows: {db.execute('select count(*) from client_traffics').fetchone()[0]}"
+      f" | on several inbounds: {db.execute('select count(*) from (select client_id from client_inbounds group by client_id having count(*)>1)').fetchone()[0]}")
+print(f"twins left: clients={left} legacy={legacy_left} live={live_twins}")
+print(f"  undo: cp {backup}/x-ui.db {DB} && x-ui restart")

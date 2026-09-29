@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""awg-port - change an AmneziaWG interface's UDP port. Runs on the server abroad.
+
+The hub reaches this through SSH with a forced command, so the key it holds can
+do this and nothing else:
+
+    command="/usr/local/sbin/awg-port",restrict ssh-ed25519 AAAA... hub-awg-hop
+
+With that in place the hub can move the tunnel to a new port when the current
+one gets filtered, but a stolen key cannot get a shell, forward a port, read a
+file or touch anything else on the server.
+
+    awg-port get                 # the port it is on now
+    awg-port port 28731          # move awg0 to 28731
+    awg-port port 28731 awg1     # a different interface
+
+Only interfaces listed in /etc/awg-port.conf (one per line, default "awg0") may
+be touched, and only ports in 1024-65535 that nothing else is listening on.
+"""
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+CONF_DIR = "/etc/amnezia/amneziawg"
+ALLOW = "/etc/awg-port.conf"
+LOW, HIGH = 1024, 65535
+
+
+def die(msg):
+    print("awg-port: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def allowed():
+    try:
+        names = [l.strip() for l in open(ALLOW) if l.strip() and not l.startswith("#")]
+    except FileNotFoundError:
+        names = []
+    return names or ["awg0"]
+
+
+def conf_of(iface):
+    p = os.path.join(CONF_DIR, iface + ".conf")
+    if not os.path.exists(p):
+        p = "/etc/wireguard/%s.conf" % iface
+    if not os.path.exists(p):
+        die("no config for %s" % iface)
+    return p
+
+
+def current(iface):
+    for line in open(conf_of(iface)):
+        m = re.match(r"\s*ListenPort\s*=\s*(\d+)", line)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def free(port, iface):
+    """Free means: nothing else is bound to it. Our own interface does not count."""
+    if port == current(iface):
+        return True
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def set_port(iface, port):
+    path = conf_of(iface)
+    shutil.copy2(path, "%s.bak-%s" % (path, time.strftime("%Y%m%d-%H%M%S")))
+    out, seen = [], False
+    for line in open(path):
+        if re.match(r"\s*ListenPort\s*=", line):
+            out.append("ListenPort = %d\n" % port)
+            seen = True
+        else:
+            out.append(line)
+    if not seen:                                  # no ListenPort line yet: add one
+        for i, line in enumerate(out):
+            if line.strip().lower().startswith("[interface]"):
+                out.insert(i + 1, "ListenPort = %d\n" % port)
+                break
+    open(path, "w").writelines(out)
+    os.chmod(path, 0o600)
+    r = subprocess.run(["systemctl", "restart", "awg-quick@" + iface],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        die("restart failed: " + (r.stderr or r.stdout).strip()[:200])
+
+
+def main():
+    # the forced command hands the request over in SSH_ORIGINAL_COMMAND
+    argv = sys.argv[1:] or (os.environ.get("SSH_ORIGINAL_COMMAND", "").split())
+    if not argv:
+        die("usage: get | port <number> [iface]")
+    iface = argv[2] if len(argv) > 2 else "awg0"
+    if iface not in allowed():
+        die("%s is not in %s" % (iface, ALLOW))
+
+    if argv[0] == "get":
+        print(json.dumps({"iface": iface, "port": current(iface)}))
+        return
+    if argv[0] != "port" or len(argv) < 2 or not argv[1].isdigit():
+        die("usage: get | port <number> [iface]")
+
+    port = int(argv[1])
+    if not LOW <= port <= HIGH:
+        die("port out of range")
+    if not free(port, iface):
+        die("port %d is in use" % port)
+    was = current(iface)
+    set_port(iface, port)
+    print(json.dumps({"iface": iface, "was": was, "port": current(iface), "ok": True}))
+
+
+if __name__ == "__main__":
+    main()

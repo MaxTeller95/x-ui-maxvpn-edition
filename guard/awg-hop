@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""awg-hop - move a tunnel to a different UDP port when its current one is filtered.
+
+What this is for: the tunnel stops handshaking while the link itself is fine.
+Both daemons are healthy, keys match, the endpoint is right, and UDP to the same
+server on any other port works in both directions - only the flow on the tunnel's
+own port is dropped. Restarting the interface does not help, because the port is
+what was identified. Moving to a new port brings it straight back, until that one
+is found too. This does the moving.
+
+    awg-hop MAIN              # pick a new port and move both ends
+    awg-hop MAIN --dry-run    # say what it would do
+    awg-hop MAIN --port 28731 # a port you chose yourself
+    awg-hop --status
+
+Both ends have to agree, so the far end is changed first, over SSH, through a
+forced command that can only set the port (see guard/awg-port). If the new port
+does not handshake either, it tries the next one, and if none of them work it
+puts the original back on both sides - a filtered tunnel is bad, a tunnel whose
+two ends disagree is worse.
+
+Config, per path, in /etc/tunnel-guard.json:
+
+    "MAIN": {"iface": "awg0", "peer": "10.0.10.1",
+                "hop": {"ssh": "root@203.0.113.10", "key": "/root/.ssh/awg-hop"}}
+
+`ports` (a list) and `tries` may be added; the defaults are a random high port
+and 3 attempts. Interface names are per-machine - if the far end calls its own
+side of this tunnel something other than `iface` (the hub's name for it), add
+`"riface"` to the hop block, matching what is in that server's /etc/awg-port.conf.
+"""
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+CONF = os.environ.get("TUNNEL_GUARD_CONF", "/etc/tunnel-guard.json")
+CONF_DIR = "/etc/amnezia/amneziawg"
+STATE = "/var/lib/tunnel-guard/hops.json"
+SAY = "/usr/local/sbin/tunnel-guard"      # reuse the guard's Telegram delivery
+WAIT = 25                                 # seconds to wait for a handshake
+COOLDOWN = 1800                           # never hop the same path twice within this
+
+
+def die(msg):
+    print("awg-hop: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(*cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=kw.get("timeout", 60))
+
+
+def say(text):
+    if os.path.exists(SAY):
+        run(SAY, "--say", text, timeout=40)
+    print(text)
+
+
+def conf_path(iface):
+    p = os.path.join(CONF_DIR, iface + ".conf")
+    return p if os.path.exists(p) else "/etc/wireguard/%s.conf" % iface
+
+
+def read_local(iface):
+    """The port we listen on and the endpoint we dial, from the interface config."""
+    port, ep = None, None
+    for line in open(conf_path(iface)):
+        m = re.match(r"\s*ListenPort\s*=\s*(\d+)", line)
+        if m:
+            port = int(m.group(1))
+        m = re.match(r"\s*Endpoint\s*=\s*([^\s:]+):(\d+)", line)
+        if m:
+            ep = (m.group(1), int(m.group(2)))
+    return port, ep
+
+
+def write_local(iface, port, ep_port):
+    path = conf_path(iface)
+    shutil.copy2(path, "%s.bak-%s" % (path, time.strftime("%Y%m%d-%H%M%S")))
+    out = []
+    for line in open(path):
+        if re.match(r"\s*ListenPort\s*=", line):
+            out.append("ListenPort = %d\n" % port)
+        elif re.match(r"\s*Endpoint\s*=", line):
+            out.append(re.sub(r":(\d+)\s*$", ":%d" % ep_port, line.rstrip()) + "\n")
+        else:
+            out.append(line)
+    open(path, "w").writelines(out)
+    os.chmod(path, 0o600)
+    run("systemctl", "restart", "awg-quick@" + iface)
+
+
+def handshake_age(iface):
+    r = run("awg", "show", iface, "latest-handshakes")
+    ts = [int(x.split()[1]) for x in r.stdout.splitlines() if len(x.split()) == 2]
+    return int(time.time()) - max(ts) if ts and max(ts) else 10 ** 6
+
+
+def far(hop, *args):
+    """Ask the far end. The forced command on its side decides what is allowed."""
+    cmd = ["ssh", "-i", hop["key"], "-o", "BatchMode=yes", "-o", "ConnectTimeout=12",
+           "-o", "StrictHostKeyChecking=accept-new", hop["ssh"]] + list(args)
+    r = run(*cmd, timeout=90)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return {"error": (r.stderr or r.stdout).strip()[:200] or "no answer"}
+
+
+def free_here(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def candidates(hop, current, n):
+    """Ports to try: the configured list, else random high ones that look unremarkable."""
+    given = [p for p in (hop.get("ports") or []) if p != current]
+    out = list(given)
+    while len(out) < n:
+        p = random.randint(20000, 60000)
+        if p != current and p not in out and free_here(p):
+            out.append(p)
+    return out[:n]
+
+
+def state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {}
+
+
+def save(s):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(s, open(STATE, "w"), indent=2)
+
+
+def hop(name, paths, want=None, dry=False, force=False):
+    p = paths.get(name) or die("no path %r in %s" % (name, CONF))
+    iface = p.get("iface") or die("%s has no iface - only tunnel paths can hop" % name)
+    cfg = p.get("hop") or die("%s has no hop config (ssh, key) in %s" % (name, CONF))
+    if not os.path.exists(cfg.get("key", "")):
+        die("ssh key %s not found - see the README" % cfg.get("key"))
+    riface = cfg.get("riface", iface)   # the interface's own name on the far end, if it differs
+
+    st = state()
+    last = st.get(name, {}).get("at", 0)
+    if not force and time.time() - last < COOLDOWN:
+        die("%s hopped %d min ago - too soon (use --force)" % (name, (time.time() - last) / 60))
+
+    port, ep = read_local(iface)
+    if not port or not ep:
+        die("could not read ListenPort/Endpoint from %s" % conf_path(iface))
+    print("%s: on udp/%d, endpoint %s:%d, handshake %ss ago" % (name, port, ep[0], ep[1], handshake_age(iface)))
+
+    tries = candidates(cfg, port, int(cfg.get("tries", 3)))
+    if want:
+        tries = [want]
+    if dry:
+        print("would try: %s" % ", ".join(str(t) for t in tries))
+        return 0
+
+    for attempt in tries:
+        print("  trying udp/%d ..." % attempt)
+        r = far(cfg, "port", str(attempt), riface)
+        if not r.get("ok"):
+            print("    far end refused: %s" % r.get("error") or r)
+            continue
+        write_local(iface, attempt, attempt)
+        for _ in range(WAIT):
+            time.sleep(1)
+            if handshake_age(iface) < 60:
+                st[name] = {"at": time.time(), "from": port, "to": attempt}
+                save(st)
+                say("\U0001f504 تانل %s روی پورت %d فیلتر شده بود — به %d منتقل شد و handshake برگشت."
+                    % (name, port, attempt))
+                return 0
+        print("    no handshake on %d" % attempt)
+
+    # nothing worked: put both ends back where they were, so they at least agree
+    far(cfg, "port", str(port), riface)
+    write_local(iface, port, port)
+    say("⚠️ تانل %s: هیچ‌کدام از پورت‌های جایگزین handshake نداد. پورت اصلی %d برگردانده شد."
+        % (name, port))
+    return 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="move a tunnel to a different UDP port")
+    ap.add_argument("path", nargs="?")
+    ap.add_argument("--port", type=int, help="a port you chose yourself")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true", help="ignore the cooldown")
+    ap.add_argument("--status", action="store_true")
+    a = ap.parse_args()
+
+    try:
+        paths = json.load(open(CONF))["paths"]
+    except Exception as e:
+        die("cannot read %s: %s" % (CONF, e))
+
+    if a.status or not a.path:
+        st = state()
+        for n, p in paths.items():
+            if not p.get("iface"):
+                continue
+            port, ep = read_local(p["iface"])
+            h = st.get(n, {})
+            print("%-14s udp/%-6s handshake %6ss ago  %s" % (
+                n, port, handshake_age(p["iface"]),
+                ("last hop %s -> %s, %s" % (h.get("from"), h.get("to"),
+                 time.strftime("%m-%d %H:%M", time.localtime(h["at"])))) if h else "never hopped"))
+        return
+    if os.geteuid() != 0:
+        die("run as root")
+    sys.exit(hop(a.path, paths, a.port, a.dry_run, a.force))
+
+
+if __name__ == "__main__":
+    main()

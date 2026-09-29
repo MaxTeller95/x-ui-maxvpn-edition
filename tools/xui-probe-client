@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""xui-probe-client - connect to the hub the way one user's app does, and measure it.
+
+    xui-probe-client <email>                 test every inbound that user is on
+    xui-probe-client <email> --inbound TAG   just one
+    xui-probe-client <email> --json          machine readable (the Optimizer page uses this)
+    options: --bytes N    size of the download used for the speed number (default 25 MB)
+
+It reads the client's UUID and the inbound's transport from the panel, builds the same
+client config the user's app would get from the subscription, runs it against the hub's
+public address and reports how long the handshake took and how fast the link is. Nothing
+is created or changed in the panel, and the UUID is never printed.
+
+So "my connection is slow" becomes a number: if the config answers in 0.3 s and pulls
+90 Mbit/s from here, the problem is between the user and the hub, not on the server.
+"""
+import glob, json, os, socket, sqlite3, subprocess, sys, tempfile, time
+
+DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
+XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
+CHECK = "https://www.google.com/generate_204"
+SPEED = "https://speed.cloudflare.com/__down?bytes=%d"
+
+
+def db():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def setting(key):
+    r = db().execute("select value from settings where key=?", (key,)).fetchone()
+    return r[0] if r else ""
+
+
+def public_ip():
+    r = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True)
+    parts = r.stdout.split()
+    return parts[parts.index("src") + 1] if "src" in parts else "127.0.0.1"
+
+
+def cert_domain():
+    """The name the panel's own certificate is for - what a TLS inbound has to be called."""
+    cert = setting("webCertFile")
+    if not cert or not os.path.exists(cert):
+        return ""
+    r = subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-subject"], capture_output=True, text=True)
+    for part in r.stdout.replace("/", ",").split(","):
+        if "CN" in part and "=" in part:
+            return part.split("=")[-1].strip()
+    return ""
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def address_of(inb, ss):
+    """Where the user's app is told to connect - same order the panel builds its links in."""
+    ext = ss.get("externalProxy") or []
+    if ext and ext[0].get("dest"):
+        return ext[0]["dest"], int(ext[0].get("port") or inb["port"])
+    if (inb["share_addr"] or "").strip():
+        return inb["share_addr"].strip(), inb["port"]
+    if ss.get("security") == "tls":
+        sni = ((ss.get("tlsSettings") or {}).get("serverName") or "").strip()
+        return (sni or cert_domain() or public_ip()), inb["port"]
+    return public_ip(), inb["port"]
+
+
+def outbound_for(inb, ss, uuid, flow, password):
+    addr, port = address_of(inb, ss)
+    net, sec = ss.get("network", "tcp"), ss.get("security", "none")
+    stream = {"network": net, "security": sec}
+    if net == "ws":
+        w = ss.get("wsSettings") or {}
+        stream["wsSettings"] = {"path": w.get("path") or "/", "headers": {"Host": w.get("host") or addr}}
+    elif net == "xhttp":
+        x = ss.get("xhttpSettings") or {}
+        stream["xhttpSettings"] = {"path": x.get("path") or "/", "mode": x.get("mode") or "auto"}
+        if x.get("host"):
+            stream["xhttpSettings"]["host"] = x["host"]
+    elif net == "grpc":
+        stream["grpcSettings"] = {"serviceName": (ss.get("grpcSettings") or {}).get("serviceName", "")}
+    elif net == "httpupgrade":
+        h = ss.get("httpupgradeSettings") or {}
+        stream["httpupgradeSettings"] = {"path": h.get("path") or "/", "host": h.get("host") or addr}
+    if sec == "tls":
+        t = ss.get("tlsSettings") or {}
+        stream["tlsSettings"] = {"serverName": (t.get("serverName") or addr), "allowInsecure": False,
+                                 "alpn": t.get("alpn") or ["h2", "http/1.1"], "fingerprint": "chrome"}
+    elif sec == "reality":
+        r = ss.get("realitySettings") or {}
+        st = r.get("settings") or {}
+        stream["realitySettings"] = {"serverName": (r.get("serverNames") or [""])[0],
+                                     "publicKey": st.get("publicKey", ""),
+                                     "shortId": (r.get("shortIds") or [""])[0],
+                                     "fingerprint": st.get("fingerprint") or "chrome",
+                                     "spiderX": st.get("spiderX") or "/"}
+    dial, note = addr, ""
+    if inb["protocol"] == "vless" and sec == "none":
+        # Xray 26 refuses plain VLESS towards a public address, so dial the listener directly;
+        # the transport, the path and the user's UUID are still exercised, the public hop is not.
+        dial, note = "127.0.0.1", "از داخل خود هاب: Xray کانفیگ VLESS بدون TLS را به آدرس عمومی اجازه نمی‌دهد"
+    if inb["protocol"] == "vless":
+        user = {"id": uuid, "encryption": "none"}
+        if flow:
+            user["flow"] = flow
+        settings = {"vnext": [{"address": dial, "port": port, "users": [user]}]}
+    elif inb["protocol"] == "vmess":
+        settings = {"vnext": [{"address": dial, "port": port, "users": [{"id": uuid, "security": "auto"}]}]}
+    elif inb["protocol"] == "trojan":
+        settings = {"servers": [{"address": dial, "port": port, "password": password or uuid}]}
+    else:
+        return None, addr, port, note
+    return {"protocol": inb["protocol"], "tag": "probe", "settings": settings, "streamSettings": stream}, addr, port, note
+
+
+def curl(port, url, fmt, timeout):
+    r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-m", str(timeout), "--socks5-hostname",
+                        "127.0.0.1:%d" % port, "-w", fmt, url], capture_output=True, text=True, timeout=timeout + 4)
+    return r.stdout.split()
+
+
+def probe(inb, uuid, flow, password, size):
+    ss = json.loads(inb["stream_settings"] or "{}")
+    ob, addr, port, note = outbound_for(inb, ss, uuid, flow, password)
+    out = {"inbound": inb["tag"], "remark": inb["remark"] or inb["tag"], "address": addr, "port": port,
+           "network": ss.get("network", "tcp"), "security": ss.get("security", "none"),
+           "flow": flow or "", "ok": False, "code": "", "connect_ms": None, "total_ms": None,
+           "mbit": None, "error": "", "note": note}
+    if not ob:
+        out["error"] = "protocol %s is not supported by this tool" % inb["protocol"]
+        return out
+    local = free_port()
+    cfg = {"log": {"loglevel": "warning"},
+           "inbounds": [{"listen": "127.0.0.1", "port": local, "protocol": "socks",
+                         "settings": {"udp": False}}],
+           "outbounds": [ob]}
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    proc = subprocess.Popen([XRAY, "run", "-c", path], cwd=BIN, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        for _ in range(40):                     # wait for the socks port, at most 4 s
+            try:
+                socket.create_connection(("127.0.0.1", local), 0.2).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        parts = curl(local, CHECK, "%{http_code} %{time_total} %{time_connect}", 12)
+        if len(parts) >= 3 and parts[0] not in ("000", ""):
+            out.update(ok=True, code=parts[0], total_ms=round(float(parts[1]) * 1000),
+                       connect_ms=round(float(parts[2]) * 1000))
+            sp = curl(local, SPEED % size, "%{speed_download}", 25)
+            if sp:
+                try:
+                    out["mbit"] = round(float(sp[0]) * 8 / 1e6, 1)
+                except ValueError:
+                    pass
+        else:
+            out["error"] = "no answer through this config"
+    except subprocess.TimeoutExpired:
+        out["error"] = "timed out"
+    finally:
+        proc.terminate()
+        try:
+            log = proc.communicate(timeout=3)[0] or ""
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            log = ""
+        os.unlink(path)
+    if not out["ok"]:
+        lines = [l for l in log.splitlines() if l.strip()]
+        if lines:
+            out["error"] = (out["error"] + " | " + lines[-1][:200]).strip(" |")
+    return out
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    as_json = "--json" in args
+    only = args[args.index("--inbound") + 1] if "--inbound" in args else None
+    size = int(args[args.index("--bytes") + 1]) if "--bytes" in args else 25_000_000
+    emails = [a for a in args if not a.startswith("--") and a not in (only, str(size))]
+    if not emails or not XRAY:
+        sys.exit(__doc__ if not XRAY else "usage: xui-probe-client <email> [--inbound TAG] [--json]")
+    email = emails[0]
+
+    c = db()
+    client = c.execute("select id, uuid, password, enable, flow from clients where email=?", (email,)).fetchone()
+    if not client:
+        msg = {"email": email, "error": "no client with this email"}
+        sys.exit(json.dumps(msg, ensure_ascii=False) if as_json else msg["error"])
+    rows = c.execute(
+        "select i.id, i.tag, i.remark, i.port, i.protocol, i.stream_settings, i.share_addr, ci.flow_override"
+        " from client_inbounds ci join inbounds i on i.id = ci.inbound_id where ci.client_id = ?"
+        " order by i.port", (client["id"],)).fetchall()
+    rows = [r for r in rows if not only or r["tag"] == only]
+    if not rows:
+        msg = {"email": email, "error": "this client is not on any inbound" if not only else "not on " + only}
+        sys.exit(json.dumps(msg, ensure_ascii=False) if as_json else msg["error"])
+
+    res = [probe(r, client["uuid"], r["flow_override"] or client["flow"], client["password"], size) for r in rows]
+    report = {"email": email, "enabled": bool(client["enable"]), "at": int(time.time()), "results": res}
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False))
+        return
+    print("%s (%s)" % (email, "enabled" if client["enable"] else "disabled"))
+    for r in res:
+        head = "  %-14s %s:%s  %s/%s" % (r["inbound"], r["address"], r["port"], r["network"], r["security"])
+        if r["ok"]:
+            print("%s  ->  HTTP %s in %d ms (connect %d ms)%s%s"
+                  % (head, r["code"], r["total_ms"], r["connect_ms"],
+                     ", %.1f Mbit/s" % r["mbit"] if r["mbit"] else "",
+                     "  [" + r["note"] + "]" if r["note"] else ""))
+        else:
+            print("%s  ->  FAILED: %s" % (head, r["error"]))
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()

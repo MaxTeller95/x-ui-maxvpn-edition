@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# mux-bench OUTBOUND - is mux worth it on this link? Starts a throwaway Xray on 127.0.0.1
+# with the given outbound three times: plain, mux concurrency 4, mux concurrency 8, and
+# measures page load (20 fresh connections at once) and 1/4/8-stream download.
+# Users' Xray is not touched. Takes about 3 minutes.
+set -u
+OB=${1:?usage: mux-bench OUTBOUND-TAG}
+BIN=/usr/local/x-ui/bin; T=/tmp/mux-bench; mkdir -p $T
+OB=$OB python3 - <<'EOF'
+import json, os
+c = json.load(open("/usr/local/x-ui/bin/config.json"))
+base = next(o for o in c["outbounds"] if o["tag"] == os.environ["OB"])
+v = [("plain", 0), ("mux4", 4), ("mux8", 8)]
+def ob(tag, n):
+    o = json.loads(json.dumps(base)); o["tag"] = tag
+    if n: o["mux"] = {"enabled": True, "concurrency": n, "xudpConcurrency": 8}
+    return o
+json.dump({"log": {"loglevel": "none"},
+  "inbounds": [{"tag": n, "listen": "127.0.0.1", "port": 20801 + i, "protocol": "socks"} for i, (n, _) in enumerate(v)],
+  "outbounds": [ob(n, k) for n, k in v],
+  "routing": {"rules": [{"type": "field", "inboundTag": [n], "outboundTag": n} for n, _ in v]}},
+  open("/tmp/mux-bench/cfg.json", "w"))
+EOF
+chmod 600 $T/cfg.json
+$BIN/xray-linux-amd64 run -c $T/cfg.json >/dev/null 2>&1 & XP=$!
+trap 'kill $XP 2>/dev/null; rm -rf $T' EXIT; sleep 2
+
+HOSTS="www.google.com www.cloudflare.com github.com www.wikipedia.org www.microsoft.com www.apple.com
+www.amazon.com www.bing.com www.youtube.com www.instagram.com www.linkedin.com stackoverflow.com
+www.mozilla.org www.bbc.com www.cnn.com www.twitch.tv www.netflix.com www.spotify.com
+www.dropbox.com www.paypal.com"
+URL=https://nbg1-speed.hetzner.com/1GB.bin
+page() { local s=$(date +%s%N); for h in $HOSTS; do curl -s -o /dev/null -m 15 --socks5-hostname 127.0.0.1:$1 https://$h/ & done; wait; echo $(( ($(date +%s%N)-s)/1000000 )); }
+bulk() { curl -s -o /dev/null -m 8 --socks5-hostname 127.0.0.1:$1 -w '%{speed_download}' $URL | awk '{printf "%.0f",$1*8/1e6}'; }
+bulkN() { local t=0 i; for i in $(seq $2); do bulk $1 >$T/b$i & done; wait; for i in $(seq $2); do t=$((t+$(cat $T/b$i))); done; echo $t; }
+med() { tr ' ' '\n' | grep . | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
+
+declare -A P=([plain]=20801 [mux4]=20802 [mux8]=20803) R
+for r in 1 2 3 4 5; do for v in plain mux4 mux8; do R[$v.page]+=" $(page ${P[$v]})"; done; done
+for r in 1 2; do for v in plain mux4 mux8; do
+  R[$v.b1]+=" $(bulk ${P[$v]})"; R[$v.b4]+=" $(bulkN ${P[$v]} 4)"; R[$v.b8]+=" $(bulkN ${P[$v]} 8)"; done; done
+
+printf '\n%-6s %10s %10s %10s %10s\n' var "page ms" "1x Mb/s" "4x Mb/s" "8x Mb/s"
+for v in plain mux4 mux8; do
+  printf '%-6s %10s %10s %10s %10s\n' $v "$(echo ${R[$v.page]}|med)" \
+    "$(echo ${R[$v.b1]}|med)" "$(echo ${R[$v.b4]}|med)" "$(echo ${R[$v.b8]}|med)"
+done
+echo; for k in $(echo "${!R[@]}" | tr ' ' '\n' | sort); do echo "  $k:${R[$k]}"; done

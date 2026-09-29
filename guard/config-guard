@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""config-guard - puts back the routing this hub depends on when the panel drops it.
+
+    config-guard             check and print, change nothing
+    config-guard --fix       put the missing pieces back (systemd runs this on every write)
+    config-guard --save      accept the current config as the new baseline
+    config-guard --json      machine readable, for the Optimizer page
+
+Saving an inbound from a panel tab that was opened before the last change makes x-ui
+write an older Xray template: the DNS cache, the traffic split or your own ir-direct
+rules disappear at once and nobody notices until users complain. This keeps a copy of
+every routing rule that carries a ruleTag, of the proxy outbounds, of the guard's probe
+inbounds and of the dns block; when one of them is gone it writes it back into the
+panel's template, tests the result with `xray -test` and restarts x-ui.
+
+Deleting a rule on purpose is fine - run `config-guard --save` (or press the button on
+the Optimizer page) and that becomes the new baseline.
+"""
+import glob, json, os, shutil, sqlite3, subprocess, sys, time
+
+DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
+CFG = BIN + "/config.json"
+STATE_DIR = "/var/lib/config-guard"
+BASE, EVENTS = STATE_DIR + "/baseline.json", STATE_DIR + "/events.json"
+COOLDOWN = 600          # never repair twice in a row inside this many seconds
+KEY = "xrayTemplateConfig"
+XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
+
+
+def db():
+    return sqlite3.connect(DB)
+
+
+def template():
+    row = db().execute("select value from settings where key=?", (KEY,)).fetchone()
+    return json.loads(row[0]) if row and row[0] else {}
+
+
+def live():
+    try:
+        return json.load(open(CFG))
+    except Exception:
+        return {}
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write(path, data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def snapshot(t):
+    """The parts of the config this hub needs to keep working."""
+    rules = t.get("routing", {}).get("rules", [])
+    return {
+        "ts": int(time.time()),
+        "rules": rules,
+        "tags": [r["ruleTag"] for r in rules if r.get("ruleTag")],
+        "outbounds": [o.get("tag") for o in t.get("outbounds", []) if o.get("tag")],
+        "inbounds": [i.get("tag") for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")],
+        "dns": t.get("dns"),
+    }
+
+
+def missing(base, now):
+    return {
+        "rules": [t for t in base["tags"] if t not in now["tags"]],
+        "outbounds": [t for t in base["outbounds"] if t not in now["outbounds"]],
+        "inbounds": [t for t in base["inbounds"] if t not in now["inbounds"]],
+        "dns": bool(base.get("dns")) and not now.get("dns"),
+    }
+
+
+def any_missing(m):
+    return bool(m["rules"] or m["outbounds"] or m["inbounds"] or m["dns"])
+
+
+def describe(m):
+    parts = []
+    if m["rules"]:
+        parts.append("قانون‌های " + "، ".join(m["rules"]))
+    if m["outbounds"]:
+        parts.append("اوت‌باندهای " + "، ".join(m["outbounds"]))
+    if m["inbounds"]:
+        parts.append("پورت‌های probe " + "، ".join(m["inbounds"]))
+    if m["dns"]:
+        parts.append("بخش dns (کش DNS)")
+    return " و ".join(parts)
+
+
+def repair(t, base, m):
+    """Put the saved pieces back where they were and hand back the patched template."""
+    rules = t.setdefault("routing", {}).setdefault("rules", [])
+    have = {r.get("ruleTag") for r in rules if r.get("ruleTag")}
+    for i, r in enumerate(base["rules"]):            # baseline order decides the position
+        tag = r.get("ruleTag")
+        if tag and tag in m["rules"] and tag not in have:
+            rules.insert(min(i, len(rules)), r)
+            have.add(tag)
+    by_tag = {o.get("tag"): o for o in base.get("full_outbounds", [])}
+    for tag in m["outbounds"]:
+        if tag in by_tag:
+            t.setdefault("outbounds", []).append(by_tag[tag])
+    by_tag = {i.get("tag"): i for i in base.get("full_inbounds", [])}
+    for tag in m["inbounds"]:
+        if tag in by_tag:
+            t.setdefault("inbounds", []).append(by_tag[tag])
+    if m["dns"]:
+        t["dns"] = base["dns"]
+    return t
+
+
+def test(t):
+    """Does Xray accept a config built from this template? (same merge x-ui does)"""
+    if not XRAY:
+        return False, "no xray binary"
+    cfg = live()
+    if not cfg:
+        return False, "no live config"
+    for k in ("api", "outbounds", "routing", "dns"):
+        if k in t:
+            cfg[k] = t[k]
+    cfg["inbounds"] = [i for i in cfg.get("inbounds", []) if not (i.get("tag") or "").startswith("guard-")] + \
+                      [i for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")]
+    path = "/tmp/config-guard-candidate.json"
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+    r = subprocess.run([XRAY, "run", "-test", "-c", path], cwd=BIN, capture_output=True, text=True)
+    os.remove(path)
+    out = r.stdout + r.stderr
+    return "Configuration OK" in out, out.strip().splitlines()[-1] if out.strip() else ""
+
+
+def say(text):
+    subprocess.run(["tunnel-guard", "--say", text], capture_output=True, timeout=40)
+
+
+def log_event(e):
+    ev = read(EVENTS, []) or []
+    ev.append(e)
+    write(EVENTS, ev[-20:])
+
+
+def save_baseline(t):
+    s = snapshot(t)
+    s["full_outbounds"] = t.get("outbounds", [])
+    s["full_inbounds"] = [i for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")]
+    write(BASE, s)
+    return s
+
+
+def main():
+    fix, as_json = "--fix" in sys.argv, "--json" in sys.argv
+    t = template()
+    if not t:
+        sys.exit("panel template not found - is this an x-ui hub?")
+    if "--save" in sys.argv:
+        s = save_baseline(t)
+        print("baseline saved: %d rules, %d outbounds" % (len(s["tags"]), len(s["outbounds"])))
+        return
+
+    base = read(BASE)
+    if not base:
+        s = save_baseline(t)
+        print("first run - baseline taken from the current config (%d tagged rules)" % len(s["tags"]))
+        return
+
+    now = snapshot(t)
+    m = missing(base, now)
+    ev = read(EVENTS, []) or []
+    last_fix = max([e["ts"] for e in ev if e.get("fixed")] or [0])
+    state = {"ok": not any_missing(m), "missing": m, "baseline_ts": base["ts"],
+             "tags": now["tags"], "events": ev[-8:], "now": int(time.time())}
+
+    if not any_missing(m):
+        if now["tags"] != base["tags"] or now["outbounds"] != base["outbounds"]:
+            save_baseline(t)                          # new pieces are fine, absorb them
+        if as_json:
+            print(json.dumps(state, ensure_ascii=False))
+        else:
+            print("ok - %d tagged rules, %d outbounds, baseline %s"
+                  % (len(now["tags"]), len(now["outbounds"]), time.strftime("%F %H:%M", time.localtime(base["ts"]))))
+        return
+
+    what = describe(m)
+    if not fix:
+        state["would_fix"] = True
+        print(json.dumps(state, ensure_ascii=False) if as_json else "MISSING: " + what)
+        return
+
+    if time.time() - last_fix < COOLDOWN:
+        log_event({"ts": int(time.time()), "missing": m, "fixed": False, "note": "cooldown"})
+        say("⚠️ config-guard: دوباره %s از کانفیگ رفت، ولی همین چند دقیقه پیش برگردانده بودم. "
+            "یک تب قدیمی پنل باز است؟ این بار دست نزدم." % what)
+        sys.exit(1)
+
+    patched = repair(json.loads(json.dumps(t)), base, m)
+    ok, detail = test(patched)
+    if not ok:
+        log_event({"ts": int(time.time()), "missing": m, "fixed": False, "note": "xray rejected: " + detail})
+        say("❌ config-guard: %s از کانفیگ رفته، ولی برگرداندنش را Xray رد کرد: %s" % (what, detail))
+        sys.exit(1)
+
+    backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
+    os.makedirs(backup, exist_ok=True)
+    for f in (DB, CFG):
+        if os.path.exists(f):
+            shutil.copy2(f, backup)
+    c = db()
+    c.execute("update settings set value=? where key=?", (json.dumps(patched, indent=2), KEY))
+    c.commit()
+    c.close()
+    subprocess.run(["systemctl", "restart", "x-ui"], check=False)
+    time.sleep(6)
+    back = [tag for tag in m["rules"] if tag in snapshot(template())["tags"]]
+    log_event({"ts": int(time.time()), "missing": m, "fixed": True, "backup": os.path.basename(backup)})
+    say("🛠 config-guard: %s از کانفیگ پاک شده بود و برگرداندمش (%d قانون). x-ui ری‌استارت شد.\n"
+        "اگر خودتان عمداً حذفش کردید: config-guard --save" % (what, len(back)))
+    print("restored: %s (backup %s)" % (what, backup))
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()

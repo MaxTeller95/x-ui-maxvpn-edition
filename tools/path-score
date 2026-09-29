@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""
+path-score - is this IP worth making a tunnel path out of?
+
+Run it on the hub, against the IP a provider is offering you, before you pay for
+anything. It measures the transport from *this* hub and looks the network up in
+RIPE's routing data, then says what it found in plain terms.
+
+    path-score 198.51.100.50
+    path-score new.example.com --json
+
+Two lessons this encodes, both learned the expensive way:
+
+  * A clean `ping` proves nothing. Networks rate-limit ICMP, so a host can show
+    5% "loss" and carry TCP perfectly - and the reverse, a host with a flawless
+    ping can be withdrawn from half the internet's routing tables twice a day.
+    So it measures TCP connects as well, and reads the prefix's real BGP churn.
+
+  * Latency is not throughput. On this hub the 75 ms path out-runs the 39 ms one,
+    because the limit is the far server's uplink, not the distance. path-score
+    deliberately does NOT guess at speed: buy the cheapest month, then measure.
+
+Everything here is read-only: it pings, it opens TCP connections, and it asks
+stat.ripe.net. It changes nothing.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import socket
+import statistics
+import subprocess
+import sys
+import time
+
+BIN = "/usr/local/x-ui/bin"
+LIVE = BIN + "/config.json"
+GUARD_CONF = "/etc/tunnel-guard.json"
+RIPE = "https://stat.ripe.net/data/%s/data.json?%s"
+
+_TTY = sys.stdout.isatty()
+
+
+def _c(code, s):
+    return "\033[%sm%s\033[0m" % (code, s) if _TTY else s
+
+
+def head(s):
+    print("\n" + _c("1", s))
+
+
+def row(label, value, note=""):
+    print("  %-22s %-28s %s" % (label, value, note))
+
+
+GOOD, OK, BAD = _c("32", "good"), _c("33", "ok"), _c("31", "poor")
+
+
+def probe_ports():
+    """Local socks ports that may reach the internet - the guard's. Any of them can be down."""
+    try:
+        cfg = json.load(open(LIVE))
+    except Exception:
+        return []
+    return [i["port"] for i in cfg.get("inbounds", [])
+            if str(i.get("tag", "")).startswith("guard-") and i.get("protocol") == "socks"]
+
+
+ROUTES = [None]     # how to reach RIPEstat: direct, then each guard port; the first that works sticks
+
+
+def ripe(call, query):
+    url = RIPE % (call, query)
+    for i, via in enumerate(ROUTES):
+        cmd = ["curl", "-s", "--max-time", "20", "-A", "path-score"]
+        if via:
+            cmd += ["--socks5-hostname", "127.0.0.1:%d" % via]
+        r = subprocess.run(cmd + [url], capture_output=True, text=True)
+        try:
+            data = json.loads(r.stdout).get("data")
+        except Exception:
+            continue
+        ROUTES.insert(0, ROUTES.pop(i))
+        return data or {}
+    return {}           # RIPEstat unreachable: the report says "unknown", never "poor"
+
+
+def resolve(host):
+    try:
+        socket.inet_aton(host)
+        return host
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        sys.exit("cannot resolve %s" % host)
+
+
+def icmp(ip, n=100):
+    r = subprocess.run(["ping", "-c", str(n), "-i", "0.1", "-W", "2", "-q", ip],
+                       capture_output=True, text=True, timeout=n * 0.2 + 30)
+    loss = re.search(r"([\d.]+)% packet loss", r.stdout)
+    rtt = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)", r.stdout)
+    return (float(loss.group(1)) if loss else 100.0,
+            [float(x) for x in rtt.groups()] if rtt else None)
+
+
+def tcp(ip, port=443, n=30):
+    times, fails = [], 0
+    for _ in range(n):
+        s = socket.socket()
+        s.settimeout(3)
+        t0 = time.time()
+        try:
+            s.connect((ip, port))
+            times.append((time.time() - t0) * 1000)
+        except Exception:
+            fails += 1
+        finally:
+            s.close()
+        time.sleep(0.1)
+    return times, fails
+
+
+def open_port(ip):
+    for p in (443, 80, 22):
+        s = socket.socket()
+        s.settimeout(2)
+        try:
+            s.connect((ip, p))
+            return p
+        except Exception:
+            continue
+        finally:
+            s.close()
+    return None
+
+
+def path_mtu(ip, lo=1200, hi=1500):
+    while hi - lo > 1:
+        mid = (hi + lo) // 2
+        r = subprocess.run(["ping", "-c", "1", "-W", "1", "-M", "do", "-s", str(mid - 28), ip],
+                           capture_output=True)
+        if r.returncode == 0:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def churn(prefix):
+    """BGP updates and withdrawals over the last 30 days. Withdrawals are what users feel."""
+    end = time.strftime("%Y-%m-%dT00:00:00", time.gmtime())
+    start = time.strftime("%Y-%m-%dT00:00:00", time.gmtime(time.time() - 30 * 86400))
+    d = ripe("bgp-updates", "resource=%s&starttime=%s&endtime=%s" % (prefix, start, end))
+    u = d.get("updates") or []
+    return d.get("nr_updates"), sum(1 for x in u if x.get("type") == "W")
+
+
+def current_paths():
+    """What this hub already has, so the candidate can be compared with it."""
+    try:
+        c = json.load(open(GUARD_CONF))
+    except Exception:
+        return {}
+    return {n: p.get("peer") for n, p in (c.get("paths") or {}).items() if p.get("peer")}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="score an IP before you make it a tunnel path")
+    ap.add_argument("host")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quick", action="store_true", help="skip the 100-packet ping and the MTU search")
+    a = ap.parse_args()
+
+    ROUTES.extend(probe_ports())
+    ip = resolve(a.host)
+    out = {"host": a.host, "ip": ip}
+
+    # ---- transport, measured from this hub
+    loss, rtt = icmp(ip, 30 if a.quick else 100)
+    port = open_port(ip)
+    times, fails = tcp(ip, port or 443, 10 if a.quick else 30)
+    out["icmp_loss"] = loss
+    out["icmp_rtt"] = rtt[1] if rtt else None
+    out["tcp_port"] = port
+    out["tcp_ok"] = len(times)
+    out["tcp_tried"] = len(times) + fails
+    if times:
+        t = sorted(times)
+        out["tcp_p50"] = round(t[len(t) // 2], 1)
+        out["tcp_p95"] = round(t[int(len(t) * 0.95)], 1)
+        out["tcp_jitter"] = round(statistics.pstdev(times), 1)
+    out["mtu"] = None if a.quick else path_mtu(ip)
+
+    # ---- the network it lives on
+    ov = ripe("prefix-overview", "resource=%s" % ip)
+    asn = (ov.get("asns") or [{}])[0]
+    prefix = ov.get("resource")
+    out["prefix"], out["asn"], out["holder"] = prefix, asn.get("asn"), asn.get("holder")
+    nb = ripe("asn-neighbours", "resource=AS%s" % out["asn"]).get("neighbours") or []
+    out["upstreams"] = [x["asn"] for x in nb if x.get("type") == "left"]
+    out["prefixes"] = len(ripe("announced-prefixes", "resource=AS%s" % out["asn"]).get("prefixes") or [])
+    vis = ripe("routing-status", "resource=%s" % prefix).get("visibility", {}).get("v4", {})
+    out["seen_by"], out["of_peers"] = vis.get("ris_peers_seeing"), vis.get("total_ris_peers")
+    out["rpki"] = ripe("rpki-validation", "resource=AS%s&prefix=%s" % (out["asn"], prefix)).get("status")
+    out["updates"], out["withdrawals"] = churn(prefix) if prefix else (None, None)
+
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return
+
+    head("%s (%s)" % (a.host, ip))
+
+    head("transport, from this hub")
+    row("ICMP", "%.1f%% loss" % loss,
+        "rate-limited, not real loss" if loss > 1 and out["tcp_ok"] == out["tcp_tried"] else "")
+    if rtt:
+        row("ICMP rtt", "avg %.1f ms" % rtt[1], "jitter %.1f" % rtt[3])
+    if times:
+        row("TCP :%s" % port, "%d/%d connected" % (out["tcp_ok"], out["tcp_tried"]),
+            GOOD if not fails else BAD)
+        row("TCP rtt", "p50 %.1f  p95 %.1f ms" % (out["tcp_p50"], out["tcp_p95"]),
+            "jitter %.1f" % out["tcp_jitter"])
+    else:
+        row("TCP", "nothing answered on 443/80/22", BAD)
+    if out["mtu"]:
+        row("path MTU", "%d bytes" % out["mtu"])
+    for name, peer in current_paths().items():
+        l2, r2 = icmp(peer, 20)
+        if r2:
+            row("vs %s" % name, "%.1f ms" % r2[1],
+                "candidate is %+.1f ms" % ((rtt[1] - r2[1]) if rtt else 0))
+
+    head("the network")
+    if not prefix:
+        row("routing data", "unknown", OK + "  RIPEstat did not answer - nothing judged")
+    else:
+        network(out)
+
+    head("verdict")
+    bad = []
+    if prefix and len(out["upstreams"]) < 2:
+        bad.append("only one transit provider")
+    if prefix and (out["withdrawals"] or 0) >= 2000:
+        bad.append("%d route withdrawals in 30 days" % out["withdrawals"])
+    if fails:
+        bad.append("%d of %d TCP connects failed" % (fails, out["tcp_tried"]))
+    if prefix and (out["seen_by"] or 0) < (out["of_peers"] or 1) * 0.95:
+        bad.append("not fully visible in global routing")
+    if bad:
+        for b in bad:
+            print("  " + _c("31", "- ") + b)
+    elif prefix:
+        print("  " + _c("32", "nothing against it in the routing data."))
+    else:
+        print("  " + _c("33", "transport looks fine; routing not checked."))
+    print("\n  Speed is NOT measured here - it depends on the server's uplink, not the path.")
+    print("  Buy one month, then:  curl -o /dev/null -w '%{speed_download} B/s\\n' \\")
+    print("      --max-time 60 'https://speed.cloudflare.com/__down?bytes=52428800'")
+
+
+def network(out):
+    row("prefix", out["prefix"])
+    row("ASN", "AS%s" % out["asn"], (out["holder"] or "")[:40])
+    row("prefixes announced", out["prefixes"])
+    n = len(out["upstreams"])
+    row("transit upstreams", n,
+        BAD + "  single-homed: one outage and it is gone" if n < 2 else (OK if n == 2 else GOOD))
+
+    head("routing stability, last 30 days")
+    row("global visibility", "%s of %s RIS peers" % (out["seen_by"], out["of_peers"]),
+        GOOD if (out["seen_by"] or 0) >= (out["of_peers"] or 1) * 0.98 else BAD)
+    row("RPKI", out["rpki"], GOOD if out["rpki"] == "valid" else OK)
+    w = out["withdrawals"] or 0
+    row("BGP withdrawals", w,
+        GOOD + "  very stable" if w < 500 else
+        (OK + "  normal for a cheap host" if w < 2000 else BAD + "  expect short dropouts"))
+    row("BGP updates", out["updates"])
+
+
+
+if __name__ == "__main__":
+    main()

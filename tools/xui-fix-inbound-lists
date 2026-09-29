@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Rebuild each inbound's built-in client list from the client<->inbound links.
+
+3.x keeps clients in their own table, but every inbound still carries a copy of the
+clients attached to it. Saving a client fails with "inbound N: empty client ID" when a
+link exists without that copy. This makes the two match, exactly as a healthy panel has
+them (one entry per link, carrying the client's own UUID and limits).
+
+    xui-fix-inbound-lists            show what is missing
+    xui-fix-inbound-lists apply      back up, rebuild, restart x-ui
+"""
+import json, os, shutil, sqlite3, subprocess, sys, time
+
+DB = "/etc/x-ui/x-ui.db"
+apply = sys.argv[1:] == ["apply"]
+db = sqlite3.connect(DB)
+ccols = [r[1] for r in db.execute("pragma table_info(clients)")]
+
+
+def entry(c, flow_override):
+    """One legacy list entry, in the panel's own shape."""
+    return {"comment": c.get("comment") or "", "created_at": c.get("created_at") or 0,
+            "email": c["email"], "enable": bool(c.get("enable", 1)),
+            "expiryTime": c.get("expiry_time") or 0, "flow": flow_override or c.get("flow") or "",
+            "id": c.get("uuid") or "", "limitIp": c.get("limit_ip") or 0, "reset": c.get("reset") or 0,
+            "subId": c.get("sub_id") or "", "tgId": c.get("tg_id") or 0,
+            "totalGB": c.get("total_gb") or 0, "updated_at": c.get("updated_at") or 0}
+
+
+plan, summary = {}, []
+for iid, tag, s in db.execute("select id, tag, settings from inbounds"):
+    st = json.loads(s)
+    if "clients" not in st:
+        continue
+    linked = db.execute(f"select ci.flow_override, {','.join('c.' + x for x in ccols)}"
+                        " from client_inbounds ci join clients c on c.id = ci.client_id"
+                        " where ci.inbound_id = ?", (iid,)).fetchall()
+    old = {c.get("email"): c for c in st.get("clients", [])}
+    new = []
+    for row in linked:
+        c = dict(zip(ccols, row[1:]))
+        e = entry(c, row[0])
+        if c["email"] in old:                       # keep what is already there
+            keep = dict(old[c["email"]])
+            keep.update({"id": e["id"] or keep.get("id", ""), "email": e["email"]})
+            new.append(keep)
+        else:
+            new.append(e)
+    added = [c["email"] for c in new if c["email"] not in old]
+    removed = [e for e in old if e not in {c["email"] for c in new}]
+    if added or removed:
+        summary.append((tag, len(old), len(new), added, removed))
+    st["clients"] = new
+    plan[tag] = st
+
+for tag, before, after, added, removed in summary:
+    print(f"{tag:<16} list {before} -> {after} | add {len(added)} {added[:3]}{'...' if len(added) > 3 else ''}"
+          f" | remove {len(removed)} {removed[:3]}")
+if not summary:
+    print("every inbound list already matches its links - nothing to do")
+if not apply:
+    print("\nshow only - nothing changed. Run with 'apply' to do it.")
+    sys.exit(0)
+
+backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+os.makedirs(backup)
+shutil.copy2(DB, backup)
+for tag, st in plan.items():
+    db.execute("update inbounds set settings=? where tag=?", (json.dumps(st, indent=2), tag))
+db.commit()
+subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+time.sleep(9)
+state = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
+print(f"\nrebuilt. backup {backup} | x-ui {state}")
+bad = []
+for iid, tag, s in db.execute("select id, tag, settings from inbounds"):
+    n = len(json.loads(s).get("clients", []))
+    links = db.execute("select count(*) from client_inbounds where inbound_id=?", (iid,)).fetchone()[0]
+    if n != links:
+        bad.append((tag, n, links))
+print("inbounds where list != links:", bad or "none")
+live = json.load(open("/usr/local/x-ui/bin/config.json"))
+print("live users per inbound:", {i.get("tag"): len(i.get("settings", {}).get("clients", []))
+                                  for i in live["inbounds"] if i.get("settings", {}).get("clients")})
+print(f"  undo: cp {backup}/x-ui.db {DB} && x-ui restart")

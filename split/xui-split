@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""xui-split - light traffic over a mux'ed outbound, heavy traffic over a plain one.
+
+    xui-split                       test only (default)
+    xui-split apply                 backup, test, apply, restart x-ui
+    xui-split remove                undo the split (keeps probe ports + RoutingService)
+    options: --main OUTBOUND        outbound to split (default: the one most inbounds use)
+             --no-tg-backup         leave the panel's Telegram backup setting alone
+
+Light traffic (web pages, messengers, APIs) goes to "<MAIN>-mux": a new connection
+rides an existing tunnel connection instead of paying a TCP handshake across the
+link. Heavy traffic (video, downloads, updates), UDP and Telegram stay on <MAIN>
+without mux, so one big download never shares a connection with anyone's chat.
+
+Also, for tunnel-guard:
+  * Xray's RoutingService is enabled, so routes can be switched without a restart
+  * every proxy outbound gets a local-only probe port (socks, 127.0.0.1:10808, 10809, ...)
+  * the catch-all rule gets ruleTag "main-<main>", the DNS cache upstream "dns-upstream"
+"""
+import collections, glob, json, os, shutil, sqlite3, subprocess, sys, time
+
+DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
+TAG = "split"
+PROBE_BASE = 10808
+NOT_PROXY = {"freedom", "blackhole", "dns"}
+HEAVY = [f"domain:{d}" for d in """
+googlevideo.com cdninstagram.com fbcdn.net tiktokcdn.com tiktokv.com nflxvideo.net
+ttvnw.net akamaized.net cloudfront.net scdn.co spotifycdn.com cdn-telegram.org
+windowsupdate.com delivery.mp.microsoft.com download.microsoft.com dl.google.com gvt1.com
+swcdn.apple.com updates.cdn-apple.com steamcontent.com steamserver.net
+githubusercontent.com dropboxusercontent.com mega.nz mega.co.nz mediafire.com
+docker.io docker.com speedtest.net ooklaserver.net hetzner.com""".split()]
+
+args = sys.argv[1:]
+mode = next((a for a in args if a in ("test", "apply", "remove")), "test")
+main_tag = args[args.index("--main") + 1] if "--main" in args else None
+tg_backup = "--no-tg-backup" not in args
+xray = (glob.glob(f"{BIN}/xray-linux-*") or [None])[0] or sys.exit(f"no xray in {BIN}")
+
+
+def catch_alls(rules, kinds):
+    """inbound-only rules that send users to a proxy outbound"""
+    return [r for r in rules if r.get("inboundTag") and kinds.get(r.get("outboundTag")) not in (None, *NOT_PROXY)
+            and "dns-internal" not in r["inboundTag"] and not r.get("ruleTag", "").startswith(("guard-", TAG + "-"))
+            and r.get("enabled") is not False                       # 3.x panels write "enabled" on saved rules
+            and set(r) <= {"type", "inboundTag", "outboundTag", "ruleTag", "enabled"}]
+
+
+def patch(t, remove=False):
+    global main_tag
+    kinds = {o.get("tag"): o.get("protocol") for o in t["outbounds"]}
+    if main_tag is None:
+        c = collections.Counter()
+        for r in catch_alls(t["routing"]["rules"], kinds):
+            c[r["outboundTag"]] += len(r["inboundTag"])
+        if not c:
+            sys.exit("no inbound is routed to a proxy outbound - nothing to split")
+        main_tag = c.most_common(1)[0][0]
+    if kinds.get(main_tag) in (None, *NOT_PROXY):
+        sys.exit(f"--main {main_tag}: not a proxy outbound")
+    mux_tag = f"{main_tag}-mux"
+
+    t["outbounds"] = [o for o in t["outbounds"] if o.get("tag") != mux_tag]
+    rules = [r for r in t["routing"]["rules"] if not r.get("ruleTag", "").startswith((TAG + "-", "guard-"))]
+    main = max((r for r in catch_alls(rules, kinds) if r["outboundTag"] == main_tag),
+               key=lambda r: len(r["inboundTag"]))
+    main["ruleTag"] = f"main-{main_tag.lower()}"
+    for r in rules:                  # DoH of the DNS cache: whatever outbound it was given
+        if r.get("inboundTag") == ["dns-internal"]:
+            r["ruleTag"] = "dns-upstream"
+
+    svc = t.setdefault("api", {}).setdefault("services", [])
+    if "RoutingService" not in svc:
+        svc.append("RoutingService")
+
+    # local-only probe port per proxy outbound, for tunnel-guard
+    # (a re-run keeps each outbound's existing port, so a running guard is not confused)
+    ports = {i["tag"]: i["port"] for i in t["inbounds"] if i.get("tag", "").startswith("guard-")}
+    t["inbounds"] = [i for i in t["inbounds"] if not i.get("tag", "").startswith("guard-")]
+    at = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
+    proxies = [o["tag"] for o in t["outbounds"] if o.get("protocol") not in NOT_PROXY and o.get("tag")
+               and not o["tag"].endswith("-mux")]
+    for ob in proxies:
+        tag = f"guard-{ob.lower()}"
+        if tag not in ports:
+            ports[tag] = next(p for p in range(PROBE_BASE, PROBE_BASE + 100) if p not in ports.values())
+        t["inbounds"].append({"tag": tag, "listen": "127.0.0.1", "port": ports[tag],
+                              "protocol": "socks", "settings": {"auth": "noauth", "udp": False}})
+        rules.insert(at, {"type": "field", "ruleTag": tag, "inboundTag": [tag], "outboundTag": ob})
+
+    if not remove:
+        base = next(o for o in t["outbounds"] if o.get("tag") == main_tag)
+        mux = json.loads(json.dumps(base))
+        mux["tag"] = mux_tag
+        mux["mux"] = {"enabled": True, "concurrency": 4, "xudpConcurrency": 8, "xudpProxyUDP443": "skip"}
+        t["outbounds"].insert(t["outbounds"].index(base) + 1, mux)
+        # the mux outbound gets a probe port too: it can stall while the tunnel under it is fine
+        mtag = f"guard-{mux_tag.lower()}"
+        if mtag not in ports:
+            ports[mtag] = next(p for p in range(PROBE_BASE, PROBE_BASE + 100) if p not in ports.values())
+        t["inbounds"].append({"tag": mtag, "listen": "127.0.0.1", "port": ports[mtag],
+                              "protocol": "socks", "settings": {"auth": "noauth", "udp": False}})
+        rules.insert(at, {"type": "field", "ruleTag": mtag, "inboundTag": [mtag], "outboundTag": mux_tag})
+        ib = main["inboundTag"]
+        new = [
+            {"type": "field", "ruleTag": f"{TAG}-udp", "inboundTag": ib, "network": "udp", "outboundTag": main_tag},
+            {"type": "field", "ruleTag": f"{TAG}-heavy", "inboundTag": ib, "domain": HEAVY, "outboundTag": main_tag},
+            {"type": "field", "ruleTag": f"{TAG}-telegram", "inboundTag": ib, "ip": ["geoip:telegram"], "outboundTag": main_tag},
+            {"type": "field", "ruleTag": f"{TAG}-light", "inboundTag": ib, "outboundTag": mux_tag},
+        ]
+        i = rules.index(main)
+        rules[i:i] = new
+    t["routing"]["rules"] = rules
+    return t
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    db = sqlite3.connect(DB)
+    tpl = patch(json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0]),
+                remove=(mode == "remove"))
+
+    cfg = json.load(open(f"{BIN}/config.json"))
+    for k in ("api", "outbounds", "routing"):
+        cfg[k] = tpl[k]
+    cfg["inbounds"] = [i for i in cfg["inbounds"] if not i.get("tag", "").startswith("guard-")] + \
+                      [i for i in tpl["inbounds"] if i.get("tag", "").startswith("guard-")]
+    path = "/tmp/xui-split-candidate.json"
+    json.dump(cfg, open(path, "w"))
+    os.chmod(path, 0o600)
+    out = subprocess.run([xray, "run", "-test", "-c", path], cwd=BIN, capture_output=True, text=True)
+    os.remove(path)
+    if "Configuration OK" not in out.stdout + out.stderr:
+        print(out.stdout + out.stderr)
+        sys.exit("xray rejected the new config - nothing changed")
+    print(f"split outbound: {main_tag}\nConfiguration OK")
+    for r in tpl["routing"]["rules"]:
+        print("  ", r.get("ruleTag", "-"), "->", r.get("outboundTag") or r.get("balancerTag"))
+    if mode == "test":
+        return
+
+    backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    os.makedirs(backup)
+    db.close()
+    for f in (DB, f"{BIN}/config.json"):
+        shutil.copy2(f, backup)
+    db = sqlite3.connect(DB)
+    db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
+    if mode == "apply" and tg_backup:
+        db.execute("update settings set value='true' where key='tgBotBackup'")
+    db.commit()
+    db.close()
+    subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+    time.sleep(6)
+    state = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
+    if shutil.which("config-guard"):   # removed or renamed on purpose: the new baseline
+        subprocess.run(["config-guard", "--save"], capture_output=True)
+    print(f"{mode} done, backup {backup}, x-ui {state}")
+    print(f"  undo: cp {backup}/x-ui.db {DB} && x-ui restart")
+
+
+if __name__ == "__main__":
+    main()

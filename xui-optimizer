@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""xui-optimizer - ad blocking and a DNS cache for x-ui (3x-ui) servers.
+
+Run as root on a server where users connect to x-ui and inbounds are routed
+to a proxy outbound (another server, usually through a tunnel):
+
+    xui-optimizer --dry-run     build and test the new config, change nothing
+    xui-optimizer               back up, test, apply, restart x-ui
+    xui-optimizer --remove      take the ad block and DNS cache out again
+    xui-optimizer --adblock on|off   only the ad block; the DNS cache and every other rule
+                                stay exactly as they are (what the Optimizer page's switch runs)
+
+What it changes, in the panel's own database so the panel keeps it:
+
+  * ad block   - geosite:category-ads-all goes to the blackhole outbound, for every
+                 inbound routed to a proxy outbound
+  * DNS cache  - DNS from users (port 53) is answered by Xray on this server; misses are
+                 fetched over DoH through the proxy outbound, never from local resolvers
+  * sniffing   - turned on with routeOnly, so the ad block also sees domains when a
+                 client sends bare IPs; the connection target is left untouched
+
+Inbounds routed to `direct` (or anything that is not a proxy) are left alone.
+Safe to re-run: earlier changes are replaced, not duplicated.
+"""
+import argparse, collections, glob, json, os, shutil, sqlite3, subprocess, sys, time
+
+DB = "/etc/x-ui/x-ui.db"
+BIN = "/usr/local/x-ui/bin"
+TAG = "xui-optimizer"
+DNS_TAG = "dns-internal"
+DOH = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+SNIFF = {"enabled": True, "destOverride": ["http", "tls", "quic"],
+         "metadataOnly": False, "routeOnly": True}
+NOT_PROXY = {"freedom", "blackhole", "dns"}
+
+
+def die(msg):
+    sys.exit(f"xui-optimizer: {msg}")
+
+
+def ours(rule):
+    """Rules this tool adds - also recognises the untagged ones from its first version."""
+    return (rule.get("ruleTag", "").startswith(TAG)
+            or rule.get("outboundTag") == "dns-out"
+            or rule.get("inboundTag") == [DNS_TAG]
+            or rule.get("domain") == ["geosite:category-ads-all"])
+
+
+def plan(tpl, dns_via):
+    """Work out which inbounds are routed abroad, and through which outbound."""
+    kinds = {o.get("tag"): o.get("protocol") for o in tpl["outbounds"]}
+    blackhole = next((t for t, p in kinds.items() if p == "blackhole"), None)
+    route = {}  # inbound -> outbound, from rules that match on inbound alone
+    for r in tpl["routing"]["rules"]:
+        # 3.x panels write "enabled" on every rule they save; a disabled rule routes nothing
+        if ours(r) or r.get("enabled") is False or set(r) - {"type", "inboundTag", "outboundTag", "ruleTag", "enabled"}:
+            continue
+        for ib in r.get("inboundTag", []):
+            if ib.startswith("guard-") or ib in ("api", DNS_TAG):   # probe ports and internals carry no users
+                continue
+            ob = r.get("outboundTag")
+            # xui-split's "-mux" copy is the same path: an inbound whose first rule is
+            # split-light still belongs to the base outbound
+            if ob and ob.endswith("-mux") and ob[:-4] in kinds:
+                ob = ob[:-4]
+            route.setdefault(ib, ob)
+    abroad = {ib: ob for ib, ob in route.items()
+              if ob in kinds and kinds[ob] not in NOT_PROXY}
+    if not abroad:
+        die("no inbound is routed to a proxy outbound - nothing to do")
+    if dns_via is None:
+        # the outbound of xui-split's catch-all if there is one, else the busiest - never a
+        # "-mux" copy: DoH is one long connection and gains nothing from mux
+        main = next((r.get("outboundTag") for r in tpl["routing"]["rules"]
+                     if (r.get("ruleTag") or "").startswith("main-")), None)
+        busiest = [ob for ob, _ in collections.Counter(abroad.values()).most_common() if not ob.endswith("-mux")]
+        dns_via = main or (busiest or list(abroad.values()))[0]
+    elif kinds.get(dns_via) in (None, *NOT_PROXY):
+        die(f"--dns-via {dns_via}: no such proxy outbound (have: {', '.join(sorted(set(abroad.values())))})")
+    return abroad, dns_via, blackhole
+
+
+def strip(tpl):
+    tpl["routing"]["rules"] = [r for r in tpl["routing"]["rules"] if not ours(r)]
+    tpl["outbounds"] = [o for o in tpl["outbounds"] if o.get("tag") != "dns-out"]
+    if tpl.get("dns", {}).get("tag") == DNS_TAG:
+        del tpl["dns"]
+
+
+def patch(tpl, abroad, dns_via, blackhole, adblock, dns):
+    strip(tpl)
+    new = []
+    if dns:
+        if "dns" in tpl:
+            die("the template already has its own 'dns' section; run with --no-dns or remove it")
+        tpl["dns"] = {"tag": DNS_TAG, "queryStrategy": "UseIP", "servers": DOH}
+        tpl["outbounds"].append({"tag": "dns-out", "protocol": "dns",
+                                 "settings": {"nonIPQuery": "reject"}})
+        via = sorted(ib for ib, ob in abroad.items() if ob == dns_via)
+        if not via:
+            die(f"no inbound is routed to {dns_via}, so the DNS cache would serve nobody; pick one with --dns-via")
+        # "dns-upstream" is the name xui-split, tunnel-guard (failover) and config-guard use
+        new += [{"type": "field", "ruleTag": "dns-upstream",
+                 "inboundTag": [DNS_TAG], "outboundTag": dns_via},
+                {"type": "field", "ruleTag": f"{TAG}-dns-cache",
+                 "inboundTag": via, "port": "53", "outboundTag": "dns-out"}]
+    if adblock:
+        if not blackhole:
+            tpl["outbounds"].append({"tag": "blocked", "protocol": "blackhole", "settings": {}})
+            blackhole = "blocked"
+        new.append({"type": "field", "ruleTag": f"{TAG}-adblock", "inboundTag": sorted(abroad),
+                    "domain": ["geosite:category-ads-all"], "outboundTag": blackhole})
+    rules = tpl["routing"]["rules"]
+    at = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
+    rules[at:at] = new
+
+
+def is_ad(rule):
+    return rule.get("domain") == ["geosite:category-ads-all"]
+
+
+def adblock_only(db_path, on, restart=True, dry=False):
+    """Add or remove the one ad-block rule and nothing else. A full run would rebuild the DNS
+    rules too, under this tool's own tags, and a hub whose guard and config-guard know those
+    rules by other names (dns-upstream, ...) must not have them renamed."""
+    db = sqlite3.connect(db_path)
+    tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    rules = tpl["routing"]["rules"]
+    had = any(is_ad(r) for r in rules)
+    tpl["routing"]["rules"] = rules = [r for r in rules if not is_ad(r)]
+    abroad = {}
+    if on:
+        abroad, _, blackhole = plan(tpl, None)
+        if not blackhole:
+            tpl["outbounds"].append({"tag": "blocked", "protocol": "blackhole", "settings": {}})
+            blackhole = "blocked"
+        at = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
+        rules.insert(at, {"type": "field", "ruleTag": f"{TAG}-adblock", "inboundTag": sorted(abroad),
+                          "domain": ["geosite:category-ads-all"], "outboundTag": blackhole})
+    elif not had:
+        print("ad block is already off")
+        return
+    with open(f"{BIN}/config.json") as f:
+        cfg = json.load(f)
+    cfg.update({k: v for k, v in tpl.items() if k != "inbounds"})
+    for ib in cfg.get("inbounds", []):
+        if ib.get("tag") in abroad:
+            ib["sniffing"] = SNIFF                       # the rule matches domains: sniffing has to see them
+    xray_test(cfg)
+    if dry:
+        print("dry run - xray: Configuration OK; would turn the ad block %s for: %s"
+              % ("on" if on else "off", ", ".join(sorted(abroad)) or "-"))
+        return
+    backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    os.makedirs(backup)
+    db.close()
+    shutil.copy2(db_path, backup)
+    shutil.copy2(f"{BIN}/config.json", backup)
+    db = sqlite3.connect(db_path)
+    db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
+    for tag in abroad:
+        db.execute("update inbounds set sniffing=? where tag=?", (json.dumps(SNIFF, indent=2), tag))
+    db.commit()
+    db.close()
+    if restart:                                          # position matters, and the API only appends
+        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+        time.sleep(5)
+    accept_in_config_guard()
+    print(("ad block on for: " + ", ".join(sorted(abroad))) if on else "ad block off")
+    print(f"backup in {backup}")
+
+
+def accept_in_config_guard():
+    """This tool removed or renamed tagged rules on purpose: make that config-guard's new
+    baseline, or it would put them straight back (it watches config.json)."""
+    if shutil.which("config-guard"):
+        subprocess.run(["config-guard", "--save"], capture_output=True)
+
+
+def xray_test(cfg):
+    xray = (glob.glob(f"{BIN}/xray-linux-*") or [None])[0]
+    if not xray:
+        die(f"no xray binary in {BIN}")
+    path = f"/tmp/{TAG}-candidate.json"
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    out = subprocess.run([xray, "run", "-test", "-c", path], cwd=BIN,
+                         capture_output=True, text=True)
+    if out.returncode != 0 or "Configuration OK" not in out.stdout + out.stderr:
+        print(out.stdout + out.stderr, file=sys.stderr)
+        die(f"xray rejected the new config ({path}); nothing was changed")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--db", default=DB)
+    ap.add_argument("--dns-via", metavar="OUTBOUND",
+                    help="outbound that DoH lookups leave through (default: the busiest one)")
+    ap.add_argument("--no-adblock", action="store_true")
+    ap.add_argument("--no-dns", action="store_true")
+    ap.add_argument("--remove", action="store_true", help="undo; sniffing is left as it is")
+    ap.add_argument("--dry-run", action="store_true", help="test only, change nothing")
+    ap.add_argument("--no-restart", action="store_true")
+    ap.add_argument("--adblock", choices=("on", "off"), help="only switch the ad block")
+    a = ap.parse_args()
+
+    if os.geteuid() != 0:
+        die("run this as root")
+    if not os.path.exists(a.db):
+        die(f"{a.db} not found - is x-ui installed?")
+
+    if a.adblock:
+        return adblock_only(a.db, a.adblock == "on", not a.no_restart, a.dry_run)
+
+    db = sqlite3.connect(a.db)
+    row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+    if not row:
+        die("x-ui has no xrayTemplateConfig setting")
+    tpl = json.loads(row[0])
+
+    if a.remove:
+        strip(tpl)
+        abroad = {}
+    else:
+        abroad, dns_via, blackhole = plan(tpl, a.dns_via)
+        patch(tpl, abroad, dns_via, blackhole, not a.no_adblock, not a.no_dns)
+
+    # Test the whole thing against the running config before touching the database.
+    with open(f"{BIN}/config.json") as f:
+        cfg = json.load(f)
+    live = {k: v for k, v in tpl.items() if k != "inbounds"}
+    cfg.update(live)
+    for k in ("dns",):
+        if k not in tpl:
+            cfg.pop(k, None)
+    for ib in cfg.get("inbounds", []):
+        if ib.get("tag") in abroad:
+            ib["sniffing"] = SNIFF
+    xray_test(cfg)
+
+    if a.remove:
+        print("will remove the ad block and DNS cache")
+    else:
+        print(f"inbounds routed abroad: {', '.join(sorted(abroad))}")
+        if not a.no_adblock:
+            print("  ad block:  all of them")
+        if not a.no_dns:
+            print(f"  DNS cache: {', '.join(sorted(i for i, o in abroad.items() if o == dns_via))}"
+                  f" (DoH via {dns_via})")
+    print("xray: Configuration OK")
+    if a.dry_run:
+        print(f"dry run - nothing changed; candidate is /tmp/{TAG}-candidate.json")
+        return
+
+    backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    os.makedirs(backup)
+    db.close()
+    shutil.copy2(a.db, backup)
+    shutil.copy2(f"{BIN}/config.json", backup)
+    db = sqlite3.connect(a.db)
+
+    db.execute("update settings set value=? where key='xrayTemplateConfig'",
+               (json.dumps(tpl, indent=2),))
+    for tag in abroad:
+        db.execute("update inbounds set sniffing=? where tag=?", (json.dumps(SNIFF, indent=2), tag))
+    db.commit()
+    db.close()
+    print(f"applied; backup in {backup}")
+    print(f"  undo: cp {backup}/x-ui.db {a.db} && x-ui restart")
+    accept_in_config_guard()
+
+    if not a.no_restart:
+        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+        time.sleep(5)
+        state = subprocess.run(["systemctl", "is-active", "x-ui"],
+                               capture_output=True, text=True).stdout.strip()
+        print(f"x-ui: {state}")
+        if state != "active":
+            die(f"x-ui did not come back - restore the backup: cp {backup}/x-ui.db {a.db} && x-ui restart")
+
+
+if __name__ == "__main__":
+    main()

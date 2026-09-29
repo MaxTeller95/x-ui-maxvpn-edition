@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""tunnel-guard - keeps users online when a tunnel abroad fails. Runs every minute.
+
+  * tests each path with a real request through its own local probe port
+  * restarts a tunnel whose handshake is stale
+  * primary down twice in a row -> moves users to the first healthy backup (in the order
+    given) through Xray's routing API: no restart, nobody is disconnected. If that backup
+    fails too, on to the next one. Back to the primary after 3 healthy minutes.
+  * Telegram alerts through whichever path works, and a daily report
+
+    tunnel-guard            one run (what the timer does)
+    tunnel-guard --check    show status, change nothing, send nothing
+    tunnel-guard --report   send the daily report now
+    tunnel-guard --test     send a test message
+Settings: /etc/tunnel-guard.json (see tunnel-guard.example.json)
+Decisions are logged to the journal: journalctl -t tunnel-guard
+"""
+import json, os, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
+
+CONF = os.environ.get("TUNNEL_GUARD_CONF", "/etc/tunnel-guard.json")
+DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
+XRAY, API = "/usr/local/x-ui/bin/xray-linux-amd64", "127.0.0.1:62789"
+STATE = "/var/lib/tunnel-guard/state.json"
+HOLD = "/var/lib/tunnel-guard/hold"     # a path name in here pins users to that path (dashboard)
+SITES = ["https://www.google.com/generate_204"]
+
+try:
+    C = json.load(open(CONF))
+except FileNotFoundError:
+    sys.exit(f"tunnel-guard: {CONF} not found - copy tunnel-guard.example.json there and edit it")
+PATHS = C["paths"]      # name: {peer, iface (tunnel paths only), tun (local sing-box tun to time through),
+                        #        probe (mtunnel-probe name, optional)}
+PRIMARY = C["primary"]
+BACKUPS = C.get("backups") or [C["backup"]]   # in order of preference
+FAILS_TO_SWITCH = C.get("fails_to_switch", 2)
+OKS_TO_RETURN = C.get("oks_to_return", 3)
+HOP_AFTER = C.get("hop_after_fails", 4)   # runs down before the UDP port is blamed
+HANDSHAKE_STALE = C.get("handshake_stale_sec", 180)
+RESTART_COOLDOWN = C.get("restart_cooldown_sec", 600)
+REPORT_HOUR_UTC = C.get("report_hour_utc", 5)
+CERT, CERT_WARN_DAYS = C.get("cert"), C.get("cert_warn_days", 20)
+RESTORE = ["dns-upstream", "split-udp", "split-heavy", "split-telegram", "split-light",
+           f"main-{PRIMARY.lower()}"]
+
+# A "<name>-mux" path is watched but never failed over to: it is the same tunnel with mux on,
+# carrying the light traffic. When it stalls, only the light rule moves (see light_bypass).
+MUX = C.get("mux_path") or next((n for n in PATHS if n.lower().endswith("-mux")), None)
+MUX_FALL = C.get("mux_fallback") or (MUX.rsplit("-", 1)[0] if MUX else None)
+
+# Probe ports come from the live config (inbounds "guard-<name>" made by xui-split).
+_live = {i.get("tag"): i.get("port") for i in json.load(open(CFG)).get("inbounds", [])}
+for _n, _p in PATHS.items():
+    _p["socks"] = _p.get("socks") or _live.get(f"guard-{_n.lower()}")
+    if not _p["socks"]:
+        sys.exit(f"tunnel-guard: no probe port guard-{_n.lower()} in {CFG} - run xui-split first")
+
+check_only = "--check" in sys.argv
+
+
+def log(msg):
+    syslog.syslog(msg)
+    print(msg)
+
+
+def run(*cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+
+
+def fetch(port, url, t=8):
+    r = run("curl", "-s", "-o", "/dev/null", "-m", str(t), "-w", "%{http_code} %{time_total}",
+            "--socks5-hostname", f"127.0.0.1:{port}", url, timeout=t + 2)
+    code, secs = (r.stdout.split() + ["000", "0"])[:2]
+    return code not in ("000", ""), float(secs)
+
+
+def handshake_age(iface):
+    r = run("awg", "show", iface, "latest-handshakes")
+    ts = [int(x.split()[1]) for x in r.stdout.splitlines() if len(x.split()) == 2]
+    return int(time.time()) - max(ts) if ts and max(ts) else 10 ** 6
+
+
+def is_local(host):
+    """True if HOST routes to this machine (e.g. the local end of a sing-box tun)."""
+    r = run("ip", "route", "get", host)
+    return r.returncode == 0 and r.stdout.startswith("local ")
+
+
+def ping(peer):
+    if is_local(peer):  # pinging ourselves gives 0 ms - no answer is better than a wrong one
+        return 0, None
+    r = run("ping", "-c", "3", "-i", "0.3", "-W", "1", "-q", peer)
+    loss, rtt = 100, None
+    for line in r.stdout.splitlines():
+        if "packet loss" in line:
+            loss = int(float(line.split("%")[0].split()[-1]))
+        if line.startswith("rtt"):
+            rtt = float(line.split("/")[4])
+    return loss, rtt
+
+
+def tun_rtt(iface, n=3):
+    """RTT through a local proxy tun (sing-box). ICMP cannot cross it (sing-box answers pings
+    itself) and it fakes the TCP handshake too, so the first request pays for the real dial and
+    the next N, on the same kept-alive connection, each take one true round trip."""
+    url = C.get("tun_rtt_url", "http://1.1.1.1/cdn-cgi/trace")
+    r = run("curl", "-s", "-m", "8", "--interface", iface, "-w", "%{num_connects} %{http_code} %{time_starttransfer}\n",
+            *(["-o", "/dev/null", url] * (n + 1)), timeout=10)
+    rows = [l.split() for l in r.stdout.splitlines() if len(l.split()) == 3]
+    reused = [float(t) for c, code, t in rows[1:] if c == "0" and code != "000"]
+    if not rows or rows[0][1] == "000":
+        return 100, None
+    return round(100 * (n - len(reused)) / n), round(min(reused) * 1000, 1) if reused else None
+
+
+def probe(name):
+    p = PATHS[name]
+    ok, secs = fetch(p["socks"], SITES[0])
+    if not ok:  # one retry: a single lost SYN is not an outage
+        ok, secs = fetch(p["socks"], SITES[0])
+    loss, rtt = tun_rtt(p["tun"]) if p.get("tun") else ping(p["peer"]) if p.get("peer") else (0, None)
+    return {"ok": ok, "secs": round(secs, 2), "loss": loss, "rtt": rtt,
+            "hs": handshake_age(p["iface"]) if p.get("iface") else None}
+
+
+# ---------------------------------------------------------------- Telegram
+def tg_creds():
+    db = sqlite3.connect(DB)
+    get = lambda k: (db.execute("select value from settings where key=?", (k,)).fetchone() or [""])[0]
+    return get("tgBotToken"), get("tgBotChatId").split(",")[0].strip()
+
+
+def send(text, prefer=None):
+    if check_only:
+        print("[telegram]", text.replace("\n", " | "))
+        return True
+    token, chat = tg_creds()
+    if not token or not chat:
+        return False
+    order = [prefer] if prefer else []
+    order += [n for n in [PRIMARY] + BACKUPS if n not in order]
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"})
+    for name in order:
+        r = run("curl", "-s", "-m", "15", "--socks5-hostname", f"127.0.0.1:{PATHS[name]['socks']}",
+                "-d", body, f"https://api.telegram.org/bot{token}/sendMessage", timeout=20)
+        if '"ok":true' in r.stdout:
+            return True
+    log("telegram: could not send through any path")
+    return False
+
+
+# ---------------------------------------------------------------- routing API
+def live_tags():
+    r = run(XRAY, "api", "lsrules", f"--server={API}")
+    return r.stdout
+
+
+def rules_from_config(tags):
+    rules = json.load(open(CFG))["routing"]["rules"]
+    by_tag = {r.get("ruleTag"): r for r in rules if r.get("ruleTag")}
+    return [by_tag[t] for t in tags if t in by_tag]
+
+
+def add_rules(rules):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"routing": {"rules": rules}}, f)
+    try:
+        r = run(XRAY, "api", "adrules", f"--server={API}", "-append", f.name)
+        return r.returncode == 0
+    finally:
+        os.unlink(f.name)
+
+
+def rm_rules(tags):
+    run(XRAY, "api", "rmrules", f"--server={API}", *tags)
+
+
+def failover(target):
+    main = rules_from_config([f"main-{PRIMARY.lower()}"])
+    if not main:
+        log(f"failover: no main-{PRIMARY.lower()} rule in config.json - nothing to move")
+        return False
+    rm_rules(RESTORE + ["fo-dns", "fo-main"])
+    ok = add_rules([
+        {"type": "field", "ruleTag": "fo-dns", "inboundTag": ["dns-internal"], "outboundTag": target},
+        {"type": "field", "ruleTag": "fo-main", "inboundTag": main[0]["inboundTag"], "outboundTag": target},
+    ])
+    log(f"failover to {target}: {'ok' if ok else 'FAILED'}")
+    return ok
+
+
+def failback():
+    rm_rules(["fo-dns", "fo-main"])
+    ok = add_rules(rules_from_config(RESTORE))
+    log(f"failback to {PRIMARY}: {'ok' if ok else 'FAILED'}")
+    return ok
+
+
+def light_bypass():
+    """Light traffic stops going through the mux outbound: with split-light gone it falls
+    through to the main rule, which is the same tunnel without mux."""
+    rm_rules(["split-light"])
+    log(f"light traffic moved off {MUX} to {MUX_FALL}")
+    return True
+
+
+def light_restore():
+    rm_rules(RESTORE)
+    ok = add_rules(rules_from_config(RESTORE))
+    log(f"light traffic back on {MUX}: {'ok' if ok else 'FAILED'}")
+    return ok
+
+
+# ---------------------------------------------------------------- daily report
+def gib(b):
+    return f"{b / 2 ** 30:.1f} GiB"
+
+
+def report(st):
+    day = time.strftime("%F", time.gmtime(time.time() - 86400))
+    lines = [f"📊 گزارش روزانه هاب — {day}"]
+    for name, p in PATHS.items():
+        r = run("vnstat", "-i", p.get("iface") or "-", "--json", "d", "2")
+        try:
+            d = [x for x in json.loads(r.stdout)["interfaces"][0]["traffic"]["day"]
+                 if "%04d-%02d-%02d" % (x["date"]["year"], x["date"]["month"], x["date"]["day"]) == day][0]
+            traffic = f"↓{gib(d['rx'])} ↑{gib(d['tx'])}"
+        except Exception:
+            traffic = "?"
+        s = r_ = lost = rtts = 0
+        try:
+            for row in open(f"/var/log/mtunnel/probe-{day}.csv"):
+                ts, path, sent, recv, avg = (row.strip().split(",") + [""])[:5]
+                if path == PATHS[name].get("probe"):  # name used by mtunnel-probe
+                    s, r_ = s + int(sent), r_ + int(recv)
+                    if avg:
+                        rtts, lost = rtts + float(avg), lost + 1
+        except FileNotFoundError:
+            pass
+        loss = f"{100 * (s - r_) / s:.1f}%" if s else "?"
+        rtt = f"{rtts / lost:.0f}ms" if lost else "?"
+        lines.append(f"{name}: {traffic} | loss {loss} | rtt {rtt}")
+    outs = [o for o in st.get("outages", []) if time.strftime("%F", time.gmtime(o["start"])) == day]
+    lines.append(f"قطعی‌ها: {len(outs)}" + "".join(
+        f"\n  {o['path']} {time.strftime('%H:%M', time.gmtime(o['start']))} "
+        + ("(removed)" if o.get('removed') and 'end' not in o else
+         f"({max(1, round((o.get('end', time.time()) - o['start']) / 60))} min)") for o in outs))
+    db = sqlite3.connect(DB)
+    now = {e: u + d for e, u, d in db.execute("select email, up, down from client_traffics")}
+    prev = st.get("usage", {})
+    top = sorted(((now[e] - prev.get(e, now[e]), e) for e in now), reverse=True)[:5]
+    if prev and top and top[0][0] > 0:
+        lines.append("پرمصرف‌ترین‌ها:" + "".join(f"\n  {e}: {gib(b)}" for b, e in top if b > 0))
+    lines += renewals(db)
+    st["usage"] = now
+    return "\n".join(lines)
+
+
+def renewals(db):
+    """Who needs a new plan soon - only on panels that keep clients in their own table (3.x)."""
+    out = []
+    try:
+        soon = db.execute("select email, expiry_time from clients where enable = 1 and expiry_time > 0"
+                          " and expiry_time < ? order by expiry_time", (int((time.time() + 3 * 86400) * 1000),)).fetchall()
+        full = db.execute("select c.email, c.total_gb, t.up + t.down from clients c"
+                          " join client_traffics t on t.email = c.email"
+                          " where c.enable = 1 and c.total_gb > 0 and (t.up + t.down) * 10 >= c.total_gb * 9"
+                          " order by (t.up + t.down) * 1.0 / c.total_gb desc").fetchall()
+    except sqlite3.Error:
+        return out
+    if soon:
+        out.append("رو به انقضا (۳ روز):" + "".join(
+            "\n  %s: %.1f روز" % (e, max(0, (x / 1000 - time.time()) / 86400)) for e, x in soon[:8]))
+    if full:
+        out.append("حجم رو به اتمام:" + "".join(
+            "\n  %s: %.0f%%" % (e, 100.0 * u / q) for e, q, u in full[:8]))
+    return out
+
+
+# ---------------------------------------------------------------- main
+def forget_removed(st):
+    """A path removed while it was down would stay "down" forever: close its outage as
+    removed (not as recovered - nobody knows when it would have come back) and drop the
+    counters kept for it."""
+    now = time.time()
+    for o in st.get("outages", []):
+        if o["path"] not in PATHS and "end" not in o and "removed" not in o:
+            o["removed"] = now
+    for key in ("fails", "oks", "down", "last", "restart_told"):
+        for n in [n for n in (st.get(key) or {}) if n not in PATHS]:
+            st[key].pop(n, None)
+
+
+def main():
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    try:
+        st = json.load(open(STATE))
+    except Exception:
+        st = {}
+    st.setdefault("fails", {}), st.setdefault("oks", {}), st.setdefault("restart", {})
+    st.setdefault("outages", []), st.setdefault("down", {})
+    st.setdefault("light", "mux"), st.setdefault("hopwait", {}), st.setdefault("restart_told", {})
+    if "on" not in st:  # older state files had a single backup
+        st["on"] = BACKUPS[0] if st.get("failed_over") else PRIMARY
+    forget_removed(st)
+
+    if "--test" in sys.argv:
+        print("sent" if send("✅ tunnel-guard: پیام آزمایشی") else "not sent")
+        return
+    if "--say" in sys.argv:            # so other tools (config-guard) reuse this delivery
+        i = sys.argv.index("--say")
+        text = sys.argv[i + 1] if len(sys.argv) > i + 1 else ""
+        print("sent" if text and send(text) else "not sent")
+        return
+    if "--report" in sys.argv:
+        send(report(st))
+        json.dump(st, open(STATE, "w"))
+        return
+
+    res = {n: probe(n) for n in PATHS}
+    for n, r in res.items():
+        print(f"{n}: {'OK ' if r['ok'] else 'DOWN'} http {r['secs']}s  ping loss {r['loss']}%"
+              f" rtt {r['rtt']}" + (f"  handshake {r['hs']}s ago" if r["hs"] is not None else ""))
+        st["fails"][n] = 0 if r["ok"] else st["fails"].get(n, 0) + 1
+        st["oks"][n] = st["oks"].get(n, 0) + 1 if r["ok"] else 0
+    print(f"users on: {st['on'] + (' (failed over)' if st['on'] != PRIMARY else '')}")
+    if check_only:
+        return
+    st["last"], st["last_ts"] = res, int(time.time())
+
+    now = time.time()
+    for n, r in res.items():
+        iface = PATHS[n].get("iface")
+        # outage bookkeeping + alerts
+        if not r["ok"] and st["fails"][n] == FAILS_TO_SWITCH and not st["down"].get(n):
+            st["down"][n] = now
+            st["outages"].append({"path": n, "start": now})
+            send(f"🔴 مسیر {n} قطع شد\nping loss {r['loss']}%" + (f" | handshake {r['hs']}s ago" if iface else ""),
+                 prefer=next((x for x in [PRIMARY] + BACKUPS if x != n and res[x]["ok"]), None))
+        # "back" only once it has stayed up OKS_TO_RETURN runs in a row: a filtered UDP tunnel
+        # can handshake and pass one probe, then die a minute later - that is not a return.
+        if r["ok"] and st["down"].get(n) and st["oks"][n] >= OKS_TO_RETURN:
+            mins = round((now - st["down"].pop(n)) / 60)
+            st["restart_told"].pop(n, None)
+            for o in reversed(st["outages"]):
+                if o["path"] == n and "end" not in o:
+                    o["end"] = now
+                    break
+            extra = f"\nhandshake {r['hs']}s ago | rtt {r['rtt']}" if iface else ""
+            back = "\nکاربرها خودکار برمی‌گردن." if n == PRIMARY and st["on"] != PRIMARY else ""
+            send(f"🟢 مسیر {n} برگشت و {OKS_TO_RETURN} دقیقه پایدار مانده "
+                 f"(قطعی {mins} دقیقه){extra}{back}")
+        # stale handshake: restart the tunnel, at most every RESTART_COOLDOWN
+        if iface and r["hs"] > HANDSHAKE_STALE and now - st["restart"].get(iface, 0) > RESTART_COOLDOWN:
+            st["restart"][iface] = now
+            run("systemctl", "try-restart", f"wstunnel-{iface}.service", timeout=30)  # AWG over TCP, if used
+            run("systemctl", "restart", f"awg-quick@{iface}", timeout=30)
+            log(f"{iface}: handshake {r['hs']}s old, restarted awg-quick@{iface}")
+            if not st["restart_told"].get(n):   # once per outage; the rest go to the log only
+                st["restart_told"][n] = now
+                send(f"🔄 تانل {iface} ({n}) handshake نداشت ({r['hs']}s) — ری‌استارت شد.\n"
+                     f"تا برگشتن، هر {RESTART_COOLDOWN // 60} دقیقه بی‌صدا دوباره امتحان می‌شه "
+                     f"و وقتی پایدار شد خبر می‌دم.")
+            st["hopwait"][n] = now          # give the restart a chance before hopping
+        # a restart that did not help means the port itself is filtered, not the link:
+        # the daemons are fine and UDP to the same server works on any other port.
+        if (iface and PATHS[n].get("hop") and r["hs"] > HANDSHAKE_STALE
+                and st["fails"][n] >= HOP_AFTER
+                and 0 < now - st["hopwait"].get(n, 0) < 10 * 60
+                and any(res[x]["ok"] for x in res if x != n)):   # the hub's own internet is fine
+            st["hopwait"].pop(n, None)
+            log(f"{n}: restart did not bring the handshake back - hopping the UDP port")
+            run("/usr/local/sbin/awg-hop", n, timeout=180)
+
+    # The mux path carries the light traffic. It can stall on its own while the tunnel under it
+    # is perfectly healthy - one stuck carrier connection freezes every stream riding it - so it
+    # is watched separately and only the light rule moves.
+    if MUX in res and st["on"] == PRIMARY:
+        if st["light"] == "mux" and st["fails"][MUX] >= FAILS_TO_SWITCH:
+            if light_bypass():
+                st["light"] = "direct"
+                send(f"⚠️ مسیر {MUX} جواب نمی‌دهد — ترافیک سبک "
+                     f"فعلاً از {MUX_FALL} می‌رود (بدون قطعی).")
+        elif st["light"] == "direct" and st["oks"][MUX] >= OKS_TO_RETURN:
+            if light_restore():
+                st["light"] = "mux"
+                send(f"✅ مسیر {MUX} برگشت — ترافیک سبک دوباره روی mux.")
+        elif st["light"] == "direct" and "split-light" in live_tags():
+            log("split-light came back after an Xray restart - moving light traffic off mux again")
+            light_bypass()
+    elif MUX and st["on"] != PRIMARY:
+        st["light"] = "mux"   # a full failover drops split-light anyway; decide again after failback
+
+    # Failover / failback of users' traffic.
+    healthy = [b for b in BACKUPS if res[b]["ok"]]
+    try:
+        hold = open(HOLD).read().strip()
+    except FileNotFoundError:
+        hold = ""
+    if hold in PATHS:  # pinned by hand: keep users there, no automatic decisions
+        if st["on"] != hold or (hold != PRIMARY and "fo-main" not in live_tags()):
+            if (failback() if hold == PRIMARY else failover(hold)):
+                if st["on"] != hold:
+                    send(f"📌 کاربرها دستی روی {hold} نگه داشته شدن (از داشبورد).")
+                st["on"] = hold
+    elif st["on"] == PRIMARY:
+        if st["fails"][PRIMARY] >= FAILS_TO_SWITCH and healthy and failover(healthy[0]):
+            st["on"] = healthy[0]
+            send(f"↪️ کاربرها به {healthy[0]} منتقل شدن (بدون قطعی). وقتی {PRIMARY} "
+                 f"{OKS_TO_RETURN} دقیقه سالم بمونه برمی‌گردن.", prefer=healthy[0])
+    else:
+        cur = st["on"]
+        others = [b for b in healthy if b != cur]
+        if st["oks"][PRIMARY] >= OKS_TO_RETURN and failback():
+            st["on"] = PRIMARY
+            send(f"↩️ کاربرها به {PRIMARY} برگشتن.")
+        elif st["fails"].get(cur, 0) >= FAILS_TO_SWITCH and others and failover(others[0]):
+            st["on"] = others[0]
+            send(f"↪️ {cur} هم قطع شد — کاربرها به {others[0]} منتقل شدن.", prefer=others[0])
+        elif "fo-main" not in live_tags():  # x-ui restarted and reset the rules
+            log("failover rules missing after an Xray restart - re-applying")
+            failover(cur)
+    st["failed_over"] = st["on"] != PRIMARY
+
+    # The TLS cert is renewed by hand (DNS TXT), so warn well before it expires, once a day.
+    today = time.strftime("%F", time.gmtime(now))
+    if CERT and st.get("cert_checked") != today:
+        st["cert_checked"] = today
+        r = run("openssl", "x509", "-in", CERT, "-noout", "-checkend", str(CERT_WARN_DAYS * 86400))
+        if r.returncode == 1:
+            end = run("openssl", "x509", "-in", CERT, "-noout", "-enddate").stdout.strip().split("=")[-1]
+            days = int((time.mktime(time.strptime(end, "%b %d %H:%M:%S %Y %Z")) - now) // 86400)
+            send(f"🔐 گواهی TLS ({os.path.basename(os.path.dirname(CERT))}) {days} روز دیگه منقضی می‌شه ({end}).\n"
+                 "تمدید: acme.sh --renew با رکورد TXT جدید. بعد از انقضا پورت 443 و subscription از کار می‌افتن.")
+
+    st["outages"] = [o for o in st["outages"] if now - o["start"] < 7 * 86400]
+    # daily report, once, in the report hour
+    today = time.strftime("%F", time.gmtime(now))
+    if time.gmtime(now).tm_hour == REPORT_HOUR_UTC and st.get("reported") != today:
+        st["reported"] = today
+        send(report(st))
+    json.dump(st, open(STATE, "w"))
+
+
+if __name__ == "__main__":
+    lock = open("/run/tunnel-guard.lock", "w")
+    import fcntl
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(0)
+    syslog.openlog("tunnel-guard")
+    main()

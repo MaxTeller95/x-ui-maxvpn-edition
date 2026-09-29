@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""abroad-tune - for the x-ui server abroad that the hub's tunnel ends on.
+
+    abroad-tune            test only
+    abroad-tune apply      backup, test, apply, restart x-ui
+
+  * freedom outbound prefers IPv4 and falls back to IPv6 ("UseIPv4v6"). With the
+    default, some IPv6 paths connect and then stall - www.microsoft.com timed out
+    after 15 s on a Hetzner server until this was set.
+  * TCP sysctls in /etc/sysctl.d/99-proxy-tcp.conf (see ../sysctl/)
+TFO is deliberately not touched: Xray 26.x does not enable it on its listening
+socket even with tcpFastOpen set, so it only adds failed SYN-data attempts.
+"""
+import glob, json, os, shutil, sqlite3, subprocess, sys, time
+
+DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
+SYSCTL = """# TCP tuning for the proxy abroad (hub <-> here <-> internet).
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_mtu_probing = 1
+"""
+apply = sys.argv[1:] == ["apply"]
+xray = glob.glob(f"{BIN}/xray-linux-*")[0]
+ver = subprocess.run([xray, "version"], capture_output=True, text=True).stdout.split()[1]
+new_sockopt = tuple(int(x) for x in ver.split(".")[:2]) >= (26, 9)
+
+
+def fix_freedom(o):
+    # Prefer IPv4, fall back to IPv6: some IPv6 paths connect and then stall (www.microsoft.com).
+    ss = o.setdefault("streamSettings", {}).setdefault("sockopt", {})
+    st = o.setdefault("settings", {})
+    if new_sockopt:
+        st.pop("domainStrategy", None)
+        ss["domainStrategy"] = "UseIPv4v6"
+    else:
+        st["domainStrategy"] = "UseIPv4v6"
+    if "happyEyeballs" in ss:
+        ss["happyEyeballs"].update({"prioritizeIPv6": False, "tryDelayMs": 250})
+    if not ss:
+        o["streamSettings"].pop("sockopt")
+    if not o["streamSettings"]:
+        o.pop("streamSettings")
+
+
+
+db = sqlite3.connect(DB)
+tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+for o in tpl["outbounds"]:
+    if o["protocol"] == "freedom":
+        fix_freedom(o)
+
+# Test the same change against the running config.
+cfg = json.load(open(f"{BIN}/config.json"))
+for o in cfg["outbounds"]:
+    if o["protocol"] == "freedom":
+        fix_freedom(o)
+json.dump(cfg, open("/tmp/abroad-candidate.json", "w"))
+os.chmod("/tmp/abroad-candidate.json", 0o600)
+out = subprocess.run([xray, "run", "-test", "-c", "/tmp/abroad-candidate.json"], cwd=BIN,
+                     capture_output=True, text=True)
+os.remove("/tmp/abroad-candidate.json")
+ok = "Configuration OK" in out.stdout + out.stderr
+print(f"xray {ver}: {'Configuration OK' if ok else 'REJECTED'}")
+if not ok:
+    print(out.stdout + out.stderr)
+    sys.exit(1)
+if not apply:
+    sys.exit(0)
+
+backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+os.makedirs(backup)
+db.close()
+for f in (DB, f"{BIN}/config.json"):
+    shutil.copy2(f, backup)
+db = sqlite3.connect(DB)
+db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
+db.commit()
+db.close()
+open("/etc/sysctl.d/99-proxy-tcp.conf", "w").write(SYSCTL)
+subprocess.run(["sysctl", "-q", "-p", "/etc/sysctl.d/99-proxy-tcp.conf"], check=True)
+subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+time.sleep(6)
+state = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
+print(f"applied, backup {backup}, x-ui {state}")

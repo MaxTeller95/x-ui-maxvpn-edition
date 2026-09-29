@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the Xray config the panel writes
+
+[Path]
+PathChanged=/usr/local/x-ui/bin/config.json
+Unit=config-guard.service
+
+[Install]
+WantedBy=multi-user.target

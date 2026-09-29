@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+"""xui-tunnel - one outbound, several tunnels to the same server abroad.
+
+    xui-tunnel discover [--json]            tunnels on this hub, where each lands, which paths ride it
+    xui-tunnel list [--json]                paths, the tunnel addresses each may use, which one is live
+    xui-tunnel set NAME ADDR[,ADDR...] [--auto on|off]
+                                            the addresses NAME may use, best first
+    xui-tunnel use NAME ADDR [--json]       move NAME (and NAME-mux) onto ADDR now
+    xui-tunnel add NAME ADDR [--json]       put one more address on NAME's list (by hand; tested, kept either way)
+    xui-tunnel scan NAME [--save] [--json]  try NAME on every tunnel's far address; --save lists the ones that answer
+    xui-tunnel test NAME ADDR [--json]      would NAME work on ADDR? (a throwaway Xray, not the live one)
+    xui-tunnel auto                         what the timer runs: leave a dead tunnel, return to the best,
+                                            and rescan every path once an hour
+
+A GRE tunnel and an AWG tunnel to the same server reach the same Xray listener, only at a
+different address (10.0.1.2 vs 10.0.10.1). So instead of one path per tunnel, a path keeps
+a list of addresses and this moves its outbound between them. The switch goes through Xray's
+API (rmo + ado): no x-ui restart, only the connections on the dead tunnel drop. The panel's
+template is updated too, so the next restart keeps it.
+
+Routed tunnels (GRE, IPIP, WireGuard, AmneziaWG) are used by their far address. A sing-box tun
+is used differently: the address stays the same and the outbound is sent through the tun
+(Xray's sendThrough = the tun's own address; the hub's policy routing sends that into the tun,
+sing-box carries it to its server, and the connection lands on the same listener there).
+Such an entry is written ADDR@IFACE, for example 10.0.1.2@sb0.
+A scan does not trust the guess of where a tunnel lands: it starts NAME's own outbound on each
+tunnel's far address and keeps the ones that fetch a page, so it finds tunnels whose far end is
+unknown too. xui-path runs a scan right after it adds a path.
+Settings live under "tunnels" in /etc/tunnel-guard.json, state in /var/lib/tunnel-guard/tunnels.json.
+"""
+import glob, ipaddress, json, os, re, socket, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
+CFG, GUARD_CONF = BIN + "/config.json", "/etc/tunnel-guard.json"
+STATE = "/var/lib/tunnel-guard/tunnels.json"
+KEY = "xrayTemplateConfig"
+XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
+PROXY = ("vless", "vmess", "trojan", "shadowsocks")
+ROUTED = ("gre", "ipip", "sit", "wireguard", "amneziawg")
+TEST_URL = "https://www.google.com/generate_204"
+SWITCH_GAP = 120        # seconds between two moves of the same path
+RETURN_OKS = 3          # healthy checks of a better tunnel before going back to it
+RETURN_GAP = 600        # stay at least this long on a tunnel before going back
+SCAN_EVERY = 3600       # the timer rescans every path this often
+ADDR_OK = re.compile(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$")   # ADDR or ADDR@tun
+
+
+def run(*cmd, timeout=20):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def log(msg):
+    syslog.openlog("xui-tunnel")
+    syslog.syslog(msg)
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+
+
+def api_addr(cfg):
+    tag = (cfg.get("api") or {}).get("tag", "api")
+    for i in cfg.get("inbounds", []):
+        if i.get("tag") == tag:
+            return "%s:%s" % (i.get("listen") or "127.0.0.1", i.get("port"))
+    return "127.0.0.1:62789"
+
+
+# ---------------------------------------------------------------- where an outbound points
+
+def _server(o):
+    """The dict that holds address/port, whichever shape the outbound was written in."""
+    s = o.get("settings") or {}
+    if "address" in s:
+        return s
+    for k in ("vnext", "servers"):
+        if s.get(k):
+            return s[k][0]
+    return {}
+
+
+def iface_addrs():
+    """{interface: its IPv4 address} and back, for sendThrough <-> ADDR@IFACE."""
+    rc, raw = run("ip", "-j", "-4", "addr", "show", timeout=5)
+    by_if = {}
+    for l in (json.loads(raw) if rc == 0 else []):
+        for a in l.get("addr_info", []):
+            by_if.setdefault(l["ifname"], a["local"])
+    return by_if
+
+
+def split(entry):
+    addr, _, via = (entry or "").partition("@")
+    return addr, via
+
+
+def addr_of(o, ifs=None):
+    """The outbound's entry: its address, plus @IFACE when it is sent through a tun."""
+    s = _server(o)
+    addr, via = s.get("address"), o.get("sendThrough")
+    if addr and via:
+        name = next((i for i, a in (ifs or iface_addrs()).items() if a == via), via)
+        addr = "%s@%s" % (addr, name)
+    return addr, s.get("port")
+
+
+def set_addr(o, entry, ifs=None):
+    addr, via = split(entry)
+    _server(o)["address"] = addr
+    if via:
+        local = (ifs or iface_addrs()).get(via)
+        if not local:
+            raise ValueError("تانل %s روی این هاب نیست" % via)
+        o["sendThrough"] = local
+    else:
+        o.pop("sendThrough", None)
+
+
+def family(name):
+    """NAME and the outbounds that ride the same tunnel as it (NAME-mux)."""
+    return (name, name + "-mux")
+
+
+# ---------------------------------------------------------------- discovery
+
+def far_of_endpoint(ep):
+    """An AWG endpoint of 127.0.0.1:P means a local wstunnel carries it: find where to."""
+    host, _, port = ep.rpartition(":")
+    if host not in ("127.0.0.1", "localhost", "[::1]"):
+        return host.strip("[]"), "udp"
+    for unit in glob.glob("/etc/systemd/system/*.service"):
+        try:
+            text = open(unit).read()
+        except OSError:
+            continue
+        if re.search(r"127\.0\.0\.1:%s\b" % port, text):
+            m = re.search(r"wss?://\[?([^\]/:\s]+)", text)
+            if m:
+                return m.group(1), "tcp (%s)" % os.path.basename(unit)[:-8]
+    return "", "udp"
+
+
+def singbox_far():
+    """{tun interface: server} from sing-box's config: tun inbound -> route rule -> outbound."""
+    out = {}
+    for path in ("/etc/sing-box/config.json",):
+        c = load(path, {})
+        tuns = {i.get("tag"): i.get("interface_name") for i in c.get("inbounds", []) if i.get("type") == "tun"}
+        servers = {o.get("tag"): o.get("server") for o in c.get("outbounds", [])}
+        for r in (c.get("route") or {}).get("rules", []):
+            ins = r.get("inbound")
+            for t in ([ins] if isinstance(ins, str) else ins or []):
+                if t in tuns and r.get("outbound") in servers:
+                    out[tuns[t]] = servers[r["outbound"]]
+    return out
+
+
+def resolve(host):
+    try:
+        return socket.gethostbyname(host) if host else ""
+    except OSError:
+        return ""
+
+
+def tunnels():
+    """Every point-to-point tunnel on this hub, with the address of its far end."""
+    rc, raw = run("ip", "-j", "-d", "addr", "show")
+    links = json.loads(raw) if rc == 0 else []
+    sb = singbox_far()
+    out = []
+    for l in links:
+        kind = (l.get("linkinfo") or {}).get("info_kind") or ""
+        name = l["ifname"]
+        v4 = [a for a in l.get("addr_info", []) if a.get("family") == "inet"]
+        if not v4 or (kind not in ROUTED and kind != "tun"):
+            continue
+        a = v4[0]
+        net = ipaddress.ip_interface("%s/%s" % (a["local"], a["prefixlen"])).network
+        if net.prefixlen < 30:              # a /16 with many peers serves users, it is not a link abroad
+            continue
+        hosts = [str(h) for h in (net.hosts() if net.prefixlen == 30 else net) if str(h) != a["local"]]
+        peer = hosts[0] if len(hosts) == 1 else ""
+        t = {"iface": name, "kind": kind, "local": a["local"], "peer": peer, "far": "", "carrier": "",
+             "up": "UP" in l.get("flags", []) or l.get("operstate") in ("UP", "UNKNOWN"), "routed": kind in ROUTED}
+        if kind in ("gre", "ipip", "sit"):
+            t["far"], t["carrier"] = ((l["linkinfo"].get("info_data") or {}).get("remote") or ""), kind
+        elif kind in ("wireguard", "amneziawg"):
+            tool = "awg" if kind == "amneziawg" else "wg"
+            rc, eps = run(tool, "show", name, "endpoints", timeout=5)
+            ep = (eps.split() + ["", ""])[1] if rc == 0 else ""
+            if ep and ep != "(none)":
+                t["far"], t["carrier"] = far_of_endpoint(ep)
+            rc, hs = run(tool, "show", name, "latest-handshakes", timeout=5)
+            last = int((hs.split() + ["0", "0"])[1] or 0) if rc == 0 else 0
+            t["handshake"] = int(time.time()) - last if last else None
+        else:
+            t["far"], t["carrier"], t["peer"] = sb.get(name, ""), "sing-box", ""
+        t["far_ip"] = resolve(t["far"])
+        out.append(t)
+    return out
+
+
+def paths_on(tuns, outbounds):
+    """Which outbound rides which tunnel: its address is the tunnel's peer (or sits on a tun)."""
+    by_peer = {t["peer"]: t for t in tuns if t["peer"]}
+    by_local = {t["local"]: t for t in tuns}
+    use = {}
+    for o in outbounds:
+        if o.get("protocol") not in PROXY:
+            continue
+        addr, via = split(addr_of(o)[0])
+        t = next((x for x in tuns if x["iface"] == via), None) if via else by_peer.get(addr) or by_local.get(addr)
+        if t:
+            use.setdefault(t["iface"], []).append(o["tag"])
+    return use
+
+
+def discover():
+    cfg = load(CFG, {})
+    tuns = tunnels()
+    use = paths_on(tuns, cfg.get("outbounds", []))
+    for t in tuns:
+        t["paths"] = [p for p in use.get(t["iface"], []) if not p.endswith("-mux")]
+        if t["routed"] and t["peer"]:
+            t["ping"] = ping(t["peer"])
+    return tuns
+
+
+def ping(host):
+    rc, out = run("ping", "-c", "2", "-i", "0.3", "-W", "2", "-q", host, timeout=8)
+    m = re.search(r"= [\d.]+/([\d.]+)/", out)
+    return round(float(m.group(1)), 1) if rc == 0 and m else None
+
+
+# ---------------------------------------------------------------- the paths and their tunnels
+
+def conf():
+    return load(GUARD_CONF, {})
+
+
+def template(db=None):
+    c = db or sqlite3.connect(DB)
+    return json.loads(c.execute("select value from settings where key=?", (KEY,)).fetchone()[0])
+
+
+def candidates(name, cfg, tuns):
+    """Addresses NAME could use: the peer of every routed tunnel that lands on the same server."""
+    out = {o["tag"]: o for o in cfg.get("outbounds", [])}.get(name)
+    if not out:
+        return []
+    addr, via = split(addr_of(out)[0])
+    here = next((t for t in tuns if t["iface"] == via), None) if via else \
+        next((t for t in tuns if t["routed"] and addr == t["peer"]), None)
+    if not here or not here["far_ip"]:     # a path that sits on a sing-box proxy has its own credentials
+        return []
+    base = addr if not via else addr
+    out = [{"addr": t["peer"], "iface": t["iface"], "kind": t["kind"], "carrier": t["carrier"]}
+           for t in tuns if t["routed"] and t["peer"] and t["far_ip"] == here["far_ip"]]
+    out += [{"addr": "%s@%s" % (base, t["iface"]), "iface": t["iface"], "kind": "sing-box", "carrier": "sing-box"}
+            for t in tuns if t["kind"] == "tun" and t["local"] and t["far_ip"] == here["far_ip"]]
+    return out
+
+
+def listing():
+    c, cfg, st = conf(), load(CFG, {}), load(STATE, {})
+    tuns = tunnels()
+    iface_of = {t["peer"]: t for t in tuns if t["peer"]}
+    iface_of.update({"@" + t["iface"]: dict(t, kind="sing-box", carrier="sing-box") for t in tuns if t["kind"] == "tun"})
+    info = lambda a: known.get(a) or iface_of.get(a) or iface_of.get("@" + split(a)[1]) or {}
+    outs = {o["tag"]: o for o in cfg.get("outbounds", [])}
+    managed = c.get("tunnels") or {}
+    order = [n for n in [c.get("primary")] + (c.get("backups") or []) if n]
+    ifs = iface_addrs()
+    rows = []
+    for name in order:
+        o = outs.get(name)
+        if not o or o.get("protocol") not in PROXY:
+            continue
+        addr, port = addr_of(o, ifs)
+        spec = managed.get(name) or {}
+        cand = candidates(name, cfg, tuns)
+        addrs = list(spec.get("addrs") or [])
+        scan = (st.get(name) or {}).get("scan") or {}
+        seen = {x["addr"] for x in cand}
+        cand += [dict(x) for x in scan.get("found", []) if x.get("ok") and x["addr"] not in seen]
+        tests = (st.get(name) or {}).get("tests") or {}
+        for x in cand:
+            if x["addr"] not in addrs and x["addr"] != addr:
+                x["new"] = True
+                x["test"] = tests.get(x["addr"])
+        known = {x["addr"]: x for x in cand}
+        rows.append({
+            "name": name, "current": addr, "port": port, "auto": bool(spec.get("auto")),
+            "managed": bool(addrs),
+            "addrs": [dict(addr=a, iface=info(a).get("iface", ""), kind=info(a).get("kind", ""),
+                           carrier=info(a).get("carrier", ""), live=a == addr, test=tests.get(a)) for a in addrs],
+            "offer": [x for x in cand if x.get("new")],
+            "scanned": scan.get("at"),
+            "last": (st.get(name) or {}).get("events", [])[-5:],
+        })
+    return rows
+
+
+# ---------------------------------------------------------------- testing an address
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def test(name, addr, cfg=None):
+    """Start a throwaway Xray with NAME's outbound pointed at ADDR and fetch a page through it."""
+    cfg = cfg or load(CFG, {})
+    o = next((x for x in cfg.get("outbounds", []) if x.get("tag") == name), None)
+    if not o:
+        return {"ok": False, "ms": None, "err": "no outbound " + name}
+    o = json.loads(json.dumps(o))
+    set_addr(o, addr)
+    o["tag"] = "t"
+    sock = (o.get("streamSettings") or {}).get("sockopt") or {}
+    sock.pop("dialerProxy", None)
+    port = free_port()
+    tmp = {"log": {"loglevel": "none"},
+           "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks", "settings": {"udp": False}}],
+           "outbounds": [o]}
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="xui-tunnel-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(tmp, f)
+    p = subprocess.Popen([XRAY, "run", "-c", path], cwd=BIN, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.8)
+        res = {"ok": False, "ms": None}
+        for _ in range(2):
+            rc, out = run("curl", "-s", "-o", "/dev/null", "-m", "8", "--socks5-hostname", "127.0.0.1:%d" % port,
+                          "-w", "%{http_code} %{time_total}", TEST_URL, timeout=12)
+            parts = out.split()
+            if parts and parts[0] not in ("000", ""):
+                res = {"ok": True, "ms": int(float(parts[1]) * 1000)}
+                break
+            time.sleep(1)
+    finally:
+        p.kill()
+        p.wait()
+        os.remove(path)
+    res["at"] = int(time.time())
+    return res
+
+
+def scan(name, save_found=False, extra=()):
+    """Start NAME's outbound on every tunnel's far address (and any extra address) at once;
+    the ones that fetch a page carry the same service. With save_found, they join NAME's list."""
+    cfg = load(CFG, {})
+    o = next((x for x in cfg.get("outbounds", []) if x.get("tag") == name), None)
+    if not o or o.get("protocol") not in PROXY:
+        raise ValueError("اوت‌باند پروکسی به اسم %s پیدا نشد" % name)
+    cur, _ = addr_of(o)
+    base, via = split(cur)
+    every = tunnels()
+    tuns = [t for t in every if t["routed"] and t["peer"]]
+    here = next((t for t in every if t["iface"] == via), None) if via else next((t for t in tuns if t["peer"] == base), None)
+    same = lambda t: bool(here and t["far_ip"] and t["far_ip"] == here["far_ip"])
+    tries = {t["peer"]: {"addr": t["peer"], "iface": t["iface"], "kind": t["kind"], "carrier": t["carrier"],
+                         "far": t["far"], "same_server": same(t)} for t in tuns}
+    for t in every:                          # the same address, carried by each sing-box tun
+        if t["kind"] == "tun" and t["local"]:
+            e = "%s@%s" % (base, t["iface"])
+            tries[e] = {"addr": e, "iface": t["iface"], "kind": "sing-box", "carrier": "sing-box",
+                        "far": t["far"], "same_server": same(t)}
+    for a in extra:
+        if ADDR_OK.match(a):
+            tries.setdefault(a, {"addr": a, "iface": "", "kind": "manual", "carrier": "", "far": "", "same_server": False})
+    tries.pop(cur, None)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = dict(zip(tries, pool.map(lambda a: test(name, a, cfg), list(tries))))
+    found = []
+    for a, meta in tries.items():
+        r = results[a]
+        found.append(dict(meta, ok=r["ok"], ms=r["ms"], at=r["at"]))
+    found.sort(key=lambda x: (not x["ok"], not x["same_server"], x["ms"] or 99999))
+    st = load(STATE, {})
+    s = st.setdefault(name, {})
+    s["scan"] = {"at": int(time.time()), "found": found}
+    s.setdefault("tests", {}).update({x["addr"]: {"ok": x["ok"], "ms": x["ms"], "at": x["at"]} for x in found})
+    save(STATE, st)
+    good = [x["addr"] for x in found if x["ok"]]
+    if save_found and good:
+        c = conf()
+        spec = c.setdefault("tunnels", {}).setdefault(name, {})
+        have = spec.get("addrs") or [cur]
+        spec["addrs"] = have + [a for a in good if a not in have]
+        save(GUARD_CONF, c)
+    return {"ok": True, "name": name, "current": cur, "found": found, "answered": good,
+            "msg": ("%s روی %d آدرس دیگر هم جواب داد: %s" % (name, len(good), "، ".join(good)) if good
+                    else "برای %s آدرس دیگری که جواب بدهد پیدا نشد (%d آدرس امتحان شد)" % (name, len(found)))}
+
+
+def add_addr(name, addr):
+    """One more address on NAME's list, typed by hand. Tested, but kept even when it does not
+    answer yet: a tunnel being set up now can come up later, and auto skips what does not answer."""
+    if not ADDR_OK.match(addr):
+        raise ValueError("آدرس نامعتبر: " + addr)
+    cfg = load(CFG, {})
+    o = next((x for x in cfg.get("outbounds", []) if x.get("tag") == name), None)
+    if not o:
+        raise ValueError("اوت‌باند %s پیدا نشد" % name)
+    cur, _ = addr_of(o)
+    c = conf()
+    order = [n for n in [c.get("primary")] + (c.get("backups") or []) if n]
+    if name not in order:
+        raise ValueError("%s در فهرست مسیرها نیست" % name)
+    spec = c.setdefault("tunnels", {}).setdefault(name, {})
+    have = spec.get("addrs") or [cur]
+    if addr not in have:
+        have.append(addr)
+    spec["addrs"] = have
+    save(GUARD_CONF, c)
+    r = test(name, addr, cfg) if addr != cur else {"ok": True, "ms": None, "at": int(time.time())}
+    st = load(STATE, {})
+    st.setdefault(name, {}).setdefault("tests", {})[addr] = r
+    save(STATE, st)
+    return {"ok": True, "reachable": r["ok"], "ms": r["ms"],
+            "msg": ("%s به %s اضافه شد و جواب داد (%s ms)" % (addr, name, r["ms"]) if r["ok"]
+                    else "%s به %s اضافه شد ولی الان جواب نمی‌دهد؛ تا سالم نشود جابجایی خودکار سراغش نمی‌رود"
+                    % (addr, name))}
+
+
+def probe_live(name, cfg):
+    """Is NAME answering right now, through its own guard probe port?"""
+    port = next((i.get("port") for i in cfg.get("inbounds", []) if i.get("tag") == "guard-" + name.lower()), None)
+    if not port:
+        return None
+    for _ in range(2):
+        rc, out = run("curl", "-s", "-o", "/dev/null", "-m", "8", "--socks5-hostname", "127.0.0.1:%d" % port,
+                      "-w", "%{http_code}", TEST_URL, timeout=12)
+        if out.strip() not in ("000", ""):
+            return True
+        time.sleep(3)
+    return False
+
+
+# ---------------------------------------------------------------- moving an outbound
+
+def use(name, addr, why="by hand"):
+    cfg = load(CFG, {})
+    tags = [t for t in family(name) if any(o.get("tag") == t for o in cfg.get("outbounds", []))]
+    if not tags:
+        raise ValueError("اوت‌باند %s پیدا نشد" % name)
+    old, _ = addr_of(next(o for o in cfg["outbounds"] if o["tag"] == name))
+    if old == addr:
+        return {"ok": True, "msg": "%s از قبل روی %s است" % (name, addr)}
+
+    # 1. the panel's template, so the next x-ui restart keeps it
+    db = sqlite3.connect(DB)
+    t = template(db)
+    for o in t.get("outbounds", []):
+        if o.get("tag") in tags:
+            set_addr(o, addr)
+    db.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
+    db.commit()
+    db.close()
+
+    # 2. the running Xray, through its API: swap the outbounds without a restart
+    # ado appends: moving the first outbound would change Xray's default route, so restart then
+    api, hot = api_addr(cfg), cfg["outbounds"][0].get("tag") not in tags
+    for o in cfg["outbounds"]:
+        if o.get("tag") not in tags:
+            continue
+        set_addr(o, addr)
+        if not hot:
+            continue
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"outbounds": [o]}, f)
+        run(XRAY, "api", "rmo", "--server=" + api, o["tag"])
+        rc, out = run(XRAY, "api", "ado", "--server=" + api, path)
+        os.remove(path)
+        hot = hot and rc == 0
+    save(CFG, cfg)                          # what the page, config-guard and the guard read
+    if not hot:                             # the API refused: fall back to a restart
+        run("systemctl", "restart", "x-ui", timeout=60)
+        time.sleep(7)
+    run("config-guard", "--save", timeout=30)
+
+    # 3. the guard pings the new peer, and watches an AWG handshake only when it is an AWG tunnel
+    c = conf()
+    plain, via = split(addr)
+    tun = next((x for x in tunnels() if (x["iface"] == via if via else x["peer"] == plain)), {})
+    for n in tags:
+        p = c.setdefault("paths", {}).setdefault(n, {})
+        if n == name:
+            p.pop("iface", None)
+            p.pop("tun", None)
+            if via:                          # through sing-box: time the round trip through its tun
+                p["peer"], p["tun"] = "", via
+            else:
+                p["peer"] = plain
+                if tun.get("kind") in ("wireguard", "amneziawg"):
+                    p["iface"] = tun["iface"]
+    save(GUARD_CONF, c)
+
+    st = load(STATE, {})
+    s = st.setdefault(name, {})
+    s.update(last_switch=int(time.time()), fails=0, back_oks=0)
+    s.setdefault("events", []).append({"t": int(time.time()), "from": old, "to": addr, "why": why})
+    s["events"] = s["events"][-20:]
+    save(STATE, st)
+    log("%s: %s -> %s (%s)%s" % (name, old, addr, why, "" if hot else " - via x-ui restart"))
+    return {"ok": True, "msg": "%s از %s به %s رفت%s" % (name, old, addr, "" if hot else " (با ری‌استارت x-ui)")}
+
+
+def telegram(text):
+    try:
+        db = sqlite3.connect(DB)
+        get = lambda k: (db.execute("select value from settings where key=?", (k,)).fetchone() or [""])[0]
+        token, chat = get("tgBotToken"), get("tgBotChatId").split(",")[0].strip()
+    except Exception:
+        return
+    if not token or not chat:
+        return
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text})
+    cfg = load(CFG, {})
+    ports = [i.get("port") for i in cfg.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")]
+    for port in ports:
+        rc, out = run("curl", "-s", "-m", "12", "--socks5-hostname", "127.0.0.1:%d" % port, "-d", body,
+                      "https://api.telegram.org/bot%s/sendMessage" % token, timeout=15)
+        if '"ok":true' in out:
+            return
+
+
+def rescan_all():
+    """Once an hour: look again for addresses that carry each path (a tunnel may be new)."""
+    st = load(STATE, {})
+    if time.time() - st.get("_scan_at", 0) < SCAN_EVERY:
+        return
+    st["_scan_at"] = int(time.time())
+    save(STATE, st)
+    c, cfg = conf(), load(CFG, {})
+    outs = {o.get("tag"): o for o in cfg.get("outbounds", [])}
+    before = {n: {x["addr"] for x in ((st.get(n) or {}).get("scan") or {}).get("found", []) if x.get("ok")}
+              for n in outs}
+    for name in [n for n in [c.get("primary")] + (c.get("backups") or []) if n]:
+        if (outs.get(name) or {}).get("protocol") not in PROXY:
+            continue
+        try:
+            r = scan(name)
+        except ValueError:
+            continue
+        new = [a for a in r["answered"] if a not in before.get(name, set())
+               and a not in ((c.get("tunnels") or {}).get(name) or {}).get("addrs", [])]
+        if new:
+            log("%s: new addresses answer: %s" % (name, ", ".join(new)))
+
+
+def auto():
+    c, st = conf(), load(STATE, {})
+    now = int(time.time())
+    for name, spec in (c.get("tunnels") or {}).items():
+        addrs = spec.get("addrs") or []
+        if not spec.get("auto") or len(addrs) < 2:
+            continue
+        cfg = load(CFG, {})
+        o = next((x for x in cfg.get("outbounds", []) if x.get("tag") == name), None)
+        if not o:
+            continue
+        cur, _ = addr_of(o)
+        s = st.setdefault(name, {})
+        tests = s.setdefault("tests", {})
+        ok = probe_live(name, cfg)
+        if ok is None:
+            ok = test(name, cur, cfg)["ok"]
+        tests[cur] = {"ok": ok, "at": now, "ms": None, "live": True}
+        if not ok:
+            s["fails"] = s.get("fails", 0) + 1
+            s["back_oks"] = 0
+            if now - s.get("last_switch", 0) < SWITCH_GAP:
+                continue
+            for a in [x for x in addrs if x != cur]:
+                r = tests[a] = test(name, a, cfg)
+                if r["ok"]:
+                    save(STATE, st)
+                    use(name, a, "tunnel %s stopped answering" % cur)
+                    st = load(STATE, {})
+                    telegram("🔀 %s: تانل %s جواب نداد؛ اوت‌باند بدون قطع کاربران روی %s رفت (%d ms)."
+                             % (name, cur, a, r["ms"] or 0))
+                    break
+            else:
+                log("%s: %s is down and no other tunnel answered" % (name, cur))
+            continue
+        s["fails"] = 0
+        better = addrs[:addrs.index(cur)] if cur in addrs else addrs
+        if not better or now - s.get("last_switch", 0) < RETURN_GAP:
+            continue
+        r = tests[better[0]] = test(name, better[0], cfg)
+        s["back_oks"] = s.get("back_oks", 0) + 1 if r["ok"] else 0
+        if s["back_oks"] >= RETURN_OKS:
+            save(STATE, st)
+            use(name, better[0], "preferred tunnel healthy again")
+            st = load(STATE, {})
+            telegram("✅ %s: تانل ترجیحی %s سالم است؛ اوت‌باند به آن برگشت." % (name, better[0]))
+    save(STATE, st)
+    rescan_all()
+
+
+def set_addrs(name, addrs, auto_flag):
+    c = conf()
+    order = [n for n in [c.get("primary")] + (c.get("backups") or []) if n]
+    if name not in order:
+        raise ValueError("%s در فهرست مسیرها نیست" % name)
+    bad = [a for a in addrs if not ADDR_OK.match(a)]
+    if bad:
+        raise ValueError("آدرس نامعتبر: " + "، ".join(bad))
+    spec = c.setdefault("tunnels", {}).setdefault(name, {})
+    if addrs:
+        spec["addrs"] = list(dict.fromkeys(addrs))
+    if auto_flag is not None:
+        spec["auto"] = auto_flag
+    if not spec.get("addrs"):
+        c["tunnels"].pop(name, None)
+    save(GUARD_CONF, c)
+    return {"ok": True, "msg": "تانل‌های %s: %s%s" % (name, "، ".join(spec.get("addrs") or ["—"]),
+                                                     " · جابجایی خودکار روشن" if spec.get("auto") else "")}
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    auto_flag = None
+    if "--auto" in args:
+        i = args.index("--auto")
+        auto_flag = (args[i + 1:i + 2] or ["on"])[0] == "on"
+        del args[i:i + 2]
+    mode = args[0] if args else "list"
+    out = lambda d, text: print(json.dumps(d, ensure_ascii=False) if as_json else text)
+    try:
+        if mode == "discover":
+            d = discover()
+            out(d, "\n".join("%-8s %-10s %-15s -> %-15s far %-16s %-22s %s" % (
+                t["iface"], t["kind"], t["local"], t["peer"] or "-", t["far"] or "?", t["carrier"],
+                ",".join(t["paths"])) for t in d))
+        elif mode == "list":
+            d = listing()
+            out(d, "\n".join("%-12s %-15s %s%s" % (r["name"], r["current"], " ".join(
+                ("*" if a["live"] else "") + a["addr"] for a in r["addrs"]) or "-",
+                "  auto" if r["auto"] else "") for r in d))
+        elif mode == "set" and len(args) >= 2:
+            d = set_addrs(args[1], [a for a in (args[2] if len(args) > 2 else "").split(",") if a], auto_flag)
+            out(d, d["msg"])
+        elif mode == "scan" and len(args) >= 2:
+            d = scan(args[1], "--save" in args, [a for a in (args[2] if len(args) > 2 and not
+                                                       args[2].startswith("--") else "").split(",") if a])
+            out(d, "\n".join("%s %-16s %-8s %s" % ("ok " if x["ok"] else "-- ", x["addr"], x["iface"],
+                                                    "%s ms" % x["ms"] if x["ok"] else "") for x in d["found"])
+                + "\n" + d["msg"])
+        elif mode == "add" and len(args) >= 3:
+            d = add_addr(args[1], args[2])
+            out(d, d["msg"])
+        elif mode == "use" and len(args) >= 3:
+            r = test(args[1], args[2])
+            if not r["ok"] and "--force" not in args:
+                raise ValueError("%s از آدرس %s جواب نداد؛ جابجا نشد" % (args[1], args[2]))
+            d = use(args[1], args[2])
+            out(d, d["msg"])
+        elif mode == "test" and len(args) >= 3:
+            d = test(args[1], args[2])
+            st = load(STATE, {})
+            st.setdefault(args[1], {}).setdefault("tests", {})[args[2]] = d
+            save(STATE, st)
+            out(dict(d, ok=True, reachable=d["ok"]), "ok %s ms" % d["ms"] if d["ok"] else "no answer")
+        elif mode == "auto":
+            auto()
+        else:
+            print(__doc__)
+            sys.exit(2)
+    except ValueError as e:
+        out({"ok": False, "msg": str(e)}, str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    if not XRAY:
+        sys.exit("xray not found in " + BIN)
+    main()

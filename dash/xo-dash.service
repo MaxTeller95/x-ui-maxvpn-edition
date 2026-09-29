@@ -1,0 +1,11 @@
+[Unit]
+Description=xui-optimizer dashboard (127.0.0.1 only, served inside the x-ui panel by nginx)
+After=network.target x-ui.service
+
+[Service]
+ExecStart=/opt/xo-dash/xo-dash
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

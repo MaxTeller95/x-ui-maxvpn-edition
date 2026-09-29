@@ -1,0 +1,8 @@
+[Unit]
+Description=Tunnel guard: probe paths, fail over users, Telegram alerts
+After=network-online.target x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tunnel-guard
+TimeoutStartSec=90

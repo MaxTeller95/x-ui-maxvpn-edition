@@ -1,0 +1,1168 @@
+#!/usr/bin/env python3
+"""xo-dash - the Optimizer page shown inside the x-ui panel.
+
+Listens on 127.0.0.1 only. nginx serves it under <panel base path>xo-dash/ and adds an
+"Optimizer" item to the panel's sidebar (see install-dash.sh). Every request is checked
+against the panel's own login: the browser's panel cookie is replayed to the panel, and
+only a logged-in session gets through.
+
+Besides the switches, a background collector reads Xray's stats API every 5 s and keeps
+one bucket per minute for 24 h in /var/lib/xo-dash/history.json, so the page can show
+live throughput per path, per inbound and per user without touching the panel's database.
+"""
+import collections, http.server, json, os, re, shutil, sqlite3, ssl, subprocess, threading, time, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
+GUARD_STATE, GUARD_HOLD = "/var/lib/tunnel-guard/state.json", "/var/lib/tunnel-guard/hold"
+GUARD_CONF = "/etc/tunnel-guard.json"
+XRAY = "/usr/local/x-ui/bin/xray-linux-amd64"
+STATE_DIR = "/var/lib/xo-dash"
+HIST = os.path.join(STATE_DIR, "history.json")
+BACKUP_DIR = "/root"
+HERE = os.path.dirname(os.path.realpath(__file__))
+LISTEN = ("127.0.0.1", int(os.environ.get("XO_DASH_PORT", "9811")))
+
+
+def setting(key):
+    r = sqlite3.connect(DB).execute("select value from settings where key=?", (key,)).fetchone()
+    return r[0] if r else ""
+
+
+BASE = setting("webBasePath") or "/"
+PREFIX = BASE + "xo-dash/"
+PANEL = "https://127.0.0.1:%s%spanel/" % (setting("webPort") or 2053, BASE)
+_insecure = ssl.create_default_context()
+_insecure.check_hostname, _insecure.verify_mode = False, ssl.CERT_NONE
+_auth_cache, _lock = {}, threading.Lock()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=_insecure))
+
+
+def logged_in(cookie):
+    """True if this cookie is a live panel session (asks the panel, caches 60 s)."""
+    if not cookie:
+        return False
+    now = time.time()
+    with _lock:
+        hit = _auth_cache.get(cookie)
+        if hit and now - hit[1] < 60:
+            return hit[0]
+    try:
+        ok = _opener.open(urllib.request.Request(PANEL, headers={"Cookie": cookie}), timeout=5).status == 200
+    except Exception:
+        ok = False
+    with _lock:
+        _auth_cache[cookie] = (ok, now)
+    return ok
+
+
+def run(*cmd, timeout=60):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return 124, str(e)
+
+
+def jrun(*cmd, timeout=10):
+    """Run a command that prints JSON and return the parsed object, or None."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def jrun_any(*cmd, timeout=10):
+    """Like jrun, but a tool that refused (exit 1) still gets to explain itself in JSON."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def db():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def conf():
+    return json.loads(read(GUARD_CONF, "{}") or "{}")
+
+
+_cfg_cache = [0, None]
+
+
+def xray_cfg():
+    """The live Xray config, re-read when it changes on disk."""
+    empty = {"inbounds": [], "outbounds": [], "routing": {"rules": []}}
+    try:
+        m = os.path.getmtime(CFG)
+    except OSError:
+        return empty
+    if _cfg_cache[0] != m:
+        try:
+            _cfg_cache[:] = [m, json.load(open(CFG))]
+        except Exception:
+            return _cfg_cache[1] or empty
+    return _cfg_cache[1]
+
+
+def access_log():
+    """Where Xray writes its access log: 2.x used the panel dir, 3.x uses /var/log/x-ui/."""
+    got = (xray_cfg().get("log") or {}).get("access") or ""
+    if got and got != "none":
+        return got if os.path.isabs(got) else os.path.join(os.path.dirname(CFG), got)
+    for p in ("/var/log/x-ui/access.log", "/usr/local/x-ui/access.log"):
+        if os.path.exists(p):
+            return p
+    return "/var/log/x-ui/access.log"
+
+
+def api_addr():
+    c = xray_cfg()
+    tag = (c.get("api") or {}).get("tag", "api")
+    for i in c.get("inbounds", []):
+        if i.get("tag") == tag:
+            return "%s:%s" % (i.get("listen", "127.0.0.1"), i.get("port"))
+    return "127.0.0.1:62789"
+
+
+def xapi(*args, timeout=10):
+    return jrun(XRAY, "api", *args, "--server=" + api_addr(), timeout=timeout)
+
+
+def path_order():
+    """The paths as the Tools tab lists them: primary first, then the backups in order."""
+    c = conf()
+    return [n for n in [c.get("primary")] + (c.get("backups") or [c.get("backup")]) if n]
+
+
+def path_ports():
+    """{path: probe port} for the listed paths only - what the Health tab watches."""
+    ports = probe_ports()
+    return {n: ports[n] for n in path_order() if n in ports}
+
+
+def probe_ports():
+    """{outbound tag: local socks port} for the probe inbounds xui-split created."""
+    out, cfg = {}, xray_cfg()
+    tags = {o.get("tag", "").lower(): o.get("tag") for o in cfg.get("outbounds", [])}
+    for i in cfg.get("inbounds", []):
+        t = i.get("tag", "")
+        if t.startswith("guard-") and t[6:] in tags:
+            out[tags[t[6:]]] = i["port"]
+    return out
+
+
+def cert_days(path):
+    rc, out = run("openssl", "x509", "-in", path, "-noout", "-enddate")
+    if rc:
+        return None
+    end = out.split("=")[-1]
+    return int((time.mktime(time.strptime(end, "%b %d %H:%M:%S %Y %Z")) - time.time()) // 86400)
+
+
+# ---------------------------------------------------------------- metrics collector
+
+class Metrics(threading.Thread):
+    """Samples Xray's counters every STEP seconds and keeps per-minute buckets for a day.
+
+    The counters only go up (the panel reads them without resetting), so a value that
+    dropped means Xray restarted and the new value is itself the delta.
+    """
+    STEP, FINE, DAY = 5, 120, 1440
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.lock = threading.Lock()
+        self.fine = collections.deque(maxlen=self.FINE)   # {"t", "o"/"i": {tag: [up, down]}, "u": {email: bytes}}
+        self.minutes = collections.deque(self._load(), maxlen=self.DAY)
+        self.prev, self.cur, self.online, self.saved, self.n = {}, None, [], 0.0, 0
+
+    def _load(self):
+        try:
+            cut = time.time() - 86400
+            return [m for m in json.loads(read(HIST, "{}") or "{}").get("minutes", []) if m.get("t", 0) > cut]
+        except Exception:
+            return []
+
+    def _save(self):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(HIST + ".tmp", "w") as f:
+                json.dump({"minutes": list(self.minutes)}, f, separators=(",", ":"))
+            os.replace(HIST + ".tmp", HIST)
+        except OSError:
+            pass
+
+    def sample(self):
+        stats = xapi("statsquery", timeout=8) or {}
+        now = time.time()
+        o, i, u = {}, {}, {}
+        for s in stats.get("stat", []):
+            parts = (s.get("name", "").split(">>>") + ["", "", "", ""])[:4]
+            kind, name, dirn = parts[0], parts[1], parts[3]
+            v, p = s.get("value", 0) or 0, self.prev.get(s["name"])
+            self.prev[s["name"]] = v
+            if p is None:
+                continue
+            d = v if v < p else v - p
+            if not d:
+                continue
+            slot = 0 if dirn == "uplink" else 1
+            if kind == "outbound":
+                o.setdefault(name, [0, 0])[slot] += d
+            elif kind == "inbound" and not name.startswith("guard-") and name != "api":
+                i.setdefault(name, [0, 0])[slot] += d
+            elif kind == "user":
+                u[name] = u.get(name, 0) + d
+        online = self.online
+        self.n += 1
+        if self.n % 3 == 1:  # who is online changes slowly; every third sample is enough
+            on = xapi("statsgetallonlineusers", timeout=8) or {}
+            online = [n.split(">>>")[1] for n in (on.get("users") or []) if ">>>" in n]
+        with self.lock:
+            self.online = online
+            self.fine.append({"t": now, "o": o, "i": i, "u": u})
+            self._roll(now, o, i, len(online))
+
+    def _roll(self, now, o, i, online):
+        m = int(now // 60) * 60
+        if self.cur is None or self.cur["t"] != m:
+            if self.cur:
+                self.minutes.append(self.cur)
+            self.cur = {"t": m, "o": {}, "i": {}, "on": 0, "p": {}}
+            for name, v in (json.loads(read(GUARD_STATE, "{}") or "{}").get("last") or {}).items():
+                self.cur["p"][name] = [round(v.get("rtt") or 0, 1), 1 if v.get("ok") else 0]
+            if now - self.saved > 300:
+                self.saved = now
+                self._save()
+        for src, key in ((o, "o"), (i, "i")):
+            for tag, (up, dn) in src.items():
+                c = self.cur[key].setdefault(tag, [0, 0])
+                c[0] += up
+                c[1] += dn
+        self.cur["on"] = max(self.cur["on"], online)
+
+    def run(self):
+        while True:
+            try:
+                self.sample()
+            except Exception:
+                pass
+            time.sleep(self.STEP)
+
+    def snapshot(self, window=30):
+        """Rates over the last `window` seconds, the day's buckets and the top talkers."""
+        with self.lock:
+            fine = [f for f in self.fine if f["t"] > time.time() - window]
+            mins = list(self.minutes) + ([self.cur] if self.cur else [])
+            online = list(self.online)
+        span = max(float(self.STEP), fine[-1]["t"] - fine[0]["t"]) if len(fine) > 1 else float(self.STEP)
+        by_out, by_in, users, up, dn = {}, {}, {}, 0, 0
+        for f in (fine[1:] if len(fine) > 1 else fine):
+            for src, into in ((f["o"], by_out), (f["i"], by_in)):
+                for tag, (a, b) in src.items():
+                    c = into.setdefault(tag, [0, 0])
+                    c[0] += a
+                    c[1] += b
+            for e, b in f["u"].items():
+                users[e] = users.get(e, 0) + b
+        for a, b in by_in.values():
+            up, dn = up + a, dn + b
+        bps = lambda v: int(v * 8 / span)
+        share = {}
+        for m in [x for x in mins if x["t"] > time.time() - 3600]:
+            for tag, (a, b) in m["o"].items():
+                share[tag] = share.get(tag, 0) + a + b
+        rtt, listed = collections.defaultdict(list), set(path_order())
+        for m in mins[-180:]:
+            for name, v in (m.get("p") or {}).items():
+                if name in listed:
+                    rtt[name].append([m["t"], v[0], v[1]])
+        return {
+            "t": int(time.time()),
+            "rate": {"up": bps(up), "down": bps(dn)},
+            "by_out": {k: bps(v[0] + v[1]) for k, v in by_out.items()},
+            "by_in": {k: bps(v[0] + v[1]) for k, v in by_in.items()},
+            "online": len(online),
+            "series": [[m["t"], sum(v[1] for v in m["i"].values()), sum(v[0] for v in m["i"].values()), m["on"]]
+                       for m in mins[-180:]],
+            "hours": self._hours(mins),
+            "share_hour": share,
+            "rtt": {k: v[::3] for k, v in rtt.items()},
+            "top": sorted(({"email": e, "bps": bps(b)} for e, b in users.items()), key=lambda x: -x["bps"])[:10],
+        }
+
+    def _hours(self, mins):
+        h = {}
+        for m in mins:
+            c = h.setdefault(int(m["t"] // 3600) * 3600, [0, 0])
+            for v in m["i"].values():
+                c[0] += v[0]
+                c[1] += v[1]
+        return [[k, v[1], v[0]] for k, v in sorted(h.items())]
+
+    def user_rates(self):
+        with self.lock:
+            fine = [f for f in self.fine if f["t"] > time.time() - 60]
+            online = set(self.online)
+        u = {}
+        for f in fine[1:]:
+            for e, b in f["u"].items():
+                u[e] = u.get(e, 0) + b
+        span = max(float(self.STEP), fine[-1]["t"] - fine[0]["t"]) if len(fine) > 1 else float(self.STEP)
+        return {e: int(b * 8 / span) for e, b in u.items()}, online
+
+
+METRICS = Metrics()
+
+
+# ---------------------------------------------------------------- status and views
+
+def resources():
+    load = (read("/proc/loadavg", "0 0 0").split() + ["0"] * 3)[:3]
+    mem = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        mem[k] = int(v.split()[0]) * 1024 if v.split() else 0
+    st = os.statvfs("/")
+    estab = 0
+    for line in run("ss", "-s", timeout=5)[1].splitlines():
+        if line.startswith("TCP:") and "estab" in line:
+            try:
+                estab = int(line.split("estab")[1].split(",")[0].strip())
+            except ValueError:
+                pass
+    ct = read("/proc/sys/net/netfilter/nf_conntrack_count", "0").strip() or "0"
+    ctmax = read("/proc/sys/net/netfilter/nf_conntrack_max", "0").strip() or "0"
+    return {
+        "load": [float(x) for x in load], "cpus": os.cpu_count() or 1,
+        "mem_total": mem.get("MemTotal", 0), "mem_avail": mem.get("MemAvailable", 0),
+        "disk_total": st.f_blocks * st.f_frsize, "disk_free": st.f_bavail * st.f_frsize,
+        "conns": estab, "conntrack": int(ct), "conntrack_max": int(ctmax),
+        "uptime": int(float((read("/proc/uptime", "0").split() or ["0"])[0])),
+    }
+
+
+def vnstat_month():
+    """This month's traffic per tunnel interface, from vnstat."""
+    out = {}
+    for name, p in (conf().get("paths") or {}).items():
+        if not p.get("iface"):
+            continue
+        d = jrun("vnstat", "--json", "m", "-i", p["iface"], timeout=8)
+        try:
+            last = d["interfaces"][0]["traffic"]["month"][-1]
+            out[name] = {"iface": p["iface"], "rx": last["rx"], "tx": last["tx"]}
+        except Exception:
+            continue
+    return out
+
+
+def backups():
+    got = []
+    try:
+        for n in os.listdir(BACKUP_DIR):
+            if not n.startswith("xui-backup-"):
+                continue
+            p = os.path.join(BACKUP_DIR, n)
+            size = os.path.getsize(p) if os.path.isfile(p) else sum(
+                os.path.getsize(os.path.join(p, f)) for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
+            got.append({"name": n, "at": int(os.path.getmtime(p)), "size": size})
+    except OSError:
+        pass
+    return sorted(got, key=lambda b: -b["at"])[:12]
+
+
+def inbound_rows():
+    with db() as c:
+        return [dict(r) for r in c.execute("select id, tag, remark, port, protocol, stream_settings, settings from inbounds")]
+
+
+def outages(st, c):
+    """Recent outages, told apart: over, still going, answering again but not yet trusted
+    (the guard waits for a few healthy runs), or the path was removed while it was down."""
+    known, last = set(c.get("paths") or {}), st.get("last") or {}
+    out = []
+    for o in sorted(st.get("outages", []), key=lambda o: -o["start"])[:8]:
+        o = dict(o)
+        if "end" in o:
+            o["state"] = "over"
+        elif o.get("removed") or o["path"] not in known:
+            o["state"] = "removed"
+        elif (last.get(o["path"]) or {}).get("ok"):
+            o["state"] = "recovering"
+        else:
+            o["state"] = "ongoing"
+        out.append(o)
+    return out
+
+
+def status():
+    st = json.loads(read(GUARD_STATE, "{}") or "{}")
+    c, cfg = conf(), xray_cfg()
+    rules = cfg.get("routing", {}).get("rules", [])
+    tags = {r.get("ruleTag") for r in rules}
+    rc, _ = run("systemctl", "is-active", "tunnel-guard.timer", timeout=10)
+    order = [c.get("primary")] + (c.get("backups") or [c.get("backup")])
+    avail = availability()
+    return {
+        "paths": [dict(name=n, role="primary" if i == 0 else "backup %d" % i,
+                       iface=(c.get("paths", {}).get(n) or {}).get("iface"), up24=avail.get(n),
+                       **(st.get("last", {}).get(n) or {})) for i, n in enumerate(order) if n],
+        "on": st.get("on"), "primary": c.get("primary"), "hold": read(GUARD_HOLD, "").strip(),
+        "last_ts": st.get("last_ts"), "guard_active": rc == 0,
+        "outages": outages(st, c),
+        "features": {
+            "split": "split-light" in tags,
+            "dns_cache": any(o.get("protocol") == "dns" for o in cfg.get("outbounds", [])),
+            "ad_block": any(r.get("domain") == ["geosite:category-ads-all"] for r in rules),
+            "tg_backup": setting("tgBotBackup") == "true",
+
+        },
+        "cert": {"file": c.get("cert"), "days": cert_days(c["cert"]) if c.get("cert") else None},
+        "inbounds": {i["tag"]: (i["remark"] or i["tag"]) for i in inbound_rows()},
+        "res": resources(), "month": vnstat_month(), "backups": backups(),
+        "xray": run(XRAY, "version", timeout=5)[1].split("\n")[0] if os.path.exists(XRAY) else "",
+        "now": int(time.time()),
+    }
+
+
+def units():
+    """The units this hub is made of - name, what it is for, and whether it is up."""
+    got = [("x-ui", "پنل و Xray"), ("nginx", "جلوی پنل و صفحه‌ی Optimizer"), ("xo-dash", "همین صفحه"),
+           ("tunnel-guard.timer", "بررسی مسیرها هر دقیقه"), ("config-guard.path", "نگهبان پیکربندی"),
+           ("config-guard.timer", "تور ایمنی نگهبان پیکربندی"),
+           ("xui-tunnel.timer", "جابجایی خودکار بین تانل‌ها")]
+    for name, p in (conf().get("paths") or {}).items():
+        if p.get("iface"):
+            got.append(("awg-quick@%s.service" % p["iface"], "تانل " + name))
+    out = []
+    for unit, what in got:
+        rc, raw = run("systemctl", "show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "LoadState",
+                      "-p", "ActiveEnterTimestampMonotonic", "-p", "MemoryCurrent", timeout=8)
+        d = dict(l.split("=", 1) for l in raw.splitlines() if "=" in l)
+        if d.get("LoadState") not in ("loaded",):
+            continue
+        since = int(d.get("ActiveEnterTimestampMonotonic") or 0) / 1e6
+        up = int(float((read("/proc/uptime", "0").split() or ["0"])[0]))
+        raw_mem = (d.get("MemoryCurrent") or "0").strip()
+        mem = int(raw_mem) if raw_mem.isdigit() else 0          # "[not set]" for units with no cgroup
+        out.append({"unit": unit, "what": what, "state": d.get("ActiveState", "?"), "sub": d.get("SubState", ""),
+                    "since": int(time.time() - (up - since)) if since else 0,
+                    "mem": mem if 0 < mem < (1 << 60) else 0})
+    return out
+
+
+RESTARTABLE = {"x-ui", "nginx", "xo-dash", "tunnel-guard.timer", "config-guard.path", "config-guard.timer",
+               "xui-tunnel.timer"}
+LOGS = {"tunnel-guard": ("journalctl", "-t", "tunnel-guard", "-n", "60", "--no-pager", "-o", "short-iso"),
+        "config-guard": ("journalctl", "-u", "config-guard.service", "-n", "60", "--no-pager", "-o", "short-iso"),
+        "x-ui": ("journalctl", "-u", "x-ui", "-n", "80", "--no-pager", "-o", "short-iso"),
+        "xo-dash": ("journalctl", "-u", "xo-dash", "-n", "60", "--no-pager", "-o", "short-iso"),
+        "access": None,  # path read from Xray's config at call time, see access_log()
+        "nginx": ("tail", "-n", "60", "/var/log/nginx/error.log")}
+SAFE_NAME = re.compile(r"^xui-backup-[A-Za-z0-9._-]+$")
+SAFE_URL = re.compile(r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{3,300}$")
+PRIVATE = ("localhost", "127.", "10.", "192.168.", "169.254.", "172.16.", "0.")
+
+
+def restartable():
+    return RESTARTABLE | {u["unit"] for u in units() if u["unit"].startswith("awg-quick@")}
+
+
+def url_through_paths(url):
+    """Does this address open through each path? The question after every new block."""
+    out = []
+    for name, port in path_ports().items():
+        rc, raw = run("curl", "-s", "-o", "/dev/null", "-m", "12", "--socks5-hostname", "127.0.0.1:%d" % port,
+                      "-A", "Mozilla/5.0", "-w", "%{http_code} %{time_total} %{size_download}", url, timeout=16)
+        p = raw.split()
+        out.append({"path": name, "code": p[0] if p else "000", "secs": float(p[1]) if len(p) > 1 else None,
+                    "size": int(p[2]) if len(p) > 2 else 0})
+    return out
+
+
+class Jobs:
+    """One slot per long tool (mux-bench takes three minutes), so the page can poll."""
+
+    ALLOWED = {"mux-bench": (("mux-bench",), 420)}
+
+    def __init__(self):
+        self.lock, self.jobs = threading.Lock(), {}
+
+    def start(self, name, arg=""):
+        cmd, limit = self.ALLOWED[name]
+        with self.lock:
+            j = self.jobs.get(name)
+            if j and not j["done"]:
+                return {"ok": True, "running": True}
+            self.jobs[name] = {"started": int(time.time()), "done": False, "out": "", "rc": None, "arg": arg}
+        def work():
+            rc, out = run(*cmd, *( [arg] if arg else [] ), timeout=limit)
+            with self.lock:
+                self.jobs[name].update(done=True, rc=rc, out=out, ended=int(time.time()))
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "running": True}
+
+    def get(self, name):
+        with self.lock:
+            return dict(self.jobs.get(name) or {})
+
+
+JOBS = Jobs()
+
+
+def paths_view():
+    return jrun("xui-path", "list", "--json", timeout=20) or []
+
+
+def tunnels_view():
+    return jrun("xui-tunnel", "list", "--json", timeout=40) or []
+
+
+def confguard():
+    """What config-guard thinks of the current config (it changes nothing without --fix)."""
+    g = jrun("config-guard", "--json", timeout=25)
+    if not g:
+        return {"error": "config-guard not installed or no baseline yet"}
+    # Old events name outbounds and probe ports that were removed on purpose since; they are
+    # history, not something to fix. Keep only what the current baseline still watches.
+    now = set(g.get("tags") or []) | set(path_order()) | {"guard-" + n.lower() for n in path_order()}
+    now |= {o.get("tag") for o in xray_cfg().get("outbounds", [])}
+    kept = []
+    for e in g.get("events") or []:
+        m = e.get("missing") or {}
+        m = {k: ([x for x in m.get(k) or [] if x in now] if k != "dns" else m.get(k)) for k in m}
+        if any(m.get(k) for k in ("rules", "outbounds", "inbounds", "dns")):
+            kept.append(dict(e, missing=m))
+    g["events"] = kept
+    return g
+
+
+def availability(hours=24):
+    """Share of the guard's checks in which each path answered, from the collector's buckets."""
+    with METRICS.lock:
+        mins = [m for m in METRICS.minutes if m["t"] > time.time() - hours * 3600]
+    tot, ok = collections.Counter(), collections.Counter()
+    for m in mins:
+        for name, v in (m.get("p") or {}).items():
+            tot[name] += 1
+            ok[name] += v[1]
+    return {n: round(100.0 * ok[n] / tot[n], 2) for n in tot if tot[n]}
+
+
+# ---------------------------------------------------------------- users
+
+IDLE_DAYS = 30
+
+
+def is_idle(r):
+    """Enabled, seen at least once, not seen for IDLE_DAYS, and not online right now."""
+    return r["enable"] and r["last"] and not r["on"] and time.time() - r["last"] > IDLE_DAYS * 86400
+
+
+def panel_api(cookie, path, body):
+    """Call the panel's own API as the person using this page: their session cookie, and
+    the CSRF token the panel mints for that session (3.x checks it on unsafe requests)."""
+    root = "https://127.0.0.1:%s%s" % (setting("webPort") or 2053, BASE)
+    head = {"Cookie": cookie, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+    for p in ("panel/csrf-token", "csrf-token"):
+        try:
+            got = json.loads(_opener.open(urllib.request.Request(root + p, headers=head), timeout=10).read())
+        except Exception:
+            continue
+        if got.get("success") and isinstance(got.get("obj"), str):
+            head["X-CSRF-Token"] = got["obj"]
+            break
+    req = urllib.request.Request(root + path, data=json.dumps(body).encode(), method="POST",
+                                 headers=dict(head, **{"Content-Type": "application/json"}))
+    try:
+        return json.loads(_opener.open(req, timeout=180).read())
+    except urllib.error.HTTPError as e:
+        return {"success": False, "msg": "پنل پاسخ %d داد" % e.code}
+
+
+def delete_idle(cookie, emails, everyone):
+    """Delete idle clients through the panel, never anyone who is not idle by the time it runs."""
+    idle = {r["email"] for r in users_rows() if is_idle(r)}
+    want = sorted(idle) if everyone else [e for e in emails if e in idle]
+    skipped = [e for e in emails if e not in idle] if not everyone else []
+    if not want:
+        return {"ok": False, "msg": "کاربر خاموشی برای حذف نماند" + (" (دیگر خاموش نیستند: %s)" % "، ".join(skipped)
+                                                                   if skipped else "")}
+    backup = os.path.basename(make_backup())               # a way back before anything goes
+    r = panel_api(cookie, "panel/api/clients/bulkDel", {"emails": want, "keepTraffic": False})
+    if not r.get("success"):
+        return {"ok": False, "msg": "پنل حذف نکرد: %s (بکاپ: %s)" % (r.get("msg") or "?", backup)}
+    obj = r.get("obj") or {}
+    gone = obj.get("deleted", len(want)) if isinstance(obj, dict) else len(want)
+    skipped += ["%s (%s)" % (x.get("email"), x.get("reason")) for x in (obj.get("skipped") or [])
+                if isinstance(x, dict)] if isinstance(obj, dict) else []
+    msg = "%d کاربر خاموش حذف شد. بکاپ قبل از حذف: %s" % (gone, backup)
+    if skipped:
+        msg += " · حذف نشد: " + "، ".join(skipped[:8])
+    return {"ok": True, "msg": msg, "deleted": gone, "backup": backup}
+
+
+def users_rows():
+    return users_view(rows_only=True)
+
+
+def users_view(rows_only=False):
+    rates, online = METRICS.user_rates()
+    now_ms = int(time.time() * 1000)
+    rows, per_inbound = [], collections.Counter()
+    with db() as c:
+        links = collections.defaultdict(list)
+        for r in c.execute("select ci.client_id, i.tag from client_inbounds ci join inbounds i on i.id = ci.inbound_id"):
+            links[r[0]].append(r[1])
+        traffic = {r["email"]: r for r in c.execute("select email, up, down, last_online from client_traffics")}
+        for r in c.execute("select id, email, total_gb, expiry_time, enable, limit_ip, comment from clients"):
+            t = traffic.get(r["email"])
+            used = (t["up"] + t["down"]) if t else 0
+            quota, exp = r["total_gb"] or 0, r["expiry_time"] or 0
+            rows.append({
+                "email": r["email"], "used": used, "quota": quota,
+                "pct": round(100.0 * used / quota, 1) if quota else None,
+                # a negative expiry is a plan that starts counting on the first connection
+                "days": round((exp - now_ms) / 86400000.0, 1) if exp > 0 else None,
+                "pending": round(-exp / 86400000.0) if exp < 0 else None,
+                "enable": bool(r["enable"]), "limit_ip": r["limit_ip"] or 0,
+                "on": r["email"] in online, "bps": rates.get(r["email"], 0),
+                "last": int((t["last_online"] or 0) / 1000) if t else 0,
+                "inbounds": links.get(r["id"], []), "comment": r["comment"] or "",
+            })
+            if r["email"] in online:
+                for tag in links.get(r["id"], []):
+                    per_inbound[tag] += 1
+    if rows_only:
+        return rows
+    return {
+        "total": len(rows), "online": len(online), "enabled": sum(1 for r in rows if r["enable"]),
+        "live": sorted([r for r in rows if r["bps"] > 0], key=lambda r: -r["bps"])[:12],
+        "expiring": sorted([r for r in rows if r["days"] is not None and r["days"] <= 7 and r["enable"]],
+                           key=lambda r: r["days"])[:15],
+        "full": sorted([r for r in rows if r["pct"] is not None and r["pct"] >= 85 and r["enable"]],
+                       key=lambda r: -r["pct"])[:15],
+        "idle": sorted([r for r in rows if is_idle(r)], key=lambda r: r["last"])[:15],
+        "idle_total": sum(1 for r in rows if is_idle(r)), "idle_days": IDLE_DAYS,
+        "per_inbound": dict(per_inbound), "sharing": sharing(online),
+    }
+
+
+def sharing(online, budget=6.0):
+    """How many addresses each online user is connected from, straight from Xray."""
+    out, end = [], time.time() + budget
+
+    def one(email):
+        if time.time() > end:
+            return None
+        d = xapi("statsonlineiplist", "-email=" + email, timeout=4)
+        return (email, len((d or {}).get("ips") or {})) if d else None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for r in pool.map(one, list(online)[:150]):
+            if r and r[1] > 1:
+                out.append({"email": r[0], "ips": r[1]})
+    return sorted(out, key=lambda r: -r["ips"])[:15]
+
+
+# ---------------------------------------------------------------- panel linter
+
+def lint():
+    """Checks the invariants this panel has to keep; every finding says how to repair it."""
+    found, cfg = [], xray_cfg()
+
+    def add(level, title, detail, fix=None):
+        found.append({"level": level, "title": title, "detail": detail, "fix": fix})
+
+    with db() as c:
+        inbounds = {r["id"]: dict(r) for r in c.execute("select id, tag, remark, settings, stream_settings from inbounds")}
+        clients = {r["id"]: dict(r) for r in c.execute("select id, email, uuid, enable, sub_id from clients")}
+        links = [dict(r) for r in c.execute("select client_id, inbound_id, flow_override from client_inbounds")]
+        traffic = {r[0] for r in c.execute("select email from client_traffics")}
+
+    listed = {}
+    for i in inbounds.values():
+        try:
+            listed[i["id"]] = {x.get("email"): x for x in (json.loads(i["settings"] or "{}").get("clients") or [])}
+        except Exception:
+            listed[i["id"]] = {}
+
+    missing, noflow = [], []
+    for l in links:
+        cl, inb = clients.get(l["client_id"]), inbounds.get(l["inbound_id"])
+        if not cl or not inb:
+            continue
+        entry = listed.get(inb["id"], {}).get(cl["email"])
+        if not entry or not entry.get("id"):
+            missing.append("%s@%s" % (cl["email"], inb["tag"]))
+        elif (entry.get("flow") or "") != (l["flow_override"] or ""):  # link and listener must agree
+            noflow.append("%s@%s" % (cl["email"], inb["tag"]))
+
+    linked = {(l["client_id"], l["inbound_id"]) for l in links}
+    by_email = {c["email"]: c["id"] for c in clients.values()}
+    ghosts = ["%s@%s" % (email, inbounds[iid]["tag"]) for iid, entries in listed.items() for email in entries
+              if (by_email.get(email), iid) not in linked]
+
+    if missing:
+        add("bad", "کلاینت‌هایی که در لیست داخلی اینباند نیستند",
+            "هنگام ویرایش، پنل خطای empty client ID می‌دهد. %d مورد: %s" % (len(missing), "، ".join(missing[:6])),
+            "fix-inbounds")
+    if ghosts:
+        add("warn", "ردیف اضافی در لیست داخلی اینباند",
+            "%d ردیف در لیست قدیمی اینباند هست ولی کلاینتی به آن وصل نیست: %s" % (len(ghosts), "، ".join(ghosts[:6])),
+            "fix-inbounds")
+    if noflow:
+        add("bad", "ناهماهنگی flow",
+            "flow در لینک کاربر با چیزی که اینباند قبول می‌کند یکی نیست، پس اتصال رد می‌شود: " + "، ".join(noflow[:6]),
+            "fix-inbounds")
+
+    orphan = traffic - set(by_email)
+    if orphan:
+        add("warn", "ردیف ترافیک بدون کلاینت",
+            "%d ردیف در client_traffics به هیچ کلاینتی وصل نیست: %s" % (len(orphan), "، ".join(list(orphan)[:6])))
+    dup_e = [e for e, n in collections.Counter(c["email"] for c in clients.values()).items() if n > 1]
+    dup_u = [u for u, n in collections.Counter(c["uuid"] for c in clients.values() if c["uuid"]).items() if n > 1]
+    if dup_e or dup_u:
+        add("bad", "ایمیل یا UUID تکراری",
+            "ایمیل: %s | UUID: %s" % ("، ".join(dup_e[:5]) or "-", "، ".join(dup_u[:3]) or "-"))
+    lonely = [c["email"] for cid, c in clients.items() if not any(l["client_id"] == cid for l in links)]
+    if lonely:
+        add("warn", "کلاینت بدون اینباند",
+            "%d کلاینت به هیچ اینباندی وصل نیست، پس لینک اشتراکشان خالی است: %s" % (len(lonely), "، ".join(lonely[:6])))
+    nosub = [c["email"] for c in clients.values() if not (c["sub_id"] or "").strip()]
+    if nosub:
+        add("warn", "کلاینت بدون subId",
+            "%d کلاینت لینک اشتراک ندارد: %s" % (len(nosub), "، ".join(nosub[:6])))
+
+    rules = [r.get("ruleTag") for r in cfg.get("routing", {}).get("rules", [])]
+    ir = [i for i, t in enumerate(rules) if t and t.startswith("ir-direct")]
+    if ir and "dns-upstream" in rules and max(ir) > rules.index("dns-upstream"):
+        add("bad", "ترتیب قانون‌های مسیریابی",
+            "قانون‌های ir-direct باید بالاتر از dns-upstream باشند، وگرنه DNS سایت‌های ایرانی هم از تانل می‌رود.")
+    if "split-light" in rules and "split-heavy" in rules and rules.index("split-heavy") > rules.index("split-light"):
+        add("warn", "ترتیب تقسیم ترافیک",
+            "قانون split-heavy باید قبل از split-light باشد وگرنه دانلودهای سنگین هم روی Mux می‌افتند.")
+    outs = {o.get("tag", "").lower() for o in cfg.get("outbounds", [])}
+    orphan_probes = [i["tag"] for i in cfg.get("inbounds", [])
+                     if (i.get("tag") or "").startswith("guard-") and i["tag"][6:] not in outs]
+    if orphan_probes:
+        add("warn", "پورت probe بدون اوت‌باند",
+            "اوت‌باند این‌ها حذف شده ولی پورتشان مانده و ترافیکش به اوت‌باند پیش‌فرض می‌رود: "
+            + "، ".join(orphan_probes), "prune-probes")
+    if not setting("remarkTemplate"):
+        add("warn", "قالب نام کانفیگ‌ها",
+            "remarkTemplate خالی است؛ پنل نام پیش‌فرض با ایمیل و حجم می‌سازد. مقدار {{INBOUND}} یعنی فقط نام اینباند.")
+    return {"findings": found, "ok": not found,
+            "counts": {"clients": len(clients), "links": len(links), "inbounds": len(inbounds)}}
+
+
+# ---------------------------------------------------------------- checkup
+
+def probe_https(port, url="https://www.google.com/generate_204", timeout=10):
+    rc, out = run("curl", "-s", "-o", "/dev/null", "-m", str(timeout), "--socks5-hostname", "127.0.0.1:%d" % port,
+                  "-w", "%{http_code} %{time_total} %{time_connect}", url, timeout=timeout + 3)
+    parts = out.split()
+    return None if rc or len(parts) < 3 else {"code": parts[0], "total": float(parts[1]), "connect": float(parts[2])}
+
+
+def checkup():
+    """One button, the whole hub: what a person would check by hand after an outage."""
+    c, cfg, res = conf(), xray_cfg(), []
+    ports = path_ports()
+
+    def add(level, title, detail, hint=""):
+        res.append({"level": level, "title": title, "detail": detail, "hint": hint})
+
+    def clock():
+        synced = run("timedatectl", "show", "-p", "NTPSynchronized", "--value", timeout=5)[1].strip()
+        off = ""
+        rc, out = run("chronyc", "tracking", timeout=5)
+        if not rc:
+            for line in out.splitlines():
+                if line.startswith("System time"):
+                    off = " (" + line.split(":", 1)[1].strip() + ")"
+        add("ok" if synced == "yes" else "bad", "ساعت سیستم",
+            ("هماهنگ با NTP" + off) if synced == "yes" else "هماهنگ نیست",
+            "TLS و Reality به ساعت دقیق نیاز دارند؛ اختلاف چند ثانیه‌ای یعنی هندشیک رد می‌شود.")
+
+    def xray_test():
+        rc, out = run(XRAY, "run", "-test", "-c", CFG, timeout=30)
+        add("ok" if rc == 0 else "bad", "پیکربندی Xray", "سالم است" if rc == 0 else out.splitlines()[-1][:200],
+            "" if rc == 0 else "تا وقتی این خطا هست، هر ری‌استارت x-ui کاربران را قطع می‌کند.")
+
+    def paths():
+        for name in path_order():
+            port = ports.get(name)
+            if not port:
+                add("bad", "مسیر " + name, "پورت probe ندارد", "در ابزارها، مسیر را حذف و دوباره اضافه کنید.")
+                continue
+            r = probe_https(port)
+            if not r:
+                add("bad", "مسیر " + name, "پاسخ نداد", "اگر ادامه پیدا کند، نگهبان کاربران را جابجا می‌کند.")
+            else:
+                add("ok" if r["total"] < 1.5 else "warn", "مسیر " + name,
+                    "HTTP %s در %.2f ثانیه (اتصال %.2f)" % (r["code"], r["total"], r["connect"]))
+
+    def speed():
+        name = c.get("primary")
+        port = ports.get(name)
+        if not port:
+            return
+        rc, out = run("curl", "-s", "-o", "/dev/null", "-m", "15", "--socks5-hostname", "127.0.0.1:%d" % port,
+                      "-w", "%{speed_download}", "https://speed.cloudflare.com/__down?bytes=25000000", timeout=20)
+        try:
+            mbit = float(out) * 8 / 1e6
+        except ValueError:
+            return add("warn", "سرعت مسیر اصلی", "اندازه‌گیری نشد")
+        add("ok" if mbit > 100 else "warn" if mbit > 25 else "bad", "سرعت مسیر اصلی (%s)" % name,
+            "%.0f مگابیت بر ثانیه در دانلود ۲۵ مگابایتی" % mbit,
+            "این عدد از خود هاب گرفته شده و سقف چیزی است که کاربر می‌گیرد.")
+
+    def dns():
+        if not any(o.get("protocol") == "dns" for o in cfg.get("outbounds", [])):
+            return add("warn", "کش DNS", "روشن نیست", "با دستور xui-optimizer روشن می‌شود.")
+        port, extra = ports.get(c.get("primary")), ""
+        if port:
+            r = probe_https(port, "https://1.1.1.1/dns-query?name=example.com&type=A")
+            if r:
+                extra = " · پاسخ DoH بالادست %.0f میلی‌ثانیه" % (r["total"] * 1000)
+        add("ok", "کش DNS", "روشن است؛ جواب‌های تکراری از روی هاب می‌آیند" + extra)
+
+    def mtu():
+        p = (c.get("paths") or {}).get(c.get("primary")) or {}
+        if not p.get("peer") or not p.get("iface"):
+            return
+        lo, hi = 1200, 1500
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            rc, _ = run("ping", "-c", "1", "-W", "2", "-M", "do", "-s", str(mid - 28), p["peer"], timeout=6)
+            lo, hi = (mid, hi) if rc == 0 else (lo, mid - 1)
+        cur = int(read("/sys/class/net/%s/mtu" % p["iface"], "0").strip() or 0)
+        if lo <= 1200:
+            return add("warn", "MTU تانل", "اندازه‌گیری نشد")
+        add("ok" if cur <= lo else "warn", "MTU تانل %s" % p["iface"],
+            "بزرگ‌ترین بسته‌ی بدون تکه‌شدن %d بایت، تنظیم فعلی %d" % (lo, cur),
+            "" if cur <= lo else "MTU بزرگ‌تر از این یعنی بسته‌ها تکه می‌شوند و سرعت می‌افتد.")
+
+    def machine():
+        r = resources()
+        mem = 100 - (100.0 * r["mem_avail"] / max(1, r["mem_total"]))
+        disk = 100 - (100.0 * r["disk_free"] / max(1, r["disk_total"]))
+        ld = r["load"][0] / max(1, r["cpus"])
+        ct = 100.0 * r["conntrack"] / max(1, r["conntrack_max"])
+        worst = max(mem, disk, ct)
+        add("bad" if worst > 92 or ld > 2 else "warn" if worst > 80 or ld > 1 else "ok", "منابع سرور",
+            "رم %.0f%% · دیسک %.0f%% · بار %.2f روی %d هسته · %d اتصال · conntrack %.0f%%"
+            % (mem, disk, r["load"][0], r["cpus"], r["conns"], ct))
+
+    def cert():
+        if not c.get("cert"):
+            return
+        d = cert_days(c["cert"])
+        if d is None:
+            return add("warn", "گواهی TLS", "خوانده نشد")
+        add("ok" if d > 20 else "warn" if d > 7 else "bad", "گواهی TLS", "%d روز اعتبار دارد" % d)
+
+    def panel():
+        r = lint()
+        bad = [f for f in r["findings"] if f["level"] == "bad"]
+        add("bad" if bad else "warn" if r["findings"] else "ok", "سلامت پنل",
+            "%d کلاینت، %d اتصال به اینباند" % (r["counts"]["clients"], r["counts"]["links"])
+            + ("" if not r["findings"] else " · %d ایراد" % len(r["findings"])),
+            "" if not r["findings"] else "جزئیات در کارت «بازرسی پنل».")
+
+    def backup():
+        b = backups()
+        if not b:
+            return add("warn", "بکاپ", "هیچ بکاپی پیدا نشد", "دکمه‌ی «بکاپ بگیر» در همین صفحه.")
+        age, tg = (time.time() - b[0]["at"]) / 86400, setting("tgBotBackup") == "true"
+        add("ok" if age < 3 or tg else "warn", "بکاپ",
+            "آخرین بکاپ %.1f روز پیش%s" % (age, " · بکاپ روزانه‌ی تلگرام روشن است" if tg else ""))
+
+    def config_guard():
+        g = confguard()
+        if g.get("error"):
+            return add("warn", "نگهبان پیکربندی", g["error"])
+        miss = g.get("missing") or {}
+        gone = (miss.get("rules") or []) + (miss.get("outbounds") or []) + (miss.get("inbounds") or [])
+        add("ok" if g.get("ok") else "bad", "نگهبان پیکربندی",
+            "%d قانون نشان‌دار زیر نظر است" % len(g.get("tags") or []) if g.get("ok")
+            else "از کانفیگ رفته: " + "، ".join(gone[:6]),
+            "" if g.get("ok") else "کارت «نگهبان پیکربندی» در همین تب، دکمه‌ی برگرداندن را دارد.")
+
+    def kernel():
+        want = {"net.ipv4.tcp_slow_start_after_idle": "0", "net.ipv4.tcp_notsent_lowat": "16384",
+                "net.ipv4.tcp_mtu_probing": "1"}
+        off = [k for k, v in want.items() if run("sysctl", "-n", k, timeout=5)[1].strip() != v]
+        add("ok" if not off else "warn", "تنظیم‌های کرنل",
+            "هر سه اعمال شده" if not off else "اعمال نشده: " + "، ".join(off),
+            "" if not off else "فایل sysctl/99-proxy-tcp.conf را در /etc/sysctl.d بگذارید و sysctl -p بزنید.")
+
+    for fn in (clock, xray_test, paths, speed, dns, mtu, machine, cert, panel, config_guard, backup, kernel):
+        try:
+            fn()
+        except Exception as e:
+            add("warn", fn.__name__, "بررسی انجام نشد: %s" % e)
+    score = sum({"ok": 100, "warn": 60, "bad": 0}[r["level"]] for r in res) // max(1, len(res))
+    return {"at": int(time.time()), "score": score, "checks": res}
+
+
+# ---------------------------------------------------------------- actions
+
+def make_backup():
+    dest = os.path.join(BACKUP_DIR, "xui-backup-" + time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(dest, exist_ok=True)
+    for src in (DB, CFG, GUARD_CONF):
+        if os.path.exists(src):
+            shutil.copy2(src, dest)
+    return dest
+
+
+def action(name, body):
+    if name == "hold":
+        path = body.get("path") or ""
+        if path:
+            open(GUARD_HOLD, "w").write(path)
+        elif os.path.exists(GUARD_HOLD):
+            os.remove(GUARD_HOLD)
+        rc, out = run("systemctl", "start", "tunnel-guard.service", timeout=90)  # act now, not in a minute
+        return {"ok": rc == 0, "msg": ("pinned to " + path) if path else "automatic again"}
+    if name == "guard":
+        verb = "enable" if body.get("on") else "disable"
+        rc, out = run("systemctl", verb, "--now", "tunnel-guard.timer")
+        return {"ok": rc == 0, "msg": out or verb}
+    if name == "telegram-test":
+        rc, out = run("tunnel-guard", "--test")
+        return {"ok": "sent" in out, "msg": out}
+    if name == "report":
+        rc, out = run("tunnel-guard", "--report", timeout=90)
+        return {"ok": rc == 0, "msg": "report sent" if rc == 0 else out}
+    if name == "adblock":  # restarts x-ui: the page asks first
+        rc, out = run("xui-optimizer", "--adblock", "on" if body.get("on") else "off", timeout=150)
+        lines = [l for l in out.splitlines() if l.strip()]
+        return {"ok": rc == 0, "msg": (lines[-2] if rc == 0 and len(lines) > 1 else lines[-1]) if lines else ""}
+    if name == "split":  # restarts x-ui: the page asks first
+        rc, out = run("xui-split", "apply" if body.get("on") else "remove", "--no-tg-backup", timeout=120)
+        return {"ok": rc == 0, "msg": out.splitlines()[-1] if out else ""}
+    if name == "log":
+        src = body.get("source") or "tunnel-guard"
+        cmd = ("tail", "-n", "80", access_log()) if src == "access" else LOGS.get(src)
+        if not cmd:
+            return {"ok": False, "msg": "unknown log"}
+        rc, out = run(*cmd, timeout=20)
+        return {"ok": True, "msg": out or "(خالی)"}
+    if name == "restart":
+        unit = str(body.get("unit") or "")
+        if unit not in restartable():
+            return {"ok": False, "msg": "این سرویس در فهرست مجاز نیست"}
+        rc, out = run("systemctl", "restart", unit, timeout=120)
+        return {"ok": rc == 0, "msg": out or ("restarted " + unit)}
+    if name == "restore":
+        got = str(body.get("name") or "")
+        src = os.path.join(BACKUP_DIR, got)
+        if not SAFE_NAME.match(got) or not os.path.exists(src):
+            return {"ok": False, "msg": "این بکاپ پیدا نشد"}
+        chosen = src if os.path.isfile(src) else os.path.join(src, os.path.basename(DB))
+        if not os.path.exists(chosen):
+            return {"ok": False, "msg": "دیتابیسی داخل این بکاپ نیست"}
+        make_backup()                                  # never overwrite without a way back
+        shutil.copy2(chosen, DB)
+        rc, out = run("systemctl", "restart", "x-ui", timeout=120)
+        run("config-guard", "--save", timeout=30)     # the restored config is the one to keep
+        return {"ok": rc == 0, "msg": "برگردانده شد: " + got}
+    if name == "prune-backups":
+        keep = {b["name"] for b in backups()[:10]}
+        gone = 0
+        for n in os.listdir(BACKUP_DIR):
+            p = os.path.join(BACKUP_DIR, n)
+            if SAFE_NAME.match(n) and n not in keep and time.time() - os.path.getmtime(p) > 7 * 86400:
+                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+                gone += 1
+        return {"ok": True, "msg": "%d بکاپ قدیمی پاک شد" % gone}
+    if name == "probe-url":
+        url = str(body.get("url") or "").strip()
+        if not url.startswith("http"):
+            url = "https://" + url
+        host = url.split("//", 1)[-1].split("/")[0].lower()
+        if not SAFE_URL.match(url) or host.startswith(PRIVATE):
+            return {"ok": False, "msg": "آدرس معتبر نیست"}
+        return {"ok": True, "result": {"url": url, "paths": url_through_paths(url)}}
+    if name == "path-add":                            # restarts x-ui: the page asks first
+        got, link = str(body.get("name") or "").strip(), str(body.get("link") or "").strip()
+        peer = str(body.get("peer") or "").strip()
+        if not got or not link or len(link) > 2000:
+            return {"ok": False, "msg": "نام و لینک لازم است"}
+        addrs = [a for a in re.split(r"[\s,،]+", str(body.get("addrs") or "")) if a][:8]
+        if any(not re.match(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$", a) for a in addrs):
+            return {"ok": False, "msg": "یکی از آدرس‌های اضافه نامعتبر است"}
+        cmd = ["xui-path", "add", got, link, "--json"] + (["--peer", peer] if peer else []) + \
+              (["--addrs", ",".join(addrs)] if addrs else [])
+        r = jrun_any(*cmd, timeout=300)
+        return r or {"ok": False, "msg": "اضافه نشد - لاگ xo-dash را ببینید"}
+    if name == "path-remove":
+        got = str(body.get("name") or "").strip()
+        r = jrun_any("xui-path", "remove", got, "--json", timeout=180)
+        return r or {"ok": False, "msg": "حذف نشد"}
+    if name == "prune-probes":                        # no restart: the API drops the ports
+        r = jrun_any("xui-path", "prune", "--json", timeout=90)
+        return r or {"ok": False, "msg": "انجام نشد"}
+    if name == "tunnel-discover":
+        return {"ok": True, "result": jrun("xui-tunnel", "discover", "--json", timeout=60) or []}
+    if name in ("tunnel-set", "tunnel-use", "tunnel-test", "tunnel-add", "tunnel-scan"):
+        path = str(body.get("name") or "").strip()
+        if path not in path_order():
+            return {"ok": False, "msg": "این مسیر در فهرست نیست"}
+        if name == "tunnel-scan":                     # every tunnel at once: about 15 seconds
+            cmd = ["xui-tunnel", "scan", path, "--json"] + (["--save"] if body.get("save") else [])
+            return jrun_any(*cmd, timeout=150) or {"ok": False, "msg": "اسکن انجام نشد"}
+        if name == "tunnel-set":
+            addrs = [str(a).strip() for a in (body.get("addrs") or []) if str(a).strip()][:8]
+            cmd = ["xui-tunnel", "set", path, ",".join(addrs), "--json"]
+            if "auto" in body:
+                cmd += ["--auto", "on" if body.get("auto") else "off"]
+            return jrun_any(*cmd, timeout=20) or {"ok": False, "msg": "ذخیره نشد"}
+        addr = str(body.get("addr") or "").strip()
+        if not re.match(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$", addr):
+            return {"ok": False, "msg": "آدرس نامعتبر"}
+        verb = {"tunnel-use": "use", "tunnel-add": "add"}.get(name, "test")
+        return jrun_any("xui-tunnel", verb, path, addr, "--json", timeout=90) or {"ok": False, "msg": "انجام نشد"}
+    if name == "job":
+        job = str(body.get("job") or "")
+        if job not in JOBS.ALLOWED:
+            return {"ok": False, "msg": "unknown job"}
+        arg = str(body.get("arg") or "") or conf().get("primary") or ""
+        if arg and arg not in probe_ports():
+            return {"ok": False, "msg": "این اوت‌باند وجود ندارد"}
+        return JOBS.start(job, arg)
+    if name == "job-status":
+        return {"ok": True, "result": JOBS.get(str(body.get("job") or ""))}
+    if name == "checkup":
+        return {"ok": True, "result": checkup()}
+    if name == "fix-inbounds":
+        rc, out = run("xui-fix-inbound-lists", "apply", timeout=120)
+        return {"ok": rc == 0, "msg": out.splitlines()[-1] if out else "", "full": out}
+    if name == "backup":
+        try:
+            return {"ok": True, "msg": os.path.basename(make_backup())}
+        except OSError as e:
+            return {"ok": False, "msg": str(e)}
+    if name == "confguard-save":
+        rc, out = run("config-guard", "--save", timeout=30)
+        return {"ok": rc == 0, "msg": out.splitlines()[-1] if out else ""}
+    if name == "confguard-fix":
+        rc, out = run("config-guard", "--fix", timeout=180)   # restarts x-ui: the page asks first
+        return {"ok": rc == 0, "msg": out.splitlines()[-1] if out else ""}
+    if name == "probe-client":
+        email = str(body.get("email") or "").strip()
+        if not email or len(email) > 120:
+            return {"ok": False, "msg": "ایمیل کاربر را بنویسید"}
+        r = jrun("xui-probe-client", email, "--json", timeout=180)
+        if not r:
+            return {"ok": False, "msg": "تست انجام نشد (ابزار نصب است؟)"}
+        return {"ok": not r.get("error"), "msg": r.get("error", ""), "result": r}
+    return {"ok": False, "msg": "unknown action"}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "xo-dash"
+    GETS = {"api/status": status, "api/live": lambda: METRICS.snapshot(), "api/users": users_view,
+            "api/lint": lint, "api/confguard": confguard, "api/units": units, "api/paths": paths_view,
+            "api/tunnels": tunnels_view}
+
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def route(self):
+        return self.path.split("?")[0][len(PREFIX):] if self.path.startswith(PREFIX) else None
+
+    def do_GET(self):
+        r = self.route()
+        if r == "inject.js":  # public on purpose: it only adds a link; the page itself checks login
+            js = open(os.path.join(HERE, "inject.js"), "rb").read().replace(b"__PREFIX__", PREFIX.encode())
+            return self.send(200, js, "application/javascript")
+        if not logged_in(self.headers.get("Cookie", "")):
+            self.send_response(302)
+            self.send_header("Location", BASE)
+            return self.end_headers()
+        if r in ("", "index.html"):
+            html = open(os.path.join(HERE, "index.html"), "rb").read()
+            return self.send(200, html.replace(b"__PREFIX__", PREFIX.encode()).replace(b"__BASE__", BASE.encode()),
+                             "text/html; charset=utf-8")
+        if r == "api/backup-file":                     # keep a copy off the server
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            got = (q.get("name") or [""])[0]
+            src = os.path.join(BACKUP_DIR, got)
+            if not SAFE_NAME.match(got) or not os.path.exists(src):
+                return self.send(404, {"error": "not found"})
+            path = src if os.path.isfile(src) else os.path.join(src, os.path.basename(DB))
+            if not os.path.exists(path):
+                return self.send(404, {"error": "no database in this backup"})
+            with open(path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", 'attachment; filename="%s.db"' % got)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+        if r in self.GETS:
+            try:
+                return self.send(200, self.GETS[r]())
+            except Exception as e:
+                return self.send(500, {"error": str(e)})
+        self.send(404, {"error": "not found"})
+
+    def do_POST(self):
+        r = self.route() or ""
+        if not logged_in(self.headers.get("Cookie", "")):
+            return self.send(401, {"error": "login to the panel first"})
+        if self.headers.get("X-Requested-With") != "xo-dash":  # no cross-site form posts
+            return self.send(403, {"error": "bad request"})
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}") if n < 20000 else {}
+        if r.startswith("api/"):
+            try:
+                if r == "api/delete-idle":
+                    emails = [str(e) for e in (body.get("emails") or []) if isinstance(e, str)][:500]
+                    return self.send(200, delete_idle(self.headers.get("Cookie", ""), emails, bool(body.get("all"))))
+                return self.send(200, action(r[4:], body))
+            except Exception as e:
+                return self.send(200, {"ok": False, "msg": str(e)})
+        self.send(404, {"error": "not found"})
+
+
+if __name__ == "__main__":
+    METRICS.start()
+    http.server.ThreadingHTTPServer(LISTEN, Handler).serve_forever()

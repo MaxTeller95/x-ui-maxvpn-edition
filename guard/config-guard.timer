@@ -1,0 +1,9 @@
+[Unit]
+Description=Safety net for config-guard (the panel can change the template without restarting Xray)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

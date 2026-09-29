@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""xui-path - add or remove a backup path for tunnel-guard, from a share link.
+
+    xui-path list [--json]
+    xui-path add NAME "vless://...#whatever"      paste the link of a server abroad
+    xui-path remove NAME
+    xui-path prune                          drop probe ports whose outbound is gone (no restart)
+    options: --peer HOST   what to ping for this path (default: the link's address)
+             --iface IF    the AWG tunnel this path rides (the guard watches its handshake)
+             --addrs A,B   more addresses of the same server (other tunnels); after the add every
+                           tunnel is scanned too, and the addresses that answer join the path
+             --json       machine readable, for the Optimizer page
+
+A path is three things that have to agree: an outbound in the panel's Xray template,
+a local socks port so tunnel-guard can probe it on its own, and an entry in
+/etc/tunnel-guard.json. This does all three at once, tests the config with
+`xray -test` before it touches anything, restarts x-ui, then actually connects
+through the new path and says whether it answered.
+
+Supported links: vless (tcp/ws/xhttp/grpc/httpupgrade, none/tls/reality),
+trojan, vmess and shadowsocks. The primary path cannot be removed, and neither
+can the one users are on right now.
+"""
+import base64, glob, json, os, re, shutil, sqlite3, subprocess, sys, time, urllib.parse
+
+DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
+CFG, GUARD_CONF = BIN + "/config.json", "/etc/tunnel-guard.json"
+GUARD_STATE = "/var/lib/tunnel-guard/state.json"
+KEY, PROBE_BASE = "xrayTemplateConfig", 10808
+NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,23}$")
+XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
+
+
+def die(msg, as_json=False):
+    print(json.dumps({"ok": False, "msg": msg}, ensure_ascii=False) if as_json else msg)
+    sys.exit(1)
+
+
+def template(db=None):
+    c = db or sqlite3.connect(DB)
+    return json.loads(c.execute("select value from settings where key=?", (KEY,)).fetchone()[0])
+
+
+def conf():
+    try:
+        with open(GUARD_CONF) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def unpad(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def parse_link(link):
+    """Turn a share link into an outbound, in the shape this panel writes them."""
+    link = link.strip()
+    scheme, _, rest = link.partition("://")
+    scheme = scheme.lower()
+    if scheme == "vmess":                      # base64 of a json blob
+        try:
+            v = json.loads(unpad(rest.split("#")[0]))
+        except Exception:
+            raise ValueError("این لینک vmess خوانده نشد")
+        q = {"type": v.get("net", "tcp"), "security": v.get("tls") or "none", "path": v.get("path", "/"),
+             "host": v.get("host", ""), "sni": v.get("sni", ""), "serviceName": v.get("path", "")}
+        return build("vmess", v.get("add"), int(v.get("port")), v.get("id"), q, extra={"aid": int(v.get("aid", 0) or 0)})
+    if "@" not in rest:
+        if scheme == "ss":                     # ss://base64(method:pass@host:port)
+            rest = unpad(rest.split("#")[0].split("?")[0]).decode()
+        else:
+            raise ValueError("این لینک شناخته نشد")
+    userinfo, _, hostpart = rest.partition("@")
+    hostpart = hostpart.split("#")[0]
+    host_port, _, query = hostpart.partition("?")
+    host, _, port = host_port.rpartition(":")
+    host = host.strip("[]")
+    if not host or not port.isdigit():
+        raise ValueError("آدرس یا پورت در لینک پیدا نشد")
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    if scheme == "vless":
+        return build("vless", host, int(port), urllib.parse.unquote(userinfo), q)
+    if scheme == "trojan":
+        return build("trojan", host, int(port), urllib.parse.unquote(userinfo), q)
+    if scheme == "ss":
+        method, _, password = unpad(userinfo).decode().partition(":") if ":" not in userinfo else userinfo.partition(":")[::2]
+        return {"protocol": "shadowsocks",
+                "settings": {"address": host, "port": int(port), "method": method, "password": password},
+                "streamSettings": {"network": "tcp", "security": "none"}}
+    raise ValueError("پروتکل %s پشتیبانی نمی‌شود" % scheme)
+
+
+def build(proto, host, port, secret, q, extra=None):
+    net, sec = q.get("type", "tcp"), (q.get("security") or "none")
+    sec = "none" if sec in ("", "0", "none") else ("tls" if sec == "1" else sec)
+    stream = {"network": net, "security": sec}
+    if net == "ws":
+        stream["wsSettings"] = {"path": urllib.parse.unquote(q.get("path", "/")),
+                                "headers": {"Host": q.get("host") or q.get("sni") or host}}
+    elif net == "xhttp":
+        stream["xhttpSettings"] = {"path": urllib.parse.unquote(q.get("path", "/")), "mode": q.get("mode", "auto")}
+        if q.get("host"):
+            stream["xhttpSettings"]["host"] = q["host"]
+    elif net == "grpc":
+        stream["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
+    elif net == "httpupgrade":
+        stream["httpupgradeSettings"] = {"path": urllib.parse.unquote(q.get("path", "/")),
+                                         "host": q.get("host") or host}
+    elif net == "tcp":
+        stream["tcpSettings"] = {"header": {"type": q.get("headerType", "none")}}
+    if sec == "tls":
+        stream["tlsSettings"] = {"serverName": q.get("sni") or q.get("host") or host,
+                                 "fingerprint": q.get("fp", "chrome"), "allowInsecure": q.get("allowInsecure") == "1"}
+        if q.get("alpn"):
+            stream["tlsSettings"]["alpn"] = urllib.parse.unquote(q["alpn"]).split(",")
+    elif sec == "reality":
+        if not q.get("pbk"):
+            raise ValueError("لینک reality بدون کلید عمومی (pbk) است")
+        stream["realitySettings"] = {"serverName": q.get("sni", ""), "publicKey": q["pbk"],
+                                     "shortId": q.get("sid", ""), "fingerprint": q.get("fp", "chrome"),
+                                     "spiderX": urllib.parse.unquote(q.get("spx", "/"))}
+    if proto == "vless":
+        settings = {"address": host, "port": port, "id": secret, "flow": q.get("flow", ""),
+                    "encryption": urllib.parse.unquote(q.get("encryption") or "none")}   # VLESS Encryption
+    elif proto == "vmess":
+        settings = {"address": host, "port": port, "id": secret, "security": "auto",
+                    "alterId": (extra or {}).get("aid", 0)}
+    else:
+        settings = {"address": host, "port": port, "password": secret}
+    return {"protocol": proto, "settings": settings, "streamSettings": stream}
+
+
+def probe_port(t):
+    used = {i.get("port") for i in t.get("inbounds", [])} | {i.get("port") for i in json.load(open(CFG)).get("inbounds", [])}
+    p = PROBE_BASE
+    while p in used:
+        p += 1
+    return p
+
+
+def test_config(t):
+    cfg = json.load(open(CFG))
+    for k in ("api", "outbounds", "routing", "dns"):
+        if k in t:
+            cfg[k] = t[k]
+    cfg["inbounds"] = [i for i in cfg.get("inbounds", []) if not (i.get("tag") or "").startswith("guard-")] + \
+                      [i for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")]
+    path = "/tmp/xui-path-candidate.json"
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+    r = subprocess.run([XRAY, "run", "-test", "-c", path], cwd=BIN, capture_output=True, text=True)
+    os.remove(path)
+    out = r.stdout + r.stderr
+    return "Configuration OK" in out, (out.strip().splitlines() or [""])[-1]
+
+
+def apply(t, note):
+    backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
+    os.makedirs(backup, exist_ok=True)
+    for f in (DB, CFG):
+        shutil.copy2(f, backup)
+    c = sqlite3.connect(DB)
+    c.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
+    c.commit()
+    c.close()
+    subprocess.run(["systemctl", "restart", "x-ui"], check=False)
+    time.sleep(7)
+    subprocess.run(["config-guard", "--save"], capture_output=True)   # this is the new normal
+    return backup
+
+
+def try_path(port, tries=3):
+    for _ in range(tries):
+        r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-m", "10", "--socks5-hostname",
+                            "127.0.0.1:%d" % port, "-w", "%{http_code} %{time_total}",
+                            "https://www.google.com/generate_204"], capture_output=True, text=True, timeout=14)
+        p = r.stdout.split()
+        if p and p[0] not in ("000", ""):
+            return {"ok": True, "code": p[0], "secs": float(p[1])}
+        time.sleep(2)
+    return {"ok": False, "code": "000", "secs": None}
+
+
+def write_conf(c):
+    with open(GUARD_CONF + ".tmp", "w") as f:
+        json.dump(c, f, indent=2)
+    os.replace(GUARD_CONF + ".tmp", GUARD_CONF)
+
+
+def listing():
+    t, c = template(), conf()
+    order = [c.get("primary")] + (c.get("backups") or [])
+    outs = {o.get("tag"): o for o in t.get("outbounds", [])}
+    probes = {i.get("tag"): i.get("port") for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")}
+    try:
+        on = json.load(open(GUARD_STATE)).get("on")
+    except Exception:
+        on = None
+    out = []
+    for i, name in enumerate([n for n in order if n]):
+        o, p = outs.get(name) or {}, (c.get("paths", {}).get(name) or {})
+        s = o.get("settings") or {}
+        out.append({"name": name, "role": "primary" if i == 0 else "backup %d" % i,
+                    "protocol": o.get("protocol", "—"),
+                    "address": "%s:%s" % (s.get("address", "?"), s.get("port", "?")) if s.get("address") else "—",
+                    "security": (o.get("streamSettings") or {}).get("security", "—"),
+                    "network": (o.get("streamSettings") or {}).get("network", "—"),
+                    "iface": p.get("iface") or "", "peer": p.get("peer") or "",
+                    "probe": probes.get("guard-" + name.lower()), "in_use": name == on,
+                    "removable": i > 0 and name != on})
+    return out
+
+
+def add(name, link, peer, as_json, iface="", addrs=()):
+    if not NAME_OK.match(name):
+        die("نام فقط حروف و عدد و - و _ (۲ تا ۲۴ کاراکتر)", as_json)
+    t, c = template(), conf()
+    if any(o.get("tag") == name for o in t.get("outbounds", [])):
+        die("اوت‌باندی به اسم %s از قبل هست" % name, as_json)
+    try:
+        ob = parse_link(link)
+    except ValueError as e:
+        die(str(e), as_json)
+    ob["tag"] = name
+    tag = "guard-" + name.lower()
+    port = probe_port(t)
+    t.setdefault("outbounds", []).append(ob)
+    t.setdefault("inbounds", []).append({"tag": tag, "listen": "127.0.0.1", "port": port, "protocol": "socks",
+                                         "settings": {"auth": "noauth", "udp": False}})
+    rules = t.setdefault("routing", {}).setdefault("rules", [])
+    last_guard = max([i for i, r in enumerate(rules) if (r.get("ruleTag") or "").startswith("guard-")] or [0])
+    rules.insert(last_guard + 1, {"type": "field", "inboundTag": [tag], "outboundTag": name, "ruleTag": tag})
+
+    ok, detail = test_config(t)
+    if not ok:
+        die("Xray این کانفیگ را رد کرد: " + detail, as_json)
+    backup = apply(t, "add " + name)
+    addr, entry = ob["settings"].get("address", ""), {}
+    if not peer and addr:
+        r = subprocess.run(["ip", "route", "get", addr], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.startswith("local "):
+            # a local proxy (sing-box and the like): pinging it measures nothing. If the address
+            # sits on a tun, the guard times the round trip through that tun instead.
+            a = subprocess.run(["ip", "-o", "addr", "show", "to", addr], capture_output=True, text=True)
+            dev = (a.stdout.split() + ["", ""])[1]
+            if dev and dev != "lo":
+                entry["tun"] = dev
+            addr = ""
+    entry["peer"] = peer or addr
+    if iface:
+        entry["iface"] = iface
+    c.setdefault("paths", {})[name] = entry
+    c.setdefault("backups", []).append(name)
+    write_conf(c)
+    res = try_path(port)
+    msg = ("مسیر %s اضافه شد و جواب داد (HTTP %s در %.2f ثانیه)" % (name, res["code"], res["secs"]) if res["ok"]
+           else "مسیر %s اضافه شد ولی از این سرور جواب نداد - تا وقتی سالم نشود نگهبان کاربران را به آن نمی‌برد" % name)
+    out = {"ok": True, "msg": msg, "name": name, "probe": port, "reachable": res["ok"], "backup": backup}
+    out.update(more_addresses(name, addrs))
+    if out.get("tunnels_msg"):
+        msg += "\n" + out["tunnels_msg"]
+    print(json.dumps(out, ensure_ascii=False) if as_json else msg)
+
+
+def more_addresses(name, addrs):
+    """Right after a path is added: try its outbound on every tunnel's far address (and on the
+    addresses typed with it), and list the ones that answer under the path, for xui-tunnel."""
+    if not shutil.which("xui-tunnel"):
+        return {}
+    cmd = ["xui-tunnel", "scan", name] + ([",".join(addrs)] if addrs else []) + ["--save", "--json"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        got = json.loads(r.stdout)
+    except ValueError:
+        return {}
+    for a in addrs:                          # typed by hand: kept even if not up yet
+        if a not in got.get("answered", []):
+            subprocess.run(["xui-tunnel", "add", name, a, "--json"], capture_output=True, timeout=60)
+    return {"tunnels": got.get("answered", []), "tunnels_msg": got.get("msg", "")}
+
+
+def remove(name, as_json):
+    t, c = template(), conf()
+    if name == c.get("primary"):
+        die("مسیر اصلی را نمی‌شود حذف کرد", as_json)
+    if name not in (c.get("backups") or []):
+        die("مسیری به اسم %s در نگهبان نیست" % name, as_json)
+    try:
+        if json.load(open(GUARD_STATE)).get("on") == name:
+            die("کاربرها همین حالا روی این مسیر هستند - اول برشان گردانید", as_json)
+    except OSError:
+        pass
+    tag = "guard-" + name.lower()
+    t["outbounds"] = [o for o in t.get("outbounds", []) if o.get("tag") not in (name, name + "-mux")]
+    t["inbounds"] = [i for i in t.get("inbounds", []) if i.get("tag") != tag]
+    t["routing"]["rules"] = [r for r in t["routing"]["rules"]
+                             if r.get("ruleTag") != tag and r.get("outboundTag") != name]
+    ok, detail = test_config(t)
+    if not ok:
+        die("Xray کانفیگ بدون این مسیر را رد کرد: " + detail, as_json)
+    backup = apply(t, "remove " + name)
+    c["backups"] = [b for b in c.get("backups", []) if b != name]
+    c.get("paths", {}).pop(name, None)
+    c.get("paths", {}).pop(name + "-mux", None)
+    (c.get("tunnels") or {}).pop(name, None)
+    write_conf(c)
+    msg = "مسیر %s حذف شد" % name
+    print(json.dumps({"ok": True, "msg": msg, "backup": backup}, ensure_ascii=False) if as_json else msg)
+
+
+def prune(as_json):
+    """Probe ports (and their rules and guard rows) left behind by an outbound that is gone.
+    An orphan probe port is worse than useless: with no rule it falls through to the first
+    outbound, so it "answers" and the page reports a path that does not exist."""
+    db = sqlite3.connect(DB)
+    t, c = template(db), conf()
+    outs = {o.get("tag", "").lower() for o in t.get("outbounds", [])}
+    dead = [i.get("tag") for i in t.get("inbounds", [])
+            if (i.get("tag") or "").startswith("guard-") and i["tag"][6:] not in outs]
+    ghost = [n for n in (c.get("paths") or {}) if n.lower() not in outs]
+    if not dead and not ghost:
+        msg = "چیز اضافه‌ای نیست"
+        return print(json.dumps({"ok": True, "msg": msg, "removed": []}, ensure_ascii=False) if as_json else msg)
+    t["inbounds"] = [i for i in t.get("inbounds", []) if i.get("tag") not in dead]
+    t["routing"]["rules"] = [r for r in t["routing"].get("rules", []) if r.get("ruleTag") not in dead
+                             and not set(r.get("inboundTag") or []) & set(dead)]
+    ok, detail = test_config(t)
+    if not ok:
+        die("Xray کانفیگ پاک‌شده را رد کرد: " + detail, as_json)
+    backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
+    os.makedirs(backup, exist_ok=True)
+    for f in (DB, CFG):
+        shutil.copy2(f, backup)
+    db.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
+    db.commit()
+    db.close()
+    live = json.load(open(CFG))                 # take them out of the running Xray too, no restart
+    api = next(("%s:%s" % (i.get("listen") or "127.0.0.1", i["port"]) for i in live.get("inbounds", [])
+                if i.get("tag") == (live.get("api") or {}).get("tag", "api")), "127.0.0.1:62789")
+    for tag in dead:
+        subprocess.run([XRAY, "api", "rmi", "--server=" + api, tag], capture_output=True)
+    live["inbounds"] = [i for i in live.get("inbounds", []) if i.get("tag") not in dead]
+    live["routing"]["rules"] = [r for r in live["routing"].get("rules", []) if r.get("ruleTag") not in dead]
+    with open(CFG + ".tmp", "w") as f:
+        json.dump(live, f, indent=2)
+    os.replace(CFG + ".tmp", CFG)
+    for n in ghost:
+        c["paths"].pop(n, None)
+    c["backups"] = [b for b in c.get("backups", []) if b.lower() in outs]
+    write_conf(c)
+    subprocess.run(["config-guard", "--save"], capture_output=True)
+    gone = dead + ["guard:" + n for n in ghost]
+    msg = "پاک شد: " + "، ".join(gone)
+    print(json.dumps({"ok": True, "msg": msg, "removed": gone, "backup": backup}, ensure_ascii=False)
+          if as_json else msg)
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    opt = {}
+    for flag in ("--peer", "--iface", "--addrs"):
+        if flag in args:
+            i = args.index(flag)
+            opt[flag] = args[i + 1] if len(args) > i + 1 else ""
+            del args[i:i + 2]
+    peer = opt.get("--peer", "")
+    mode = args[0] if args else "list"
+    if not XRAY:
+        die("xray در %s پیدا نشد" % BIN, as_json)
+    if mode == "list":
+        print(json.dumps(listing(), ensure_ascii=False) if as_json else
+              "\n".join("%-14s %-9s %-7s %-22s probe %s%s" % (p["name"], p["role"], p["protocol"], p["address"],
+                                                              p["probe"], "  <- users here" if p["in_use"] else "")
+                        for p in listing()))
+    elif mode == "add" and len(args) >= 3:
+        add(args[1], args[2], peer, as_json, opt.get("--iface", ""),
+            [a.strip() for a in opt.get("--addrs", "").split(",") if a.strip()])
+    elif mode == "remove" and len(args) >= 2:
+        remove(args[1], as_json)
+    elif mode == "prune":
+        prune(as_json)
+    else:
+        die(__doc__, as_json)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()

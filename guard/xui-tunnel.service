@@ -1,0 +1,8 @@
+[Unit]
+Description=Tunnel switch: keep each path on a tunnel that answers
+After=network-online.target x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-tunnel auto
+TimeoutStartSec=300
