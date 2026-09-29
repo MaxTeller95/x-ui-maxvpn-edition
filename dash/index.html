@@ -315,7 +315,8 @@
       <div class="card">
         <h2>ویژگی‌ها</h2>
         <div class="row">
-          <div>تقسیم ترافیک سبک / سنگین<div class="muted">صفحه‌ها و پیام‌رسان‌ها با Mux، دانلود و ویدیو بدون Mux</div></div>
+          <div>تقسیم ترافیک سبک / سنگین<div class="muted">صفحه‌ها و پیام‌رسان‌ها با Mux، دانلود و ویدیو بدون Mux</div>
+            <div id="split-state" class="sm" style="margin-top:4px"></div></div>
           <label class="switch"><input type="checkbox" id="split"><span></span></label>
         </div>
         <div class="row"><div>کش DNS روی هاب</div><span id="f-dns"></span></div>
@@ -564,6 +565,12 @@ function renderStatus(s) {
   $("#f-bk-list").innerHTML = bk.map((p) => `<span dir="ltr" style="color:var(--${p.ok === undefined ? "muted" : p.ok ? "ok" : "bad"})">${esc(p.name)}</span>`).join("، ");
   $("#f-tg").innerHTML = chip(s.features.tg_backup);
   if (!$("#ads").disabled) $("#ads").checked = !!s.features.ad_block;
+  const sc = s.features.split_check;
+  $("#split-state").innerHTML = !sc || !sc.on ? ""
+    : sc.problems && sc.problems.length
+      ? `<span class="chip bad">mux کار نمی‌کند</span> <span class="muted">${esc(sc.problems[0].msg)}</span>
+         <button data-fix="split-fix" style="margin-top:4px">تعمیر خودکار</button>`
+      : `<span class="chip ok">mux روی ${esc(sc.mux)} فعال</span>${(sc.notes || []).length ? ` <span class="muted">${esc(sc.notes[0])}</span>` : ""}`;
   const d = s.cert.days;
   $("#cert-days").innerHTML = d == null ? "—" : `<span style="color:var(--${d < 20 ? "bad" : d < 35 ? "warn" : "ok"})">${d} روز</span>`;
   $("#cert-note").textContent = d == null ? "" : (d < 20 ? "وقت تمدیده: رکورد TXT جدید لازمه." : "تا انقضا مونده. ۲۰ روز قبلش روی تلگرام هشدار می‌گیرید.");
@@ -929,11 +936,13 @@ document.addEventListener("click", async (e) => {
   if (f) {
     const cg = f.dataset.fix === "confguard-fix";
     if (!confirm(cg ? "قانون‌های گم‌شده برمی‌گردند و x-ui ری‌استارت می‌شود (چند ثانیه قطعی). ادامه؟"
+                    : f.dataset.fix === "split-fix" ? "اوت‌باند mux و قانون‌های تقسیم بررسی و تعمیر می‌شوند. اگر فقط اوت‌باند خراب باشد بدون ری‌استارت، وگرنه با ری‌استارت x-ui. قبلش بکاپ گرفته می‌شود. ادامه؟"
                     : "قبل از تعمیر بکاپ گرفته می‌شود. ادامه؟")) return;
     f.disabled = true; toast("در حال تعمیر...");
     const r = await post(f.dataset.fix);
-    toast(r.ok ? "تعمیر شد" : "خطا: " + (r.msg || ""));
-    if (cg) { loadCG(); loadStatus(); } else loadLint();
+    toast(r.ok ? (r.msg || "تعمیر شد") : "خطا: " + (r.msg || ""));
+    if (cg || f.dataset.fix === "split-fix") { loadCG(); loadStatus(); }
+    loadLint();
     return;
   }
   const a = e.target.closest("[data-act]");

@@ -185,6 +185,18 @@ def main():
     if not any_missing(m):
         if now["tags"] != base["tags"] or now["outbounds"] != base["outbounds"]:
             save_baseline(t)                          # new pieces are fine, absorb them
+        if fix and "split-light" in now["tags"] and shutil.which("xui-split"):
+            # the panel's own editor can save the mux copy without its mux block: the rule then
+            # still sends light traffic there, only without mux. Repaired live, never restarted.
+            r = subprocess.run(["xui-split", "fix", "--auto", "--json"], capture_output=True, text=True, timeout=90)
+            try:
+                got = json.loads(r.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                got = {}
+            if got.get("changed"):
+                log_event({"ts": int(time.time()), "missing": {"rules": [], "outbounds": [], "inbounds": [],
+                                                               "dns": False}, "fixed": True, "note": got.get("msg")})
+                say("🔧 config-guard: " + got.get("msg", "mux دوباره فعال شد"))
         if as_json:
             print(json.dumps(state, ensure_ascii=False))
         else:

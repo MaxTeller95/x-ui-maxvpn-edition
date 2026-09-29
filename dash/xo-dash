@@ -417,6 +417,16 @@ def outages(st, c):
     return out
 
 
+_split_cache = [0, None]
+
+
+def split_check():
+    """xui-split check, at most once a minute (it asks the running Xray too)."""
+    if time.time() - _split_cache[0] > 60:
+        _split_cache[:] = [time.time(), jrun("xui-split", "check", "--json", timeout=30)]
+    return _split_cache[1]
+
+
 def status():
     st = json.loads(read(GUARD_STATE, "{}") or "{}")
     c, cfg = conf(), xray_cfg()
@@ -434,6 +444,7 @@ def status():
         "outages": outages(st, c),
         "features": {
             "split": "split-light" in tags,
+            "split_check": split_check(),
             "dns_cache": any(o.get("protocol") == "dns" for o in cfg.get("outbounds", [])),
             "ad_block": any(r.get("domain") == ["geosite:category-ads-all"] for r in rules),
             "tg_backup": setting("tgBotBackup") == "true",
@@ -771,6 +782,10 @@ def lint():
         add("warn", "پورت probe بدون اوت‌باند",
             "اوت‌باند این‌ها حذف شده ولی پورتشان مانده و ترافیکش به اوت‌باند پیش‌فرض می‌رود: "
             + "، ".join(orphan_probes), "prune-probes")
+    sc = split_check() or {}
+    if sc.get("problems"):
+        add("bad" if any(p["code"] in ("mux-off", "mux-missing", "live-mux-off", "rule-order") for p in sc["problems"])
+            else "warn", "تقسیم ترافیک ناقص است", "؛ ".join(p["msg"] for p in sc["problems"][:3]), "split-fix")
     if not setting("remarkTemplate"):
         add("warn", "قالب نام کانفیگ‌ها",
             "remarkTemplate خالی است؛ پنل نام پیش‌فرض با ایمیل و حجم می‌سازد. مقدار {{INBOUND}} یعنی فقط نام اینباند.")
@@ -963,8 +978,15 @@ def action(name, body):
         rc, out = run("xui-optimizer", "--adblock", "on" if body.get("on") else "off", timeout=150)
         lines = [l for l in out.splitlines() if l.strip()]
         return {"ok": rc == 0, "msg": (lines[-2] if rc == 0 and len(lines) > 1 else lines[-1]) if lines else ""}
-    if name == "split":  # restarts x-ui: the page asks first
-        rc, out = run("xui-split", "apply" if body.get("on") else "remove", "--no-tg-backup", timeout=120)
+    if name == "split":  # may restart x-ui: the page asks first
+        _split_cache[0] = 0
+        if body.get("on"):   # already split: repair only what is wrong (live when it can); else build it
+            r = jrun_any("xui-split", "fix", "--json", "--no-tg-backup", timeout=180)
+            if r:
+                return r
+            rc, out = run("xui-split", "apply", "--no-tg-backup", timeout=150)
+            return {"ok": rc == 0, "msg": out.splitlines()[-1] if out else ""}
+        rc, out = run("xui-split", "remove", "--no-tg-backup", timeout=120)
         return {"ok": rc == 0, "msg": out.splitlines()[-1] if out else ""}
     if name == "log":
         src = body.get("source") or "tunnel-guard"
@@ -1025,6 +1047,9 @@ def action(name, body):
         got = str(body.get("name") or "").strip()
         r = jrun_any("xui-path", "remove", got, "--json", timeout=180)
         return r or {"ok": False, "msg": "حذف نشد"}
+    if name == "split-fix":
+        _split_cache[0] = 0
+        return jrun_any("xui-split", "fix", "--json", "--no-tg-backup", timeout=180) or {"ok": False, "msg": "انجام نشد"}
     if name == "prune-probes":                        # no restart: the API drops the ports
         r = jrun_any("xui-path", "prune", "--json", timeout=90)
         return r or {"ok": False, "msg": "انجام نشد"}

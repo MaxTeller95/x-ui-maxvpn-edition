@@ -119,6 +119,15 @@ xui-split apply           # also turns on the panel's daily Telegram backup
 xui-split remove
 ```
 
+`xui-split check` tells whether the split really works: `<MAIN>-mux` exists, has mux on,
+matches the main outbound (address, sing-box route, credentials), the split rules are in
+order, the probe port is there, and the running Xray has mux too. `xui-split fix` repairs
+what it found - through Xray's API with **no restart** when only the mux outbound is wrong,
+otherwise with a rebuild and a restart. The panel's own outbound editor can save the mux
+copy without its `mux` block; config-guard notices after every write of `config.json` and
+puts it back live. The page shows the real mux state under the split switch, with a
+repair button.
+
 It also prepares the guard: Xray's `RoutingService` (switch routes without a restart),
 a local-only socks probe port per proxy outbound (`guard-<outbound>`, 127.0.0.1:10808+,
 stable across re-runs), and rule tags `main-<outbound>` / `dns-upstream`.

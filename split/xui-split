@@ -4,6 +4,10 @@
     xui-split                       test only (default)
     xui-split apply                 backup, test, apply, restart x-ui
     xui-split remove                undo the split (keeps probe ports + RoutingService)
+    xui-split check [--json]        is the split really working? outbound, mux, rules, probe, live Xray
+    xui-split fix [--auto] [--json] repair what check found: through Xray's API when only the mux
+                                    outbound is wrong (no restart), else a full rebuild (restart);
+                                    --auto only does the no-restart repairs (config-guard runs it)
     options: --main OUTBOUND        outbound to split (default: the one most inbounds use)
              --no-tg-backup         leave the panel's Telegram backup setting alone
 
@@ -31,8 +35,12 @@ swcdn.apple.com updates.cdn-apple.com steamcontent.com steamserver.net
 githubusercontent.com dropboxusercontent.com mega.nz mega.co.nz mediafire.com
 docker.io docker.com speedtest.net ooklaserver.net hetzner.com""".split()]
 
+MUX = {"enabled": True, "concurrency": 4, "xudpConcurrency": 8, "xudpProxyUDP443": "skip"}
+SPLIT_RULES = ("split-udp", "split-heavy", "split-telegram")
+GUARD_STATE = "/var/lib/tunnel-guard/state.json"
+
 args = sys.argv[1:]
-mode = next((a for a in args if a in ("test", "apply", "remove")), "test")
+mode = next((a for a in args if a in ("test", "apply", "remove", "check", "fix")), "test")
 main_tag = args[args.index("--main") + 1] if "--main" in args else None
 tg_backup = "--no-tg-backup" not in args
 xray = (glob.glob(f"{BIN}/xray-linux-*") or [None])[0] or sys.exit(f"no xray in {BIN}")
@@ -92,7 +100,7 @@ def patch(t, remove=False):
         base = next(o for o in t["outbounds"] if o.get("tag") == main_tag)
         mux = json.loads(json.dumps(base))
         mux["tag"] = mux_tag
-        mux["mux"] = {"enabled": True, "concurrency": 4, "xudpConcurrency": 8, "xudpProxyUDP443": "skip"}
+        mux["mux"] = dict(MUX)
         t["outbounds"].insert(t["outbounds"].index(base) + 1, mux)
         # the mux outbound gets a probe port too: it can stall while the tunnel under it is fine
         mtag = f"guard-{mux_tag.lower()}"
@@ -114,9 +122,217 @@ def patch(t, remove=False):
     return t
 
 
+# ---------------------------------------------------------------- check / fix
+
+def _flow(o):
+    s = o.get("settings") or {}
+    users = [s] + [u for v in s.get("vnext") or [] for u in v.get("users") or []]
+    return next((u.get("flow") for u in users if u.get("flow")), "")
+
+
+def _same_path(a, b):
+    """The mux copy must be the main outbound with mux on: same server, credentials, transport
+    and route (sendThrough). Anything else means one of them was edited or moved alone."""
+    strip = lambda o: {k: v for k, v in o.items() if k not in ("tag", "mux")}
+    return strip(a) == strip(b)
+
+
+def live_outbound(tag):
+    """What the running Xray has for this outbound, as its API reports it (None if absent)."""
+    api = next(("%s:%s" % (i.get("listen") or "127.0.0.1", i["port"])
+                for i in json.load(open(f"{BIN}/config.json")).get("inbounds", []) if i.get("tag") == "api"),
+               "127.0.0.1:62789")
+    r = subprocess.run([xray, "api", "lso", "--server=" + api], capture_output=True, text=True, timeout=15)
+    try:
+        return next((o for o in json.loads(r.stdout).get("outbounds", []) if o.get("tag") == tag), None), api
+    except ValueError:
+        return None, api
+
+
+def check(t):
+    """Everything the split needs, from the template to the running Xray. Each problem says
+    whether it can be repaired without restarting x-ui."""
+    rules = t["routing"]["rules"]
+    by_tag = {r.get("ruleTag"): (i, r) for i, r in enumerate(rules) if r.get("ruleTag")}
+    main_rule = next(((i, r) for tag, (i, r) in by_tag.items() if tag.startswith("main-")), None)
+    out = {"on": "split-light" in by_tag, "main": None, "mux": None, "problems": [], "notes": []}
+    bad = lambda code, msg, hot=False: out["problems"].append({"code": code, "msg": msg, "hot": hot})
+    if not out["on"]:
+        return out
+    if not main_rule:
+        bad("no-main", "قانون اصلی (main-...) پیدا نشد؛ xui-split apply لازم است")
+        return out
+    main_tag = main_rule[1].get("outboundTag")
+    mux_tag = f"{main_tag}-mux"
+    out["main"], out["mux"] = main_tag, mux_tag
+    outs = {o.get("tag"): o for o in t["outbounds"]}
+    base, mux = outs.get(main_tag), outs.get(mux_tag)
+    if not base:
+        bad("no-base", f"اوت‌باند اصلی {main_tag} در پنل نیست")
+        return out
+    if _flow(base):
+        bad("flow", f"{main_tag} با flow «{_flow(base)}» است و Xray روی آن mux را قبول نمی‌کند؛ "
+                    "تقسیم ترافیک را خاموش کنید یا flow را بردارید")
+        return out
+    if not mux:
+        bad("mux-missing", f"اوت‌باند {mux_tag} در پنل نیست ولی قانون split-light به آن می‌رود", hot=True)
+    else:
+        if not (mux.get("mux") or {}).get("enabled"):
+            bad("mux-off", f"{mux_tag} هست ولی mux رویش خاموش است؛ ترافیک سبک بدون mux می‌رود", hot=True)
+        if not _same_path(base, mux):
+            bad("mux-drift", f"{mux_tag} با {main_tag} یکی نیست (آدرس، مسیر یا مشخصات جدا عوض شده)", hot=True)
+    light = by_tag.get("split-light")
+    if light and light[1].get("outboundTag") != mux_tag:
+        bad("light-target", f"split-light به {light[1].get('outboundTag')} می‌رود، نه {mux_tag}")
+    for tag in SPLIT_RULES:
+        if tag not in by_tag:
+            bad("rule-missing", f"قانون {tag} نیست؛ ترافیک سنگین هم روی mux می‌افتد")
+        elif by_tag[tag][1].get("outboundTag") != main_tag:
+            bad("rule-target", f"{tag} باید به {main_tag} برود")
+        elif light and by_tag[tag][0] > light[0]:
+            bad("rule-order", f"{tag} بعد از split-light است، پس هیچ‌وقت اعمال نمی‌شود")
+    if light and light[0] > main_rule[0]:
+        bad("rule-order", "split-light بعد از قانون اصلی است، پس هیچ‌وقت اعمال نمی‌شود")
+    probe = f"guard-{mux_tag.lower()}"
+    if not any(i.get("tag") == probe for i in t.get("inbounds", [])):
+        bad("probe-missing", f"پورت probe {probe} نیست؛ نگهبان نمی‌تواند گیر کردن mux را ببیند")
+    # the running Xray: the template can be right while x-ui still runs an older copy
+    if mux and (mux.get("mux") or {}).get("enabled"):
+        lo, _ = live_outbound(mux_tag)
+        if lo is None:
+            bad("live-missing", f"Xray در حال اجرا اوت‌باند {mux_tag} را ندارد", hot=True)
+        elif "multiplexSettings" not in json.dumps(lo):
+            bad("live-mux-off", f"Xray در حال اجرا {mux_tag} را بدون mux اجرا می‌کند", hot=True)
+    try:
+        if json.load(open(GUARD_STATE)).get("light") == "direct":
+            out["notes"].append("نگهبان تانل ترافیک سبک را موقتاً از mux برداشته (mux گیر کرده بود)؛ "
+                                "وقتی سالم شود خودش برمی‌گرداند")
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def hot_replace(tpl, mux_tag):
+    """Only the mux outbound changes: write it to the panel and swap it in the running Xray."""
+    ob = next(o for o in tpl["outbounds"] if o.get("tag") == mux_tag)
+    cfg = json.load(open(f"{BIN}/config.json"))
+    outs = cfg.get("outbounds", [])
+    idx = next((i for i, o in enumerate(outs) if o.get("tag") == mux_tag), None)
+    if idx is None:
+        base = next((i for i, o in enumerate(outs) if o.get("tag") == mux_tag[:-4]), len(outs) - 1)
+        outs.insert(base + 1, ob)
+    else:
+        outs[idx] = ob
+    with open(f"{BIN}/config.json.tmp", "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(f"{BIN}/config.json.tmp", f"{BIN}/config.json")
+    _, api = live_outbound(mux_tag)
+    path = "/tmp/xui-split-mux.json"
+    with open(path, "w") as f:
+        json.dump({"outbounds": [ob]}, f)
+    subprocess.run([xray, "api", "rmo", "--server=" + api, mux_tag], capture_output=True)
+    r = subprocess.run([xray, "api", "ado", "--server=" + api, path], capture_output=True, text=True)
+    os.remove(path)
+    return r.returncode == 0
+
+
+def fix(auto=False, as_json=False):
+    global main_tag
+    db = sqlite3.connect(DB)
+    tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    before = check(tpl)
+    say = lambda d: (print(json.dumps(d, ensure_ascii=False) if as_json else d["msg"]), True)[1]
+    if not before["on"]:
+        if auto:
+            return say({"ok": True, "msg": "تقسیم ترافیک خاموش است", "changed": False})
+        return None                                     # not split yet: the caller runs a full apply
+    if not before["problems"]:
+        return say({"ok": True, "msg": "تقسیم ترافیک سالم است؛ mux روی %s فعال" % before["mux"],
+                    "changed": False, "check": before})
+    if any(p["code"] in ("flow", "no-base", "no-main") for p in before["problems"]):
+        return say({"ok": False, "msg": before["problems"][0]["msg"], "changed": False, "check": before})
+    hot_only = all(p["hot"] for p in before["problems"])
+    if auto and not hot_only:
+        return say({"ok": False, "changed": False, "check": before,
+                    "msg": "تقسیم ترافیک ناقص است و تعمیرش ری‌استارت می‌خواهد: " + before["problems"][0]["msg"]})
+    main_tag = before["main"]
+    if hot_only:
+        # only the mux copy is wrong: rebuild it from the main outbound, touch nothing else
+        new = json.loads(json.dumps(tpl))
+        base = next(o for o in new["outbounds"] if o.get("tag") == main_tag)
+        mux = json.loads(json.dumps(base))
+        mux["tag"], mux["mux"] = before["mux"], dict(MUX)
+        new["outbounds"] = [o for o in new["outbounds"] if o.get("tag") != before["mux"]]
+        new["outbounds"].insert(new["outbounds"].index(base) + 1, mux)
+    else:
+        new = patch(json.loads(json.dumps(tpl)))        # rules or probe port wrong: the build apply does
+    ok, detail = test_candidate(new)
+    if not ok:
+        return say({"ok": False, "msg": "Xray کانفیگ تعمیرشده را رد کرد: " + detail, "changed": False})
+    backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    os.makedirs(backup)
+    db.close()
+    for f in (DB, f"{BIN}/config.json"):
+        shutil.copy2(f, backup)
+    db = sqlite3.connect(DB)
+    db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(new, indent=2),))
+    db.commit()
+    db.close()
+    how = "بدون ری‌استارت (از راه API)"
+    if not (hot_only and hot_replace(new, before["mux"])):
+        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+        time.sleep(6)
+        how = "با ری‌استارت x-ui"
+    if shutil.which("config-guard"):
+        subprocess.run(["config-guard", "--save"], capture_output=True)
+    after = check(new)
+    fixed = [p["msg"] for p in before["problems"]]
+    return say({"ok": not after["problems"], "changed": True, "backup": backup, "check": after,
+         "msg": ("تقسیم ترافیک تعمیر شد %s: %s" % (how, "؛ ".join(fixed))) if not after["problems"]
+                else "بعد از تعمیر هنوز: " + after["problems"][0]["msg"]})
+
+
+def test_candidate(tpl):
+    cfg = json.load(open(f"{BIN}/config.json"))
+    for k in ("api", "outbounds", "routing"):
+        cfg[k] = tpl[k]
+    cfg["inbounds"] = [i for i in cfg["inbounds"] if not i.get("tag", "").startswith("guard-")] + \
+                      [i for i in tpl["inbounds"] if i.get("tag", "").startswith("guard-")]
+    path = "/tmp/xui-split-candidate.json"
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+    out = subprocess.run([xray, "run", "-test", "-c", path], cwd=BIN, capture_output=True, text=True)
+    os.remove(path)
+    text = out.stdout + out.stderr
+    return "Configuration OK" in text, (text.strip().splitlines() or [""])[-1]
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("run this as root")
+    as_json = "--json" in args
+    if mode == "check":
+        tpl = json.loads(sqlite3.connect(DB).execute(
+            "select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+        c = check(tpl)
+        if as_json:
+            return print(json.dumps(c, ensure_ascii=False))
+        if not c["on"]:
+            return print("split: off")
+        print("split: %s -> light over %s" % (c["main"], c["mux"]))
+        for p in c["problems"]:
+            print("  PROBLEM%s: %s" % (" (fixable live)" if p["hot"] else "", p["msg"]))
+        for n in c["notes"]:
+            print("  note:", n)
+        if not c["problems"]:
+            print("  ok - mux on, rules in order, probe port there, live Xray has mux")
+        return
+    if mode == "fix":
+        if fix(auto="--auto" in args, as_json=as_json) is None:     # never applied: build it
+            globals()["mode"] = "apply"
+        else:
+            return
     db = sqlite3.connect(DB)
     tpl = patch(json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0]),
                 remove=(mode == "remove"))
