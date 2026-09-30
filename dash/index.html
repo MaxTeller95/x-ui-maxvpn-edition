@@ -242,6 +242,14 @@
         <table id="u-share"><tbody></tbody></table>
         <div class="muted">تعداد آدرس‌هایی که همین حالا با یک کانفیگ وصل‌اند. برای محدود کردن، limit IP کاربر را در پنل تنظیم کنید.</div>
       </div>
+      <div class="card wide">
+        <h2>سرعت واقعی کاربران به تفکیک اینباند <span class="muted">۲۴ ساعت اخیر</span></h2>
+        <div id="speeds" class="muted">...</div>
+        <div class="muted sm" style="margin-top:6px">برای هر کاربر، سریع‌ترین آپلود و دانلودی که واقعاً داشته (میانگین ۵ ثانیه‌ای، از
+          آمار خود Xray) در نظر گرفته می‌شود و بعد بین کاربران هر اینباند میانه (p50) و ۹۰٪ (p90) گرفته می‌شود. لحظه‌هایی
+          که کاربر کمتر از ۲۵۶ کیلوبایت جابجا کرده حساب نمی‌شوند. چون هر کاربر از شبکه‌ی خودش وصل است، اختلاف پایدار بین
+          دو اینباند نشان می‌دهد نوع اتصال (مثلاً WebSocket روی ۸۰ در برابر TLS روی ۴۴۳) روی سرعت اثر دارد.</div>
+      </div>
       <div class="card">
         <h2>خاموش‌ها <span class="muted" id="u-idle-note">بیش از ۳۰ روز بی‌استفاده</span>
           <button id="u-idle-all" hidden>حذف همه</button></h2>
@@ -750,6 +758,21 @@ function renderCheckup(c) {
 /* ---------- loading ---------- */
 async function loadLive() { const v = await get("live"); if (v) renderLive(v); }
 async function loadStatus() { const s = await get("status"); if (s) { S = s; renderStatus(s); } }
+function renderSpeeds(s) {
+  const el = $("#speeds");
+  if (!s || !s.rows || !s.rows.length) { el.textContent = "هنوز داده‌ای جمع نشده؛ چند دقیقه بعد دوباره نگاه کنید."; return; }
+  el.classList.remove("muted");
+  const mb = (v) => v ? (v / 1e6).toFixed(v < 1e7 ? 1 : 0) : "—";
+  const col = (x) => x && x.n ? `<b>${mb(x.p50)}</b> <span class="muted">/ ${mb(x.p90)} / ${mb(x.max)}</span>` : '<span class="muted">—</span>';
+  el.innerHTML = `<div style="overflow-x:auto"><table><tbody>
+    <tr><th>اینباند</th><th class="n">آپلود Mb/s<div class="muted sm">میانه / ۹۰٪ / بیشینه</div></th>
+      <th class="n">دانلود Mb/s<div class="muted sm">میانه / ۹۰٪ / بیشینه</div></th><th class="n">کاربر سنجیده‌شده</th></tr>
+    ${s.rows.map((r) => `<tr><td><b>${esc(r.remark)}</b><div class="muted sm" dir="ltr">${r.port ? r.port + " · " : ""}${esc([r.protocol, r.network, r.security].filter(Boolean).join("/"))}</div></td>
+      <td class="n">${col(r.up)}</td><td class="n">${col(r.down)}</td>
+      <td class="n">${r.up.n || 0} ↑ · ${r.down.n || 0} ↓ <span class="muted">از ${r.users}</span></td></tr>`).join("")}
+  </tbody></table></div>`;
+}
+async function loadSpeeds() { const s = await get("speeds"); renderSpeeds(s); }
 async function loadUsers() { const u = await get("users"); if (u) { U = u; renderUsers(u); } }
 async function loadLint() { const l = await get("lint"); if (l) { L = l; renderLint(l); } }
 async function loadCG() { const g = await get("confguard"); if (g) renderCG(g); }
@@ -909,6 +932,7 @@ document.querySelectorAll("nav.tabs button").forEach((b) => {
     document.querySelectorAll("nav.tabs button").forEach((x) => x.classList.toggle("on", x === b));
     document.querySelectorAll("[data-panel]").forEach((p) => p.classList.toggle("on", p.dataset.panel === TAB));
     if (TAB === "users" && !U) loadUsers();
+    if (TAB === "users") loadSpeeds();
     if (TAB === "health" && !L) { loadLint(); loadCG(); }
     if (TAB === "health") loadReach();
     if (TAB === "tools") { loadUnits(); loadPaths(); loadTunnels(); }

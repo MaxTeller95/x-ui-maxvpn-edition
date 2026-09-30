@@ -195,20 +195,25 @@ class Metrics(threading.Thread):
         self.lock = threading.Lock()
         self.fine = collections.deque(maxlen=self.FINE)   # {"t", "o"/"i": {tag: [up, down]}, "u": {email: bytes}}
         self.minutes = collections.deque(self._load(), maxlen=self.DAY)
+        self.peaks = self._load("peaks") or {}   # {hour: {email: [max up bps, max down bps]}}
         self.prev, self.cur, self.online, self.saved, self.n = {}, None, [], 0.0, 0
+        self.last_t = None
 
-    def _load(self):
+    def _load(self, key="minutes"):
         try:
             cut = time.time() - 86400
-            return [m for m in json.loads(read(HIST, "{}") or "{}").get("minutes", []) if m.get("t", 0) > cut]
+            got = json.loads(read(HIST, "{}") or "{}").get(key)
+            if key == "peaks":
+                return {h: v for h, v in (got or {}).items() if int(h) > cut}
+            return [m for m in got or [] if m.get("t", 0) > cut]
         except Exception:
-            return []
+            return {} if key == "peaks" else []
 
     def _save(self):
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
             with open(HIST + ".tmp", "w") as f:
-                json.dump({"minutes": list(self.minutes)}, f, separators=(",", ":"))
+                json.dump({"minutes": list(self.minutes), "peaks": self.peaks}, f, separators=(",", ":"))
             os.replace(HIST + ".tmp", HIST)
         except OSError:
             pass
@@ -216,7 +221,7 @@ class Metrics(threading.Thread):
     def sample(self):
         stats = xapi("statsquery", timeout=8) or {}
         now = time.time()
-        o, i, u = {}, {}, {}
+        o, i, u, ud = {}, {}, {}, {}
         for s in stats.get("stat", []):
             parts = (s.get("name", "").split(">>>") + ["", "", "", ""])[:4]
             kind, name, dirn = parts[0], parts[1], parts[3]
@@ -234,6 +239,7 @@ class Metrics(threading.Thread):
                 i.setdefault(name, [0, 0])[slot] += d
             elif kind == "user":
                 u[name] = u.get(name, 0) + d
+                ud.setdefault(name, [0, 0])[slot] += d      # Xray's uplink is what the user sends
         online = self.online
         self.n += 1
         if self.n % 3 == 1:  # who is online changes slowly; every third sample is enough
@@ -243,6 +249,39 @@ class Metrics(threading.Thread):
             self.online = online
             self.fine.append({"t": now, "o": o, "i": i, "u": u})
             self._roll(now, o, i, len(online))
+            self._peak(now, ud)
+
+    PEAK_MIN = 256 * 1024          # bytes in one sample before it counts as "really transferring"
+
+    def _peak(self, now, ud):
+        """Per user and hour, the fastest sample in each direction. A sample only counts when
+        the user moved at least PEAK_MIN bytes that way, so idle users do not pull the numbers
+        down; a 5-second average still undersells a burst, the same way for every inbound."""
+        dt, self.last_t = (now - self.last_t) if self.last_t else self.STEP, now
+        if not 2 <= dt <= 30:
+            return
+        hour = str(int(now // 3600) * 3600)
+        bucket = self.peaks.setdefault(hour, {})
+        for email, (up, dn) in ud.items():
+            cur = bucket.setdefault(email, [0, 0])
+            if up >= self.PEAK_MIN:
+                cur[0] = max(cur[0], int(up * 8 / dt))
+            if dn >= self.PEAK_MIN:
+                cur[1] = max(cur[1], int(dn * 8 / dt))
+        cut = now - 86400
+        for h in [h for h in self.peaks if int(h) <= cut]:
+            self.peaks.pop(h)
+
+    def peak_by_user(self, hours=24):
+        cut = time.time() - hours * 3600
+        with self.lock:
+            out = {}
+            for h, b in self.peaks.items():
+                if int(h) > cut:
+                    for email, (up, dn) in b.items():
+                        cur = out.setdefault(email, [0, 0])
+                        cur[0], cur[1] = max(cur[0], up), max(cur[1], dn)
+            return out
 
     def _roll(self, now, o, i, online):
         m = int(now // 60) * 60
@@ -452,6 +491,47 @@ def quic_share(lines=20000):
             quic += 1
             refused += m.group(1) in ("blocked", "block", "blackhole")
     return {"total": total, "quic": quic, "refused": refused, "pct": round(100.0 * quic / total, 1) if total else 0}
+
+
+def speed_by_inbound(hours=24):
+    """The fastest real transfer each user reached (5-second average), grouped by the inbound
+    they connect through - so two transports (say WebSocket on 80 and TLS on 443) can be
+    compared on the same users' own networks. Users on several inbounds are kept apart."""
+    peaks = METRICS.peak_by_user(hours)
+    with db() as c:
+        where = collections.defaultdict(set)
+        for email, tag in c.execute("select cl.email, i.tag from client_inbounds ci join clients cl on cl.id = ci.client_id "
+                                    "join inbounds i on i.id = ci.inbound_id"):
+            where[email].add(tag)
+        meta = {r["tag"]: dict(r) for r in c.execute("select tag, remark, port, protocol, stream_settings from inbounds")}
+    groups = collections.defaultdict(lambda: {"up": [], "down": []})
+    for email, (up, dn) in peaks.items():
+        tags = where.get(email) or set()
+        key = next(iter(tags)) if len(tags) == 1 else "*multi"
+        if up:
+            groups[key]["up"].append(up)
+        if dn:
+            groups[key]["down"].append(dn)
+
+    def spread(v):
+        v = sorted(v)
+        pick = lambda q: v[min(len(v) - 1, int(q * len(v)))]
+        return {"n": len(v), "p50": pick(0.5), "p90": pick(0.9), "max": v[-1]} if v else {"n": 0}
+
+    rows = []
+    for key, g in groups.items():
+        m = meta.get(key) or {}
+        try:
+            ss = json.loads(m.get("stream_settings") or "{}")
+        except ValueError:
+            ss = {}
+        rows.append({"inbound": key, "remark": m.get("remark") or ("چند اینباند" if key == "*multi" else key),
+                     "port": m.get("port"), "protocol": m.get("protocol", ""),
+                     "network": ss.get("network", ""), "security": ss.get("security", "none"),
+                     "users": len([e for e, t in where.items() if key in t or (key == "*multi" and len(t) > 1)]),
+                     "up": spread(g["up"]), "down": spread(g["down"])})
+    rows.sort(key=lambda r: -r["up"].get("n", 0))
+    return {"hours": hours, "rows": rows, "sample_secs": Metrics.STEP}
 
 
 def reach_view():
@@ -1244,7 +1324,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "xo-dash"
     GETS = {"api/status": status, "api/live": lambda: METRICS.snapshot(), "api/users": users_view,
             "api/lint": lint, "api/confguard": confguard, "api/units": units, "api/paths": paths_view,
-            "api/tunnels": tunnels_view, "api/reach": reach_view}
+            "api/tunnels": tunnels_view, "api/reach": reach_view, "api/speeds": speed_by_inbound}
 
     def log_message(self, *a):
         pass
