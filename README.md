@@ -9,8 +9,26 @@
 هر ابزار:
 - مستقیم دیتابیس خود پنل را ویرایش می‌کند، پس پنل تغییرات را نگه می‌دارد و در **Xray Configs** نشانشان می‌دهد؛
 - کانفیگ جدید را **قبل از** هر تغییری با `xray run -test` می‌سنجد؛
-- از `x-ui.db` و `config.json` در `/root/xui-backup-<زمان>/` بکاپ می‌گیرد؛
+- از دیتابیس پنل (`x-ui.db`، یا برای PostgreSQL یک `x-ui.pgdump`) و `config.json` در `/root/xui-backup-<زمان>/` بکاپ می‌گیرد؛
 - با اجرای دوباره، قانون‌های خودش را جایگزین می‌کند، نه اینکه دوباره اضافه کند.
+
+## دیتابیس پنل: SQLite یا PostgreSQL
+
+3x-ui نسخه‌ی 3 می‌تواند اطلاعاتش را به‌جای `/etc/x-ui/x-ui.db` در PostgreSQL نگه دارد (`XUI_DB_TYPE=postgres` و
+`XUI_DB_DSN` در `/etc/default/x-ui`). همه‌ی ابزارها از یک ماژول مشترک (`lib/xuidb.py`) استفاده می‌کنند که دیتابیس را
+همان‌طور که خود x-ui می‌بیند پیدا می‌کند: محیط پروسه‌ی x-ui در حال اجرا، بعد تنظیمات سرویس، بعد SQLite پیش‌فرض.
+
+- برای PostgreSQL از `psql` و `pg_dump` استفاده می‌شود (نصب‌کننده اگر نباشند نصبشان می‌کند) و رمز روی خط فرمان نمی‌آید.
+- تغییرها مثل SQLite همه با هم و در یک تراکنش نوشته می‌شوند.
+- بکاپ‌ها برای PostgreSQL یک `pg_dump` کامل‌اند و برگرداندن هم از صفحه‌ی Optimizer و هم با این دستور است:
+
+```bash
+xui-db detect                                  # کدام دیتابیس پیدا شده
+xui-db backup /root/my-backup                  # بکاپ دستی
+xui-db restore /root/xui-backup-<زمان>/x-ui.pgdump   # برگرداندن (x-ui را متوقف و دوباره روشن می‌کند)
+```
+
+ابزارهای ارتقای 2.x به 3.x (`migrate/upgrade-2x-to-3x.sh`) فقط SQLite هستند، چون پنل 2.x PostgreSQL ندارد.
 
 ## فهرست ابزارها
 
@@ -402,6 +420,7 @@ sudo bash install.sh --dash <پورت پنل> --move    # نهایی: x-ui به 
 |---|---|
 | `/opt/xui-optimizer` | سورس (همین ریپو) |
 | `/usr/local/sbin/*` | ابزارها |
+| `/usr/local/lib/xui-optimizer/xuidb.py` | ماژول مشترک دیتابیس (SQLite / PostgreSQL)؛ `xui-db` به آن لینک است |
 | `/etc/tunnel-guard.json` | مسیرها، پشتیبان‌ها، تانل‌ها و تنظیم نگهبان |
 | `/var/lib/tunnel-guard/` | وضعیت نگهبان و تانل‌ها |
 | `/var/lib/config-guard/` | مبنا و رویدادهای نگهبان پیکربندی |

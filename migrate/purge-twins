@@ -10,12 +10,14 @@ client on several inbounds with one quota, one expiry and one usage counter.
     xui-purge-twins apply      back up, clean both places, restart x-ui
 """
 import json, os, shutil, sqlite3, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB = "/etc/x-ui/x-ui.db"
 MARK = "twin-of:"
 SUFFIX = ("-443", "-80", "-tls", "-ws", "-2087", "-2053")
 apply = sys.argv[1:] == ["apply"]
-db = sqlite3.connect(DB)
+db = xuidb.connect()
 tags = dict(db.execute("select id, tag from inbounds"))
 
 
@@ -58,7 +60,7 @@ if not apply:
 
 backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
 os.makedirs(backup)
-shutil.copy2(DB, backup)
+xuidb.backup_to(backup)
 now = int(time.time() * 1000)
 db.execute("begin immediate")
 for p in plan:
@@ -93,4 +95,4 @@ print(f"clients: {db.execute('select count(*) from clients').fetchone()[0]}"
       f" | traffic rows: {db.execute('select count(*) from client_traffics').fetchone()[0]}"
       f" | on several inbounds: {db.execute('select count(*) from (select client_id from client_inbounds group by client_id having count(*)>1)').fetchone()[0]}")
 print(f"twins left: clients={left} legacy={legacy_left} live={live_twins}")
-print(f"  undo: cp {backup}/x-ui.db {DB} && x-ui restart")
+print(f"  undo: {xuidb.undo_hint(backup)}")

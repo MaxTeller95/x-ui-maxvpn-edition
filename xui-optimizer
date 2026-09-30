@@ -26,6 +26,8 @@ Inbounds routed to `direct` (or anything that is not a proxy) are left alone.
 Safe to re-run: earlier changes are replaced, not duplicated.
 """
 import argparse, collections, glob, json, os, shutil, sqlite3, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB = "/etc/x-ui/x-ui.db"
 BIN = "/usr/local/x-ui/bin"
@@ -135,12 +137,24 @@ TOGGLES = {
 }
 
 
+def backup_db(db_path, folder):
+    """--db names a SQLite file; without it, the panel's own database, whichever kind it is."""
+    if db_path:
+        shutil.copy2(db_path, folder)
+    else:
+        xuidb.backup_to(folder)
+
+
+def undo(db_path, folder):
+    return f"cp {folder}/x-ui.db {db_path} && x-ui restart" if db_path else xuidb.undo_hint(folder)
+
+
 def toggle(key, db_path, on, restart=True, dry=False):
     """Add or remove one of TOGGLES and nothing else. A full run would rebuild the DNS rules
     too, under this tool's own tags, and a hub whose guard and config-guard know those rules by
     other names (dns-upstream, ...) must not have them renamed."""
     spec = TOGGLES[key]
-    db = sqlite3.connect(db_path)
+    db = xuidb.connect(db_path)
     tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
     rules = tpl["routing"]["rules"]
     had = any(spec["match"](r) for r in rules)
@@ -171,9 +185,9 @@ def toggle(key, db_path, on, restart=True, dry=False):
     backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
     os.makedirs(backup)
     db.close()
-    shutil.copy2(db_path, backup)
+    backup_db(db_path, backup)
     shutil.copy2(f"{BIN}/config.json", backup)
-    db = sqlite3.connect(db_path)
+    db = xuidb.connect(db_path)
     db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
     for tag in sniff:
         db.execute("update inbounds set sniffing=? where tag=?", (json.dumps(SNIFF, indent=2), tag))
@@ -214,7 +228,7 @@ def xray_test(cfg):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--db", default=DB)
+    ap.add_argument("--db", default=None, help="a SQLite file (default: the panel's own database)")
     ap.add_argument("--dns-via", metavar="OUTBOUND",
                     help="outbound that DoH lookups leave through (default: the busiest one)")
     ap.add_argument("--no-adblock", action="store_true")
@@ -228,15 +242,15 @@ def main():
 
     if os.geteuid() != 0:
         die("run this as root")
-    if not os.path.exists(a.db):
-        die(f"{a.db} not found - is x-ui installed?")
+    if (a.db and not os.path.exists(a.db)) or (not a.db and not xuidb.exists()):
+        die(f"{a.db or xuidb.describe()} not found - is x-ui installed?")
 
     if a.adblock:
         return adblock_only(a.db, a.adblock == "on", not a.no_restart, a.dry_run)
     if a.quic:
         return toggle("quic", a.db, a.quic == "block", not a.no_restart, a.dry_run)
 
-    db = sqlite3.connect(a.db)
+    db = xuidb.connect(a.db)
     row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
     if not row:
         die("x-ui has no xrayTemplateConfig setting")
@@ -279,9 +293,9 @@ def main():
     backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
     os.makedirs(backup)
     db.close()
-    shutil.copy2(a.db, backup)
+    backup_db(a.db, backup)
     shutil.copy2(f"{BIN}/config.json", backup)
-    db = sqlite3.connect(a.db)
+    db = xuidb.connect(a.db)
 
     db.execute("update settings set value=? where key='xrayTemplateConfig'",
                (json.dumps(tpl, indent=2),))
@@ -290,7 +304,7 @@ def main():
     db.commit()
     db.close()
     print(f"applied; backup in {backup}")
-    print(f"  undo: cp {backup}/x-ui.db {a.db} && x-ui restart")
+    print(f"  undo: {undo(a.db, backup)}")
     accept_in_config_guard()
 
     if not a.no_restart:
@@ -300,7 +314,7 @@ def main():
                                capture_output=True, text=True).stdout.strip()
         print(f"x-ui: {state}")
         if state != "active":
-            die(f"x-ui did not come back - restore the backup: cp {backup}/x-ui.db {a.db} && x-ui restart")
+            die(f"x-ui did not come back - restore the backup: {undo(a.db, backup)}")
 
 
 if __name__ == "__main__":

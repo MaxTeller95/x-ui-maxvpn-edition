@@ -6,8 +6,9 @@
 set -euo pipefail
 PUBLIC_PORT=${1:?public port}; MODE=${2:-side}
 HERE=$(cd "$(dirname "$0")" && pwd)
-DB=/etc/x-ui/x-ui.db
-get() { python3 -c "import sqlite3,sys;r=sqlite3.connect('$DB').execute('select value from settings where key=?',(sys.argv[1],)).fetchone();print(r[0] if r else '')" "$1"; }
+# the panel's database, SQLite or PostgreSQL, through the shared module install.sh puts in place
+PYDB="import sys; sys.path[:0] = ['$HERE/../lib', '/usr/local/lib/xui-optimizer']; import xuidb"
+get() { python3 -c "$PYDB; r = xuidb.connect().execute('select value from settings where key=?', (sys.argv[1],)).fetchone(); print(r[0] if r else '')" "$1"; }
 BASE=$(get webBasePath); PANEL_PORT=$(get webPort); CERT=$(get webCertFile); KEY=$(get webKeyFile)
 PUB_IP=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
 [ -n "$BASE" ] && [ -n "$PANEL_PORT" ] && [ -f "$CERT" ] || { echo "panel settings incomplete" >&2; exit 1; }
@@ -53,7 +54,7 @@ server {
 }
 CONF
 if [ "$MODE" = move ]; then
-  python3 -c "import sqlite3;c=sqlite3.connect('$DB');c.execute(\"update settings set value='127.0.0.1' where key='webListen'\");c.commit()"
+  python3 -c "$PYDB; c = xuidb.connect(); c.execute(\"update settings set value='127.0.0.1' where key='webListen'\"); c.commit()"
   systemctl restart x-ui; sleep 5
 fi
 nginx -t && systemctl reload nginx

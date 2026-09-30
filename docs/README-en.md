@@ -28,8 +28,21 @@ The numbers below were measured on a production hub with about 140 users and two
 
 All of them edit the panel's own database (so the panel keeps the changes and shows
 them under **Xray Configs**), test the new config with `xray run -test` **before**
-touching anything, back up `x-ui.db` + `config.json` to `/root/xui-backup-<time>/`,
-and replace their own rules on a re-run instead of adding more.
+touching anything, back up the panel's database (`x-ui.db`, or `x-ui.pgdump` on PostgreSQL)
++ `config.json` to `/root/xui-backup-<time>/`, and replace their own rules on a re-run instead
+of adding more.
+
+### SQLite or PostgreSQL
+
+3x-ui 3.x can keep its data in PostgreSQL instead of `/etc/x-ui/x-ui.db` (`XUI_DB_TYPE=postgres`,
+`XUI_DB_DSN` in `/etc/default/x-ui`). Every tool goes through one module, `lib/xuidb.py`
+(installed in `/usr/local/lib/xui-optimizer`, linked as `xui-db`), which finds the database the way
+x-ui does: the running x-ui process's environment, then the service's settings, then the SQLite
+default. PostgreSQL is reached with `psql` (the installer adds `postgresql-client`), credentials go
+through libpq's environment, not the command line, and a tool's writes are sent together in one
+transaction on commit, as with SQLite. Backups are a full `pg_dump`; `xui-db restore FILE` (or the
+Optimizer page) puts one back, stopping and starting x-ui around it. `xui-db detect` shows what was
+found. Only the 2.x -> 3.x upgrade stays SQLite-only: 2.x panels have no PostgreSQL.
 
 ## Install
 

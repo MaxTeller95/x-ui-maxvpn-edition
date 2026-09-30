@@ -17,6 +17,8 @@ Deleting a rule on purpose is fine - run `config-guard --save` (or press the but
 the Optimizer page) and that becomes the new baseline.
 """
 import glob, json, os, shutil, sqlite3, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 CFG = BIN + "/config.json"
@@ -28,7 +30,7 @@ XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
 
 
 def db():
-    return sqlite3.connect(DB)
+    return xuidb.connect()
 
 
 def template():
@@ -225,9 +227,9 @@ def main():
 
     backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
     os.makedirs(backup, exist_ok=True)
-    for f in (DB, CFG):
-        if os.path.exists(f):
-            shutil.copy2(f, backup)
+    xuidb.backup_to(backup)
+    if os.path.exists(CFG):
+        shutil.copy2(CFG, backup)
     c = db()
     c.execute("update settings set value=? where key=?", (json.dumps(patched, indent=2), KEY))
     c.commit()

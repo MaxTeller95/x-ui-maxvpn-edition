@@ -12,6 +12,8 @@ TFO is deliberately not touched: Xray 26.x does not enable it on its listening
 socket even with tcpFastOpen set, so it only adds failed SYN-data attempts.
 """
 import glob, json, os, shutil, sqlite3, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 SYSCTL = """# TCP tuning for the proxy abroad (hub <-> here <-> internet).
@@ -43,7 +45,7 @@ def fix_freedom(o):
 
 
 
-db = sqlite3.connect(DB)
+db = xuidb.connect()
 tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
 for o in tpl["outbounds"]:
     if o["protocol"] == "freedom":
@@ -70,9 +72,9 @@ if not apply:
 backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
 os.makedirs(backup)
 db.close()
-for f in (DB, f"{BIN}/config.json"):
-    shutil.copy2(f, backup)
-db = sqlite3.connect(DB)
+xuidb.backup_to(backup)
+shutil.copy2(f"{BIN}/config.json", backup)
+db = xuidb.connect()
 db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
 db.commit()
 db.close()

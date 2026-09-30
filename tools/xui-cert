@@ -18,6 +18,8 @@ and someone has to add the record by hand. With a DNS API the same cron job adds
 the record itself, installs the new files where the panel reads them and restarts x-ui.
 """
 import glob, json, os, re, sqlite3, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB = "/etc/x-ui/x-ui.db"
 ACME_HOME = "/root/.acme.sh"
@@ -43,9 +45,9 @@ def run(*cmd, timeout=300, env=None):
 
 def setting(key):
     try:
-        row = sqlite3.connect(DB).execute("select value from settings where key=?", (key,)).fetchone()
+        row = xuidb.connect().execute("select value from settings where key=?", (key,)).fetchone()
         return row[0] if row else ""
-    except sqlite3.Error:
+    except xuidb.Error:
         return ""
 
 

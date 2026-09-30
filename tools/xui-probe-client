@@ -15,6 +15,8 @@ So "my connection is slow" becomes a number: if the config answers in 0.3 s and 
 90 Mbit/s from here, the problem is between the user and the hub, not on the server.
 """
 import glob, json, os, socket, sqlite3, subprocess, sys, tempfile, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
@@ -23,8 +25,8 @@ SPEED = "https://speed.cloudflare.com/__down?bytes=%d"
 
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
+    c = xuidb.connect()
+    c.row_factory = xuidb.Row
     return c
 
 

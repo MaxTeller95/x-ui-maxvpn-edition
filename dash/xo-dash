@@ -10,7 +10,9 @@ Besides the switches, a background collector reads Xray's stats API every 5 s an
 one bucket per minute for 24 h in /var/lib/xo-dash/history.json, so the page can show
 live throughput per path, per inbound and per user without touching the panel's database.
 """
-import collections, http.server, json, os, re, shutil, sqlite3, ssl, subprocess, threading, time, urllib.parse, urllib.request
+import collections, http.server, json, os, re, shutil, sqlite3, ssl, subprocess, threading, time, urllib.parse, urllib.request, sys
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 from concurrent.futures import ThreadPoolExecutor
 
 DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
@@ -25,7 +27,7 @@ LISTEN = ("127.0.0.1", int(os.environ.get("XO_DASH_PORT", "9811")))
 
 
 def setting(key):
-    r = sqlite3.connect(DB).execute("select value from settings where key=?", (key,)).fetchone()
+    r = xuidb.connect().execute("select value from settings where key=?", (key,)).fetchone()
     return r[0] if r else ""
 
 
@@ -98,8 +100,8 @@ def read(path, default=""):
 
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
+    c = xuidb.connect()
+    c.row_factory = xuidb.Row
     return c
 
 
@@ -1031,7 +1033,7 @@ def checkup():
                        "در تنظیمات پنل ← اشتراک روشنش کنید تا کاربران لینک اشتراک بگیرند.")
         port, path = setting("subPort") or "2096", setting("subPath") or "/sub/"
         with db() as cn:
-            row = cn.execute("select sub_id from clients where enable=1 and sub_id!='' limit 1").fetchone()
+            row = cn.execute("select sub_id from clients where enable = true and sub_id != '' limit 1").fetchone()
         if not row:
             return add("warn", "لینک اشتراک", "کلاینت فعالی با لینک اشتراک نیست")
         url = "https://127.0.0.1:%s%s%s" % (port, path, row[0])
@@ -1123,10 +1125,21 @@ def checkup():
 def make_backup():
     dest = os.path.join(BACKUP_DIR, "xui-backup-" + time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(dest, exist_ok=True)
-    for src in (DB, CFG, GUARD_CONF):
+    xuidb.backup_to(dest)
+    for src in (CFG, GUARD_CONF):
         if os.path.exists(src):
             shutil.copy2(src, dest)
     return dest
+
+
+def backup_db_file(src):
+    """The database inside a backup: a SQLite file, or a PostgreSQL dump."""
+    if os.path.isfile(src):
+        return src
+    for n in (os.path.basename(xuidb.detect()["path"]), xuidb.PG_DUMP):
+        if os.path.exists(os.path.join(src, n)):
+            return os.path.join(src, n)
+    return os.path.join(src, "x-ui.db")
 
 
 def action(name, body):
@@ -1185,11 +1198,13 @@ def action(name, body):
         src = os.path.join(BACKUP_DIR, got)
         if not SAFE_NAME.match(got) or not os.path.exists(src):
             return {"ok": False, "msg": "این بکاپ پیدا نشد"}
-        chosen = src if os.path.isfile(src) else os.path.join(src, os.path.basename(DB))
+        chosen = backup_db_file(src)
         if not os.path.exists(chosen):
             return {"ok": False, "msg": "دیتابیسی داخل این بکاپ نیست"}
+        if chosen.endswith(xuidb.PG_DUMP) != (xuidb.kind() == "postgres"):
+            return {"ok": False, "msg": "این بکاپ مال دیتابیس دیگری است (SQLite و PostgreSQL)"}
         make_backup()                                  # never overwrite without a way back
-        shutil.copy2(chosen, DB)
+        xuidb.restore(chosen, start=False)
         run("config-guard", "--save", timeout=30)     # the restored config is the one to keep - saved
         rc, out = run("systemctl", "restart", "x-ui", timeout=120)   # before x-ui rewrites config.json
         return {"ok": rc == 0, "msg": "برگردانده شد: " + got}
@@ -1361,14 +1376,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             src = os.path.join(BACKUP_DIR, got)
             if not SAFE_NAME.match(got) or not os.path.exists(src):
                 return self.send(404, {"error": "not found"})
-            path = src if os.path.isfile(src) else os.path.join(src, os.path.basename(DB))
+            path = backup_db_file(src)
             if not os.path.exists(path):
                 return self.send(404, {"error": "no database in this backup"})
             with open(path, "rb") as f:
                 data = f.read()
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", 'attachment; filename="%s.db"' % got)
+            self.send_header("Content-Disposition", 'attachment; filename="%s%s"' % (got, ".pgdump" if path.endswith(".pgdump") else ".db"))
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             return self.wfile.write(data)

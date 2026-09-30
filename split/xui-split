@@ -35,6 +35,8 @@ restart, and every proxy outbound gets a local-only probe port (socks, 127.0.0.1
 The DNS cache's upstream rule is tagged "dns-upstream".
 """
 import glob, json, os, shutil, sqlite3, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 SETTINGS, GUARD_CONF = "/etc/xui-split.json", "/etc/tunnel-guard.json"
@@ -102,7 +104,7 @@ def mux_block(conf):
 
 
 def template(db=None):
-    c = db or sqlite3.connect(DB)
+    c = db or xuidb.connect()
     return json.loads(c.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
 
 
@@ -233,13 +235,13 @@ def test_candidate(tpl):
 def backup():
     b = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
     os.makedirs(b)
-    for f in (DB, f"{BIN}/config.json"):
-        shutil.copy2(f, b)
+    xuidb.backup_to(b)
+    shutil.copy2(f"{BIN}/config.json", b)
     return b
 
 
 def write_template(tpl):
-    db = sqlite3.connect(DB)
+    db = xuidb.connect()
     db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
     db.commit()
     db.close()
@@ -511,7 +513,7 @@ def main():
     b = backup()
     write_template(tpl)
     if mode == "apply" and tg_backup:
-        db = sqlite3.connect(DB)
+        db = xuidb.connect()
         db.execute("update settings set value='true' where key='tgBotBackup'")
         db.commit()
         db.close()
@@ -521,7 +523,7 @@ def main():
     state = restart()
     sync_guard(want)
     print(f"{mode} done, backup {b}, x-ui {state}")
-    print(f"  undo: cp {b}/x-ui.db {DB} && x-ui restart")
+    print(f"  undo: {xuidb.undo_hint(b)}")
 
 
 if __name__ == "__main__":

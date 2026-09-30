@@ -16,6 +16,8 @@ Settings: /etc/tunnel-guard.json (see tunnel-guard.example.json)
 Decisions are logged to the journal: journalctl -t tunnel-guard
 """
 import json, os, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 CONF = os.environ.get("TUNNEL_GUARD_CONF", "/etc/tunnel-guard.json")
 DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
@@ -126,7 +128,7 @@ def probe(name):
 
 # ---------------------------------------------------------------- Telegram
 def tg_creds():
-    db = sqlite3.connect(DB)
+    db = xuidb.connect()
     get = lambda k: (db.execute("select value from settings where key=?", (k,)).fetchone() or [""])[0]
     return get("tgBotToken"), get("tgBotChatId").split(",")[0].strip()
 
@@ -273,7 +275,7 @@ def report(st):
         f"\n  {o['path']} {time.strftime('%H:%M', time.gmtime(o['start']))} "
         + ("(removed)" if o.get('removed') and 'end' not in o else
          f"({max(1, round((o.get('end', time.time()) - o['start']) / 60))} min)") for o in outs))
-    db = sqlite3.connect(DB)
+    db = xuidb.connect()
     now = {e: u + d for e, u, d in db.execute("select email, up, down from client_traffics")}
     prev = st.get("usage", {})
     top = sorted(((now[e] - prev.get(e, now[e]), e) for e in now), reverse=True)[:5]
@@ -288,13 +290,13 @@ def renewals(db):
     """Who needs a new plan soon - only on panels that keep clients in their own table (3.x)."""
     out = []
     try:
-        soon = db.execute("select email, expiry_time from clients where enable = 1 and expiry_time > 0"
+        soon = db.execute("select email, expiry_time from clients where enable = true and expiry_time > 0"
                           " and expiry_time < ? order by expiry_time", (int((time.time() + 3 * 86400) * 1000),)).fetchall()
         full = db.execute("select c.email, c.total_gb, t.up + t.down from clients c"
                           " join client_traffics t on t.email = c.email"
-                          " where c.enable = 1 and c.total_gb > 0 and (t.up + t.down) * 10 >= c.total_gb * 9"
+                          " where c.enable = true and c.total_gb > 0 and (t.up + t.down) * 10 >= c.total_gb * 9"
                           " order by (t.up + t.down) * 1.0 / c.total_gb desc").fetchall()
-    except sqlite3.Error:
+    except xuidb.Error:
         return out
     if soon:
         out.append("رو به انقضا (۳ روز):" + "".join(

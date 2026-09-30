@@ -24,6 +24,8 @@ Settings (optional) in /etc/xui-reach.json:
 A timer (xui-reach.timer) runs one round every 10 minutes.
 """
 import json, os, sqlite3, subprocess, sys, time, urllib.parse, urllib.request
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB = "/etc/x-ui/x-ui.db"
 CONF, STATE_DIR = "/etc/xui-reach.json", "/var/lib/xui-reach"
@@ -63,9 +65,9 @@ def targets(conf):
     """[(port, what it is)] - enabled inbounds that listen on every address, and the subscription."""
     if conf.get("ports"):
         return [(int(p), str(p)) for p in conf["ports"]]
-    db = sqlite3.connect(DB)
+    db = xuidb.connect()
     out = []
-    for tag, remark, port, listen in db.execute("select tag, remark, port, listen from inbounds where enable=1"):
+    for tag, remark, port, listen in db.execute("select tag, remark, port, listen from inbounds where enable = true"):
         if (listen or "") in ("", "0.0.0.0", "::"):
             out.append((int(port), remark or tag))
     get_set = lambda k: (db.execute("select value from settings where key=?", (k,)).fetchone() or [""])[0]

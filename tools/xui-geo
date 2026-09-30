@@ -18,6 +18,8 @@ Downloads go direct first and through the guard's probe ports (the tunnels) when
 does not answer from the hub.
 """
 import glob, hashlib, json, os, shutil, sqlite3, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 CFG = BIN + "/config.json"
@@ -153,7 +155,7 @@ def update(restart):
 def security(on):
     """One rule: the security categories go to the blackhole outbound, for every user inbound.
     Only this rule changes; config-guard learns it before x-ui restarts."""
-    db = sqlite3.connect(DB)
+    db = xuidb.connect()
     tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
     rules = [r for r in tpl["routing"]["rules"] if r.get("ruleTag") != TAG]
     kinds = {o.get("tag"): o.get("protocol") for o in tpl["outbounds"]}
@@ -187,9 +189,9 @@ def security(on):
     backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
     os.makedirs(backup)
     db.close()
-    for f in (DB, CFG):
-        shutil.copy2(f, backup)
-    db = sqlite3.connect(DB)
+    xuidb.backup_to(backup)
+    shutil.copy2(CFG, backup)
+    db = xuidb.connect()
     db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
     db.commit()
     db.close()

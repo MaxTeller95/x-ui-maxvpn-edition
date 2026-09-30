@@ -31,6 +31,8 @@ Both ride UDP: where UDP abroad is throttled they fail, and the guard simply ski
 The primary path cannot be removed, and neither can the one users are on right now.
 """
 import base64, glob, json, os, re, shutil, sqlite3, subprocess, sys, time, urllib.parse
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 CFG, GUARD_CONF = BIN + "/config.json", "/etc/tunnel-guard.json"
@@ -46,7 +48,7 @@ def die(msg, as_json=False):
 
 
 def template(db=None):
-    c = db or sqlite3.connect(DB)
+    c = db or xuidb.connect()
     return json.loads(c.execute("select value from settings where key=?", (KEY,)).fetchone()[0])
 
 
@@ -279,9 +281,9 @@ def test_config(t):
 def apply(t, note):
     backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
     os.makedirs(backup, exist_ok=True)
-    for f in (DB, CFG):
-        shutil.copy2(f, backup)
-    c = sqlite3.connect(DB)
+    xuidb.backup_to(backup)
+    shutil.copy2(CFG, backup)
+    c = xuidb.connect()
     c.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
     c.commit()
     c.close()
@@ -445,7 +447,7 @@ def prune(as_json):
     """Probe ports (and their rules and guard rows) left behind by an outbound that is gone.
     An orphan probe port is worse than useless: with no rule it falls through to the first
     outbound, so it "answers" and the page reports a path that does not exist."""
-    db = sqlite3.connect(DB)
+    db = xuidb.connect()
     t, c = template(db), conf()
     outs = {o.get("tag", "").lower() for o in t.get("outbounds", [])}
     dead = [i.get("tag") for i in t.get("inbounds", [])
@@ -462,8 +464,8 @@ def prune(as_json):
         die("Xray کانفیگ پاک‌شده را رد کرد: " + detail, as_json)
     backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
     os.makedirs(backup, exist_ok=True)
-    for f in (DB, CFG):
-        shutil.copy2(f, backup)
+    xuidb.backup_to(backup)
+    shutil.copy2(CFG, backup)
     db.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
     db.commit()
     db.close()

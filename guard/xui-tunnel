@@ -29,6 +29,8 @@ unknown too. xui-path runs a scan right after it adds a path.
 Settings live under "tunnels" in /etc/tunnel-guard.json, state in /var/lib/tunnel-guard/tunnels.json.
 """
 import glob, ipaddress, json, os, re, socket, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 from concurrent.futures import ThreadPoolExecutor
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
@@ -255,7 +257,7 @@ def conf():
 
 
 def template(db=None):
-    c = db or sqlite3.connect(DB)
+    c = db or xuidb.connect()
     return json.loads(c.execute("select value from settings where key=?", (KEY,)).fetchone()[0])
 
 
@@ -469,7 +471,7 @@ def use(name, addr, why="by hand"):
         return {"ok": True, "msg": "%s از قبل روی %s است" % (name, addr)}
 
     # 1. the panel's template, so the next x-ui restart keeps it
-    db = sqlite3.connect(DB)
+    db = xuidb.connect()
     t = template(db)
     for o in t.get("outbounds", []):
         if o.get("tag") in tags:
@@ -529,7 +531,7 @@ def use(name, addr, why="by hand"):
 
 def telegram(text):
     try:
-        db = sqlite3.connect(DB)
+        db = xuidb.connect()
         get = lambda k: (db.execute("select value from settings where key=?", (k,)).fetchone() or [""])[0]
         token, chat = get("tgBotToken"), get("tgBotChatId").split(",")[0].strip()
     except Exception:

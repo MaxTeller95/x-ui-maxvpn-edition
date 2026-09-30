@@ -57,7 +57,8 @@ done
 if [ -n "$UNINSTALL" ]; then
   inf "خاموش کردن تایمرها و سرویس‌ها"
   [ -f /usr/local/share/xui-optimizer/subpage/index.html ] && { "$DEST/xui-subpage" off || true; }
-  rm -rf /usr/local/share/xui-optimizer
+  rm -rf /usr/local/share/xui-optimizer /usr/local/lib/xui-optimizer
+  rm -f "$DEST/xui-db"
   for t in $TIMERS xo-dash.service; do systemctl disable --now "$t" 2>/dev/null || true; done
   for f in $TOOLS; do rm -f "$DEST/$(basename "$f")"; done
   for u in $UNITS; do rm -f "/etc/systemd/system/$(basename "$u")"; done
@@ -82,7 +83,6 @@ if [ -n "$need" ]; then
   inf "نصب پیش‌نیازها:$need"
   apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $need >/dev/null
 fi
-[ -f /etc/x-ui/x-ui.db ] || red "هشدار: /etc/x-ui/x-ui.db پیدا نشد - اول پنل x-ui یا 3x-ui را نصب کنید."
 
 # --------------------------------------------------------------------- ۱. گرفتن سورس
 here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
@@ -106,7 +106,25 @@ else
 fi
 SRC=$HOME_DIR
 
+# --------------------------------------------------------------------- دیتابیس پنل
+# همان‌طور که خود x-ui می‌بیند: محیط پروسه‌ی در حال اجرا، بعد تنظیمات سرویس، بعد SQLite پیش‌فرض
+DBINFO=$(python3 "$SRC/lib/xuidb.py" detect 2>&1 || true)
+inf "دیتابیس پنل: $DBINFO"
+case "$DBINFO" in
+  postgres*)
+    if ! command -v psql >/dev/null || ! command -v pg_dump >/dev/null; then
+      inf "پنل روی PostgreSQL است؛ نصب psql و pg_dump"
+      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-client >/dev/null
+    fi ;;
+  sqlite*)
+    python3 -c "import sys; sys.path.insert(0, '$SRC/lib'); import xuidb; sys.exit(0 if xuidb.exists() else 1)" ||
+      red "هشدار: دیتابیس پنل پیدا نشد - اول پنل x-ui یا 3x-ui را نصب کنید." ;;
+esac
+
 # --------------------------------------------------------------------- ۲. ابزارها و سرویس‌ها
+install -d /usr/local/lib/xui-optimizer                      # ماژول مشترک دیتابیس (SQLite یا PostgreSQL)
+install -m 755 "$SRC/lib/xuidb.py" /usr/local/lib/xui-optimizer/xuidb.py
+ln -sf /usr/local/lib/xui-optimizer/xuidb.py "$DEST/xui-db"
 for f in $TOOLS; do install -m 755 "$SRC/$f" "$DEST/$(basename "$f")"; done
 for u in $UNITS; do install -m 644 "$SRC/$u" "/etc/systemd/system/$(basename "$u")"; done
 [ -f /etc/tunnel-guard.json ] || install -m 644 "$SRC/guard/tunnel-guard.example.json" /etc/tunnel-guard.json
