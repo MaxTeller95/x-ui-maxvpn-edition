@@ -126,7 +126,7 @@ xui-split                 # test (default)
 xui-split apply           # also turns on the panel's daily Telegram backup
 xui-split remove
 xui-split groups                              # the exits, their inbounds and settings
-xui-split set BACKUP --label TR --concurrency 8   # one exit; then fix (mux only) or apply (on/off)
+xui-split set BACKUP --label "site 2" --concurrency 8   # one exit; then fix (mux only) or apply (on/off)
 ```
 
 `xui-split check` tells whether the split really works: `<MAIN>-mux` exists, has mux on,

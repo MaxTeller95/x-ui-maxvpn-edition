@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs the dashboard and puts nginx in front of the x-ui panel on PUBLIC_PORT.
 #   bash install-dash.sh 59085        # side by side: panel stays on its own port too (test)
-#   bash install-dash.sh 59084 move   # take over the panel's port; x-ui moves to 127.0.0.1
+#   bash install-dash.sh <panel port> move   # take over the panel's port; x-ui moves to 127.0.0.1
 # The panel's secret base path is read from its database here and never printed.
 set -euo pipefail
 PUBLIC_PORT=${1:?public port}; MODE=${2:-side}

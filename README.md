@@ -116,7 +116,7 @@ mux دست‌دادن TCP روی تانل را حذف می‌کند (صفحه‌
 | قانون‌ها | `split-<out>-udp`، `split-<out>-heavy`، `split-<out>-telegram` ← `<OUT>` و `split-<out>-light` ← `<OUT>-mux` |
 | قانون اصلی | `main-<out>` |
 | پورت probe | `guard-<out>-mux` |
-| تنظیمات | در `/etc/xui-split.json`: روشن/خاموش، concurrency، xudp، برچسب (مثلاً «آلمان») و دامنه‌های سنگین اضافه |
+| تنظیمات | در `/etc/xui-split.json`: روشن/خاموش، concurrency، xudp، برچسب (مثلاً «کشور یک») و دامنه‌های سنگین اضافه |
 
 مسیرهای دیگر به همان سرور (تانل دوم، مسیر sing-box، مسیر Reality) گروه جدا نیستند. نگهبان تانل هر mux را جدا
 می‌سنجد: اگر mux یک خروجی گیر کند فقط ترافیک سبک همان خروجی از mux برداشته می‌شود.
@@ -126,7 +126,7 @@ xui-split          # تست (پیش‌فرض)
 xui-split apply    # اعمال؛ بکاپ روزانه‌ی تلگرام پنل را هم روشن می‌کند
 xui-split remove
 xui-split groups                                   # خروجی‌ها، اینباندها و تنظیمات هر کدام
-xui-split set BACKUP --label ترکیه --concurrency 8  # تنظیم یک خروجی؛ بعد fix (فقط mux) یا apply (روشن/خاموش)
+xui-split set BACKUP --label "کشور دو" --concurrency 8  # تنظیم یک خروجی؛ بعد fix (فقط mux) یا apply (روشن/خاموش)
 mux-bench <OUTBOUND>   # قبل از اعمال، روی لینک خودتان بسنجید
 ```
 

@@ -579,7 +579,7 @@ function renderStatus(s) {
         : g.light === "direct" ? '<span class="chip warn">موقتاً بدون mux</span>'
         : '<span class="chip ok">mux فعال</span>';
       return `<div class="sg"><div class="th"><b dir="ltr">${esc(g.out)}</b>
-          <input class="sg-label" data-sglabel="${esc(g.out)}" value="${esc(g.label)}" placeholder="برچسب، مثل آلمان">
+          <input class="sg-label" data-sglabel="${esc(g.out)}" value="${esc(g.label)}" placeholder="برچسب، مثل کشور یک">
           ${st}
           <label class="mini"><input type="checkbox" data-sgon="${esc(g.out)}" ${g.enabled ? "checked" : ""}>فعال</label>
           <select data-sgconc="${esc(g.out)}" title="concurrency: چند اتصال روی یک اتصال تانل">${[2, 4, 8, 16].map((n) =>
