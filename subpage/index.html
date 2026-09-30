@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>{{ if .subTitle }}{{ .subTitle }}{{ else }}اشتراک شما{{ end }}</title>
+<style>
+:root {
+  --bg: #f3f5f9; --card: #ffffff; --text: #1d2433; --muted: #6b7489; --line: #e3e7ef;
+  --accent: #2f6fed; --accent-soft: #e8f0ff; --ok: #14a05b; --warn: #e08a00; --bad: #d62839;
+  --shadow: 0 1px 2px rgba(20, 30, 60, .06), 0 4px 16px rgba(20, 30, 60, .06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f131b; --card: #181e2a; --text: #e6e9f0; --muted: #8d96aa; --line: #273043;
+    --accent: #5b8cff; --accent-soft: #1d2a47; --ok: #2fc47a; --warn: #f0a531; --bad: #ff4d5e;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 16px rgba(0, 0, 0, .25);
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--text); line-height: 1.7; -webkit-text-size-adjust: 100%;
+  font-family: Vazirmatn, "Vazir", "IRANSans", "Segoe UI", Tahoma, system-ui, sans-serif;
+}
+.wrap { max-width: 720px; margin: 0 auto; padding: 16px 16px 40px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 8px 0 16px; }
+h1 { font-size: 1.25rem; margin: 0; }
+h2 { font-size: 1rem; margin: 0 0 12px; }
+.muted { color: var(--muted); }
+.sm { font-size: .82rem; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; margin-bottom: 14px; box-shadow: var(--shadow); }
+.pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 12px; font-size: .82rem; background: var(--accent-soft); white-space: nowrap; }
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill.on .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.stat { background: var(--bg); border-radius: 12px; padding: 10px 12px; min-width: 0; }
+.stat b { display: block; font-size: 1.08rem; overflow-wrap: anywhere; }
+.bar { height: 10px; border-radius: 99px; background: var(--line); overflow: hidden; margin: 8px 0 4px; }
+.bar i { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--ok); transition: width .6s ease; }
+.bar i.warn { background: var(--warn); }
+.bar i.bad { background: var(--bad); }
+.row { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line);
+  background: var(--card); color: var(--text); border-radius: 10px; padding: 8px 14px; font: inherit; font-size: .9rem;
+  cursor: pointer; text-decoration: none; min-height: 40px;
+}
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.url {
+  direction: ltr; text-align: left; font-family: ui-monospace, Consolas, monospace; font-size: .8rem; background: var(--bg);
+  border-radius: 10px; padding: 10px 12px; overflow-wrap: anywhere; margin-bottom: 10px; user-select: all;
+}
+.tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.tab { border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 99px; padding: 4px 14px; font: inherit; font-size: .85rem; cursor: pointer; }
+.tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+.cfg { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+.cfg:first-of-type { border-top: 0; }
+.cfg .name { min-width: 0; overflow-wrap: anywhere; }
+.cfg .proto { font-size: .72rem; direction: ltr; display: inline-block; background: var(--accent-soft); color: var(--accent); border-radius: 6px; padding: 0 6px; margin-inline-start: 6px; }
+.cfg .btns { flex-shrink: 0; flex-wrap: nowrap; }
+.cfg .btn { padding: 6px 10px; min-height: 34px; font-size: .82rem; }
+.announce { white-space: pre-wrap; border-inline-start: 4px solid var(--accent); }
+.alert { border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); background: color-mix(in srgb, var(--bad) 8%, var(--card)); }
+.alert b { color: var(--bad); }
+footer { text-align: center; margin-top: 18px; }
+
+/* the stamp */
+.stamp {
+  position: fixed; inset: 0; display: none; align-items: center; justify-content: center; pointer-events: none; z-index: 20; overflow: hidden;
+}
+.stamp.show { display: flex; }
+.stamp div {
+  color: var(--bad); border: 6px double var(--bad); border-radius: 18px; padding: 14px 26px 10px; text-align: center;
+  font-size: clamp(1.6rem, 8.5vw, 3.6rem); font-weight: 900; white-space: nowrap; line-height: 1.3; letter-spacing: 0;
+  transform: rotate(-16deg); opacity: .82; background: color-mix(in srgb, var(--card) 55%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 20%, transparent) inset;
+  animation: slam .45s cubic-bezier(.2, 1.6, .4, 1) both; max-width: 92vw;
+  -webkit-mask-image: repeating-linear-gradient(35deg, #000 0 7px, rgba(0, 0, 0, .78) 7px 9px);
+          mask-image: repeating-linear-gradient(35deg, #000 0 7px, rgba(0, 0, 0, .78) 7px 9px);
+}
+.stamp small { display: block; white-space: normal; font-size: .34em; font-weight: 700; letter-spacing: 0; margin-top: 2px; }
+@keyframes slam { from { transform: rotate(-16deg) scale(2.2); opacity: 0; } to { transform: rotate(-16deg) scale(1); opacity: .82; } }
+body.dead .live { filter: grayscale(1); opacity: .55; }
+
+/* QR dialog and toast */
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); display: none; align-items: center; justify-content: center; padding: 16px; z-index: 30; }
+.modal.show { display: flex; }
+.modal .box { background: var(--card); border-radius: 16px; padding: 16px; width: min(360px, 100%); text-align: center; }
+.modal .qr { background: #fff; border-radius: 12px; padding: 10px; margin: 10px 0; }
+.modal .qr svg { width: 100%; height: auto; display: block; }
+.toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); border-radius: 10px; padding: 8px 16px; opacity: 0; transition: .25s; z-index: 40; pointer-events: none; }
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+@media (max-width: 420px) {
+  .grid { gap: 8px; }
+  .cfg { flex-direction: column; align-items: stretch; }
+  .cfg .btns .btn { flex: 1; }
+}
+</style>
+</head>
+<body>
+<div class="stamp" id="stamp" aria-hidden="true"><div><span id="stamp-text"></span><small id="stamp-sub"></small></div></div>
+
+<div class="wrap">
+  <header>
+    <h1 id="title"></h1>
+    <span class="pill" id="online"><span class="dot"></span><span></span></span>
+  </header>
+
+  <div class="card alert" id="alert" hidden>
+    <b id="alert-title"></b>
+    <div id="alert-text" class="sm"></div>
+    <div class="btns" style="margin-top:10px" id="alert-support" hidden><a class="btn primary" target="_blank" rel="noopener">تماس با پشتیبانی</a></div>
+  </div>
+
+  <div class="card announce" id="announce" hidden></div>
+
+  <div class="card live">
+    <h2>مصرف حجم</h2>
+    <div class="row"><span id="used-line"></span><span class="muted sm" id="used-pct"></span></div>
+    <div class="bar"><i id="used-bar"></i></div>
+    <div class="grid" style="margin-top:12px">
+      <div class="stat"><span class="muted sm">باقی‌مانده</span><b id="remain"></b></div>
+      <div class="stat"><span class="muted sm">کل حجم</span><b id="total"></b></div>
+      <div class="stat"><span class="muted sm">دانلود</span><b id="down"></b></div>
+      <div class="stat"><span class="muted sm">آپلود</span><b id="up"></b></div>
+    </div>
+  </div>
+
+  <div class="card live">
+    <h2>زمان اشتراک</h2>
+    <div class="row"><span id="exp-line"></span><span class="muted sm" id="exp-date"></span></div>
+    <div class="bar" id="exp-barbox" hidden><i id="exp-bar"></i></div>
+  </div>
+
+  <div class="card">
+    <h2>لینک اشتراک</h2>
+    <div class="url" id="sub-url"></div>
+    <div class="btns">
+      <button class="btn primary" id="copy-sub">کپی لینک</button>
+      <button class="btn" id="qr-sub">نمایش QR</button>
+    </div>
+    <div class="muted sm" style="margin-top:8px">این لینک را در برنامه‌ی خود «افزودن اشتراک» کنید تا کانفیگ‌ها خودکار به‌روز بمانند<span id="upd"></span>.</div>
+  </div>
+
+  <div class="card">
+    <h2>افزودن خودکار به برنامه</h2>
+    <div class="tabs" id="os-tabs"></div>
+    <div class="apps" id="apps"></div>
+  </div>
+
+  <div class="card" id="cfg-card">
+    <h2>کانفیگ‌ها <span class="muted sm" id="cfg-n"></span></h2>
+    <div id="cfgs"></div>
+  </div>
+
+  <footer class="muted sm" id="foot"></footer>
+</div>
+
+<div class="modal" id="modal" role="dialog" aria-modal="true">
+  <div class="box">
+    <b id="qr-title"></b>
+    <div class="qr" id="qr"></div>
+    <div class="btns" style="justify-content:center">
+      <button class="btn primary" id="qr-copy">کپی</button>
+      <button class="btn" id="qr-close">بستن</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script id="sub-data" type="application/json">{{ . }}</script>
+<script>//---------------------------------------------------------------------
+// QR Code Generator for JavaScript
+// Copyright (c) 2009 Kazuhiko Arase
+// URL: http://www.d-project.com/
+// Licensed under the MIT license:
+//  http://www.opensource.org/licenses/mit-license.php
+// The word 'QR Code' is registered trademark of
+// DENSO WAVE INCORPORATED
+//  http://www.denso-wave.com/qrcode/faqpatent-e.html
+//---------------------------------------------------------------------
+var qrcode=function(){
+//---------------------------------------------------------------------
+// qrcode
+//---------------------------------------------------------------------
+/**
+   * qrcode
+   * @param typeNumber 1 to 40
+   * @param errorCorrectionLevel 'L','M','Q','H'
+   */
+var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],f={},c=function(t,r){o=function(t){for(var r=new Array(t),e=0;e<t;e+=1){r[e]=new Array(t);for(var n=0;n<t;n+=1)r[e][n]=null}return r}(i=4*e+17),l(0,0),l(i-7,0),l(0,i-7),s(),h(),d(t,r),e>=7&&v(t),null==a&&(a=p(e,n,u)),w(a,r)},l=function(t,r){for(var e=-1;e<=7;e+=1)if(!(t+e<=-1||i<=t+e))for(var n=-1;n<=7;n+=1)r+n<=-1||i<=r+n||(o[t+e][r+n]=0<=e&&e<=6&&(0==n||6==n)||0<=n&&n<=6&&(0==e||6==e)||2<=e&&e<=4&&2<=n&&n<=4)},h=function(){for(var t=8;t<i-8;t+=1)null==o[t][6]&&(o[t][6]=t%2==0);for(var r=8;r<i-8;r+=1)null==o[6][r]&&(o[6][r]=r%2==0)},s=function(){for(var t=B.getPatternPosition(e),r=0;r<t.length;r+=1)for(var n=0;n<t.length;n+=1){var i=t[r],a=t[n];if(null==o[i][a])for(var u=-2;u<=2;u+=1)for(var f=-2;f<=2;f+=1)o[i+u][a+f]=-2==u||2==u||-2==f||2==f||0==u&&0==f}},v=function(t){for(var r=B.getBCHTypeNumber(e),n=0;n<18;n+=1){var a=!t&&1==(r>>n&1);o[Math.floor(n/3)][n%3+i-8-3]=a}for(n=0;n<18;n+=1){a=!t&&1==(r>>n&1);o[n%3+i-8-3][Math.floor(n/3)]=a}},d=function(t,r){
+// vertical
+for(var e=n<<3|r,a=B.getBCHTypeInfo(e),u=0;u<15;u+=1){var f=!t&&1==(a>>u&1);u<6?o[u][8]=f:u<8?o[u+1][8]=f:o[i-15+u][8]=f}
+// horizontal
+for(u=0;u<15;u+=1){f=!t&&1==(a>>u&1);u<8?o[8][i-u-1]=f:u<9?o[8][15-u-1+1]=f:o[8][15-u-1]=f}
+// fixed module
+o[i-8][8]=!t},w=function(t,r){for(var e=-1,n=i-1,a=7,u=0,f=B.getMaskFunction(r),c=i-1;c>0;c-=2)for(6==c&&(c-=1);;){for(var g=0;g<2;g+=1)if(null==o[n][c-g]){var l=!1;u<t.length&&(l=1==(t[u]>>>a&1)),f(n,c-g)&&(l=!l),o[n][c-g]=l,-1==(a-=1)&&(u+=1,a=7)}if((n+=e)<0||i<=n){n-=e,e=-e;break}}},p=function(t,r,e){for(var n=A.getRSBlocks(t,r),o=b(),i=0;i<e.length;i+=1){var a=e[i];o.put(a.getMode(),4),o.put(a.getLength(),B.getLengthInBits(a.getMode(),t)),a.write(o)}
+// calc num max data.
+var u=0;for(i=0;i<n.length;i+=1)u+=n[i].dataCount;if(o.getLengthInBits()>8*u)throw"code length overflow. ("+o.getLengthInBits()+">"+8*u+")";
+// end code
+// padding
+for(o.getLengthInBits()+4<=8*u&&o.put(0,4);o.getLengthInBits()%8!=0;)o.putBit(!1);
+// padding
+for(;!(o.getLengthInBits()>=8*u||(o.put(236,8),o.getLengthInBits()>=8*u));)o.put(17,8);return function(t,r){for(var e=0,n=0,o=0,i=new Array(r.length),a=new Array(r.length),u=0;u<r.length;u+=1){var f=r[u].dataCount,c=r[u].totalCount-f;n=Math.max(n,f),o=Math.max(o,c),i[u]=new Array(f);for(var g=0;g<i[u].length;g+=1)i[u][g]=255&t.getBuffer()[g+e];e+=f;var l=B.getErrorCorrectPolynomial(c),h=k(i[u],l.getLength()-1).mod(l);for(a[u]=new Array(l.getLength()-1),g=0;g<a[u].length;g+=1){var s=g+h.getLength()-a[u].length;a[u][g]=s>=0?h.getAt(s):0}}var v=0;for(g=0;g<r.length;g+=1)v+=r[g].totalCount;var d=new Array(v),w=0;for(g=0;g<n;g+=1)for(u=0;u<r.length;u+=1)g<i[u].length&&(d[w]=i[u][g],w+=1);for(g=0;g<o;g+=1)for(u=0;u<r.length;u+=1)g<a[u].length&&(d[w]=a[u][g],w+=1);return d}(o,n)};f.addData=function(t,r){var e=null;switch(r=r||"Byte"){case"Numeric":e=M(t);break;case"Alphanumeric":e=x(t);break;case"Byte":e=m(t);break;case"Kanji":e=L(t);break;default:throw"mode:"+r}u.push(e),a=null},f.isDark=function(t,r){if(t<0||i<=t||r<0||i<=r)throw t+","+r;return o[t][r]},f.getModuleCount=function(){return i},f.make=function(){if(e<1){for(var t=1;t<40;t++){for(var r=A.getRSBlocks(t,n),o=b(),i=0;i<u.length;i++){var a=u[i];o.put(a.getMode(),4),o.put(a.getLength(),B.getLengthInBits(a.getMode(),t)),a.write(o)}var g=0;for(i=0;i<r.length;i++)g+=r[i].dataCount;if(o.getLengthInBits()<=8*g)break}e=t}c(!1,function(){for(var t=0,r=0,e=0;e<8;e+=1){c(!0,e);var n=B.getLostPoint(f);(0==e||t>n)&&(t=n,r=e)}return r}())},f.createTableTag=function(t,r){t=t||2;var e="";e+='<table style="',e+=" border-width: 0px; border-style: none;",e+=" border-collapse: collapse;",e+=" padding: 0px; margin: "+(r=void 0===r?4*t:r)+"px;",e+='">',e+="<tbody>";for(var n=0;n<f.getModuleCount();n+=1){e+="<tr>";for(var o=0;o<f.getModuleCount();o+=1)e+='<td style="',e+=" border-width: 0px; border-style: none;",e+=" border-collapse: collapse;",e+=" padding: 0px; margin: 0px;",e+=" width: "+t+"px;",e+=" height: "+t+"px;",e+=" background-color: ",e+=f.isDark(n,o)?"#000000":"#ffffff",e+=";",e+='"/>';e+="</tr>"}return e+="</tbody>",e+="</table>"},f.createSvgTag=function(t,r,e,n){var o={};"object"==typeof arguments[0]&&(
+// Called by options.
+// overwrite cellSize and margin.
+t=(o=arguments[0]).cellSize,r=o.margin,e=o.alt,n=o.title),t=t||2,r=void 0===r?4*t:r,(
+// Compose alt property surrogate
+e="string"==typeof e?{text:e}:e||{}).text=e.text||null,e.id=e.text?e.id||"qrcode-description":null,(
+// Compose title property surrogate
+n="string"==typeof n?{text:n}:n||{}).text=n.text||null,n.id=n.text?n.id||"qrcode-title":null;var i,a,u,c,g=f.getModuleCount()*t+2*r,l="";for(c="l"+t+",0 0,"+t+" -"+t+",0 0,-"+t+"z ",l+='<svg version="1.1" xmlns="http://www.w3.org/2000/svg"',l+=o.scalable?"":' width="'+g+'px" height="'+g+'px"',l+=' viewBox="0 0 '+g+" "+g+'" ',l+=' preserveAspectRatio="xMinYMin meet"',l+=n.text||e.text?' role="img" aria-labelledby="'+y([n.id,e.id].join(" ").trim())+'"':"",l+=">",l+=n.text?'<title id="'+y(n.id)+'">'+y(n.text)+"</title>":"",l+=e.text?'<description id="'+y(e.id)+'">'+y(e.text)+"</description>":"",l+='<rect width="100%" height="100%" fill="white" cx="0" cy="0"/>',l+='<path d="',a=0;a<f.getModuleCount();a+=1)for(u=a*t+r,i=0;i<f.getModuleCount();i+=1)f.isDark(a,i)&&(l+="M"+(i*t+r)+","+u+c);return l+='" stroke="transparent" fill="black"/>',l+="</svg>"},f.createDataURL=function(t,r){t=t||2,r=void 0===r?4*t:r;var e=f.getModuleCount()*t+2*r,n=r,o=e-r;return I(e,e,function(r,e){if(n<=r&&r<o&&n<=e&&e<o){var i=Math.floor((r-n)/t),a=Math.floor((e-n)/t);return f.isDark(a,i)?0:1}return 1})},f.createImgTag=function(t,r,e){t=t||2,r=void 0===r?4*t:r;var n=f.getModuleCount()*t+2*r,o="";return o+="<img",o+=' src="',o+=f.createDataURL(t,r),o+='"',o+=' width="',o+=n,o+='"',o+=' height="',o+=n,o+='"',e&&(o+=' alt="',o+=y(e),o+='"'),o+="/>"};var y=function(t){for(var r="",e=0;e<t.length;e+=1){var n=t.charAt(e);switch(n){case"<":r+="&lt;";break;case">":r+="&gt;";break;case"&":r+="&amp;";break;case'"':r+="&quot;";break;default:r+=n}}return r};return f.createASCII=function(t,r){if((t=t||1)<2)return function(t){t=void 0===t?2:t;var r,e,n,o,i,a=1*f.getModuleCount()+2*t,u=t,c=a-t,g={"██":"█","█ ":"▀"," █":"▄","  ":" "},l={"██":"▀","█ ":"▀"," █":" ","  ":" "},h="";for(r=0;r<a;r+=2){for(n=Math.floor((r-u)/1),o=Math.floor((r+1-u)/1),e=0;e<a;e+=1)i="█",u<=e&&e<c&&u<=r&&r<c&&f.isDark(n,Math.floor((e-u)/1))&&(i=" "),u<=e&&e<c&&u<=r+1&&r+1<c&&f.isDark(o,Math.floor((e-u)/1))?i+=" ":i+="█",
+// Output 2 characters per pixel, to create full square. 1 character per pixels gives only half width of square.
+h+=t<1&&r+1>=c?l[i]:g[i];h+="\n"}return a%2&&t>0?h.substring(0,h.length-a-1)+Array(a+1).join("▀"):h.substring(0,h.length-1)}(r);t-=1,r=void 0===r?2*t:r;var e,n,o,i,a=f.getModuleCount()*t+2*r,u=r,c=a-r,g=Array(t+1).join("██"),l=Array(t+1).join("  "),h="",s="";for(e=0;e<a;e+=1){for(o=Math.floor((e-u)/t),s="",n=0;n<a;n+=1)i=1,u<=n&&n<c&&u<=e&&e<c&&f.isDark(o,Math.floor((n-u)/t))&&(i=0),
+// Output 2 characters per pixel, to create full square. 1 character per pixels gives only half width of square.
+s+=i?g:l;for(o=0;o<t;o+=1)h+=s+"\n"}return h.substring(0,h.length-1)},f.renderTo2dContext=function(t,r){r=r||2;for(var e=f.getModuleCount(),n=0;n<e;n++)for(var o=0;o<e;o++)t.fillStyle=f.isDark(n,o)?"black":"white",t.fillRect(n*r,o*r,r,r)},f};
+//---------------------------------------------------------------------
+// qrcode.stringToBytes
+//---------------------------------------------------------------------
+t.stringToBytes=(t.stringToBytesFuncs={default:function(t){for(var r=[],e=0;e<t.length;e+=1){var n=t.charCodeAt(e);r.push(255&n)}return r}}).default,
+//---------------------------------------------------------------------
+// qrcode.createStringToBytes
+//---------------------------------------------------------------------
+/**
+   * @param unicodeData base64 string of byte array.
+   * [16bit Unicode],[16bit Bytes], ...
+   * @param numChars
+   */
+t.createStringToBytes=function(t,r){
+// create conversion map.
+var e=function(){for(var e=S(t),n=function(){var t=e.read();if(-1==t)throw"eof";return t},o=0,i={};;){var a=e.read();if(-1==a)break;var u=n(),f=n()<<8|n();i[String.fromCharCode(a<<8|u)]=f,o+=1}if(o!=r)throw o+" != "+r;return i}(),n="?".charCodeAt(0);return function(t){for(var r=[],o=0;o<t.length;o+=1){var i=t.charCodeAt(o);if(i<128)r.push(i);else{var a=e[t.charAt(o)];"number"==typeof a?(255&a)==a?
+// 1byte
+r.push(a):(
+// 2bytes
+r.push(a>>>8),r.push(255&a)):r.push(n)}}return r}};
+//---------------------------------------------------------------------
+// QRMode
+//---------------------------------------------------------------------
+var r,e,n,o,i,a=1,u=2,f=4,c=8,g={L:1,M:0,Q:3,H:2},l=0,h=1,s=2,v=3,d=4,w=5,p=6,y=7,B=(r=[[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50],[6,30,54],[6,32,58],[6,34,62],[6,26,46,66],[6,26,48,70],[6,26,50,74],[6,30,54,78],[6,30,56,82],[6,30,58,86],[6,34,62,90],[6,28,50,72,94],[6,26,50,74,98],[6,30,54,78,102],[6,28,54,80,106],[6,32,58,84,110],[6,30,58,86,114],[6,34,62,90,118],[6,26,50,74,98,122],[6,30,54,78,102,126],[6,26,52,78,104,130],[6,30,56,82,108,134],[6,34,60,86,112,138],[6,30,58,86,114,142],[6,34,62,90,118,146],[6,30,54,78,102,126,150],[6,24,50,76,102,128,154],[6,28,54,80,106,132,158],[6,32,58,84,110,136,162],[6,26,54,82,110,138,166],[6,30,58,86,114,142,170]],e=1335,n=7973,i=function(t){for(var r=0;0!=t;)r+=1,t>>>=1;return r},(o={}).getBCHTypeInfo=function(t){for(var r=t<<10;i(r)-i(e)>=0;)r^=e<<i(r)-i(e);return 21522^(t<<10|r)},o.getBCHTypeNumber=function(t){for(var r=t<<12;i(r)-i(n)>=0;)r^=n<<i(r)-i(n);return t<<12|r},o.getPatternPosition=function(t){return r[t-1]},o.getMaskFunction=function(t){switch(t){case l:return function(t,r){return(t+r)%2==0};case h:return function(t,r){return t%2==0};case s:return function(t,r){return r%3==0};case v:return function(t,r){return(t+r)%3==0};case d:return function(t,r){return(Math.floor(t/2)+Math.floor(r/3))%2==0};case w:return function(t,r){return t*r%2+t*r%3==0};case p:return function(t,r){return(t*r%2+t*r%3)%2==0};case y:return function(t,r){return(t*r%3+(t+r)%2)%2==0};default:throw"bad maskPattern:"+t}},o.getErrorCorrectPolynomial=function(t){for(var r=k([1],0),e=0;e<t;e+=1)r=r.multiply(k([1,C.gexp(e)],0));return r},o.getLengthInBits=function(t,r){if(1<=r&&r<10)
+// 1 - 9
+switch(t){case a:return 10;case u:return 9;case f:case c:return 8;default:throw"mode:"+t}else if(r<27)
+// 10 - 26
+switch(t){case a:return 12;case u:return 11;case f:return 16;case c:return 10;default:throw"mode:"+t}else{if(!(r<41))throw"type:"+r;
+// 27 - 40
+switch(t){case a:return 14;case u:return 13;case f:return 16;case c:return 12;default:throw"mode:"+t}}},o.getLostPoint=function(t){
+// LEVEL1
+for(var r=t.getModuleCount(),e=0,n=0;n<r;n+=1)for(var o=0;o<r;o+=1){for(var i=0,a=t.isDark(n,o),u=-1;u<=1;u+=1)if(!(n+u<0||r<=n+u))for(var f=-1;f<=1;f+=1)o+f<0||r<=o+f||0==u&&0==f||a==t.isDark(n+u,o+f)&&(i+=1);i>5&&(e+=3+i-5)}
+// LEVEL2
+for(n=0;n<r-1;n+=1)for(o=0;o<r-1;o+=1){var c=0;t.isDark(n,o)&&(c+=1),t.isDark(n+1,o)&&(c+=1),t.isDark(n,o+1)&&(c+=1),t.isDark(n+1,o+1)&&(c+=1),0!=c&&4!=c||(e+=3)}
+// LEVEL3
+for(n=0;n<r;n+=1)for(o=0;o<r-6;o+=1)t.isDark(n,o)&&!t.isDark(n,o+1)&&t.isDark(n,o+2)&&t.isDark(n,o+3)&&t.isDark(n,o+4)&&!t.isDark(n,o+5)&&t.isDark(n,o+6)&&(e+=40);for(o=0;o<r;o+=1)for(n=0;n<r-6;n+=1)t.isDark(n,o)&&!t.isDark(n+1,o)&&t.isDark(n+2,o)&&t.isDark(n+3,o)&&t.isDark(n+4,o)&&!t.isDark(n+5,o)&&t.isDark(n+6,o)&&(e+=40);
+// LEVEL4
+var g=0;for(o=0;o<r;o+=1)for(n=0;n<r;n+=1)t.isDark(n,o)&&(g+=1);return e+=Math.abs(100*g/r/r-50)/5*10},o),C=function(){
+// initialize tables
+for(var t=new Array(256),r=new Array(256),e=0;e<8;e+=1)t[e]=1<<e;for(e=8;e<256;e+=1)t[e]=t[e-4]^t[e-5]^t[e-6]^t[e-8];for(e=0;e<255;e+=1)r[t[e]]=e;var n={glog:function(t){if(t<1)throw"glog("+t+")";return r[t]},gexp:function(r){for(;r<0;)r+=255;for(;r>=256;)r-=255;return t[r]}};return n}();
+//---------------------------------------------------------------------
+// QRErrorCorrectionLevel
+//---------------------------------------------------------------------
+//---------------------------------------------------------------------
+// qrPolynomial
+//---------------------------------------------------------------------
+function k(t,r){if(void 0===t.length)throw t.length+"/"+r;var e=function(){for(var e=0;e<t.length&&0==t[e];)e+=1;for(var n=new Array(t.length-e+r),o=0;o<t.length-e;o+=1)n[o]=t[o+e];return n}(),n={getAt:function(t){return e[t]},getLength:function(){return e.length},multiply:function(t){for(var r=new Array(n.getLength()+t.getLength()-1),e=0;e<n.getLength();e+=1)for(var o=0;o<t.getLength();o+=1)r[e+o]^=C.gexp(C.glog(n.getAt(e))+C.glog(t.getAt(o)));return k(r,0)},mod:function(t){if(n.getLength()-t.getLength()<0)return n;for(var r=C.glog(n.getAt(0))-C.glog(t.getAt(0)),e=new Array(n.getLength()),o=0;o<n.getLength();o+=1)e[o]=n.getAt(o);for(o=0;o<t.getLength();o+=1)e[o]^=C.gexp(C.glog(t.getAt(o))+r);
+// recursive call
+return k(e,0).mod(t)}};return n}
+//---------------------------------------------------------------------
+// QRRSBlock
+//---------------------------------------------------------------------
+var A=function(){var t=[
+// L
+// M
+// Q
+// H
+// 1
+[1,26,19],[1,26,16],[1,26,13],[1,26,9],
+// 2
+[1,44,34],[1,44,28],[1,44,22],[1,44,16],
+// 3
+[1,70,55],[1,70,44],[2,35,17],[2,35,13],
+// 4
+[1,100,80],[2,50,32],[2,50,24],[4,25,9],
+// 5
+[1,134,108],[2,67,43],[2,33,15,2,34,16],[2,33,11,2,34,12],
+// 6
+[2,86,68],[4,43,27],[4,43,19],[4,43,15],
+// 7
+[2,98,78],[4,49,31],[2,32,14,4,33,15],[4,39,13,1,40,14],
+// 8
+[2,121,97],[2,60,38,2,61,39],[4,40,18,2,41,19],[4,40,14,2,41,15],
+// 9
+[2,146,116],[3,58,36,2,59,37],[4,36,16,4,37,17],[4,36,12,4,37,13],
+// 10
+[2,86,68,2,87,69],[4,69,43,1,70,44],[6,43,19,2,44,20],[6,43,15,2,44,16],
+// 11
+[4,101,81],[1,80,50,4,81,51],[4,50,22,4,51,23],[3,36,12,8,37,13],
+// 12
+[2,116,92,2,117,93],[6,58,36,2,59,37],[4,46,20,6,47,21],[7,42,14,4,43,15],
+// 13
+[4,133,107],[8,59,37,1,60,38],[8,44,20,4,45,21],[12,33,11,4,34,12],
+// 14
+[3,145,115,1,146,116],[4,64,40,5,65,41],[11,36,16,5,37,17],[11,36,12,5,37,13],
+// 15
+[5,109,87,1,110,88],[5,65,41,5,66,42],[5,54,24,7,55,25],[11,36,12,7,37,13],
+// 16
+[5,122,98,1,123,99],[7,73,45,3,74,46],[15,43,19,2,44,20],[3,45,15,13,46,16],
+// 17
+[1,135,107,5,136,108],[10,74,46,1,75,47],[1,50,22,15,51,23],[2,42,14,17,43,15],
+// 18
+[5,150,120,1,151,121],[9,69,43,4,70,44],[17,50,22,1,51,23],[2,42,14,19,43,15],
+// 19
+[3,141,113,4,142,114],[3,70,44,11,71,45],[17,47,21,4,48,22],[9,39,13,16,40,14],
+// 20
+[3,135,107,5,136,108],[3,67,41,13,68,42],[15,54,24,5,55,25],[15,43,15,10,44,16],
+// 21
+[4,144,116,4,145,117],[17,68,42],[17,50,22,6,51,23],[19,46,16,6,47,17],
+// 22
+[2,139,111,7,140,112],[17,74,46],[7,54,24,16,55,25],[34,37,13],
+// 23
+[4,151,121,5,152,122],[4,75,47,14,76,48],[11,54,24,14,55,25],[16,45,15,14,46,16],
+// 24
+[6,147,117,4,148,118],[6,73,45,14,74,46],[11,54,24,16,55,25],[30,46,16,2,47,17],
+// 25
+[8,132,106,4,133,107],[8,75,47,13,76,48],[7,54,24,22,55,25],[22,45,15,13,46,16],
+// 26
+[10,142,114,2,143,115],[19,74,46,4,75,47],[28,50,22,6,51,23],[33,46,16,4,47,17],
+// 27
+[8,152,122,4,153,123],[22,73,45,3,74,46],[8,53,23,26,54,24],[12,45,15,28,46,16],
+// 28
+[3,147,117,10,148,118],[3,73,45,23,74,46],[4,54,24,31,55,25],[11,45,15,31,46,16],
+// 29
+[7,146,116,7,147,117],[21,73,45,7,74,46],[1,53,23,37,54,24],[19,45,15,26,46,16],
+// 30
+[5,145,115,10,146,116],[19,75,47,10,76,48],[15,54,24,25,55,25],[23,45,15,25,46,16],
+// 31
+[13,145,115,3,146,116],[2,74,46,29,75,47],[42,54,24,1,55,25],[23,45,15,28,46,16],
+// 32
+[17,145,115],[10,74,46,23,75,47],[10,54,24,35,55,25],[19,45,15,35,46,16],
+// 33
+[17,145,115,1,146,116],[14,74,46,21,75,47],[29,54,24,19,55,25],[11,45,15,46,46,16],
+// 34
+[13,145,115,6,146,116],[14,74,46,23,75,47],[44,54,24,7,55,25],[59,46,16,1,47,17],
+// 35
+[12,151,121,7,152,122],[12,75,47,26,76,48],[39,54,24,14,55,25],[22,45,15,41,46,16],
+// 36
+[6,151,121,14,152,122],[6,75,47,34,76,48],[46,54,24,10,55,25],[2,45,15,64,46,16],
+// 37
+[17,152,122,4,153,123],[29,74,46,14,75,47],[49,54,24,10,55,25],[24,45,15,46,46,16],
+// 38
+[4,152,122,18,153,123],[13,74,46,32,75,47],[48,54,24,14,55,25],[42,45,15,32,46,16],
+// 39
+[20,147,117,4,148,118],[40,75,47,7,76,48],[43,54,24,22,55,25],[10,45,15,67,46,16],
+// 40
+[19,148,118,6,149,119],[18,75,47,31,76,48],[34,54,24,34,55,25],[20,45,15,61,46,16]],r=function(t,r){var e={};return e.totalCount=t,e.dataCount=r,e},e={};return e.getRSBlocks=function(e,n){var o=function(r,e){switch(e){case g.L:return t[4*(r-1)+0];case g.M:return t[4*(r-1)+1];case g.Q:return t[4*(r-1)+2];case g.H:return t[4*(r-1)+3];default:return}}(e,n);if(void 0===o)throw"bad rs block @ typeNumber:"+e+"/errorCorrectionLevel:"+n;for(var i=o.length/3,a=[],u=0;u<i;u+=1)for(var f=o[3*u+0],c=o[3*u+1],l=o[3*u+2],h=0;h<f;h+=1)a.push(r(c,l));return a},e}(),b=function(){var t=[],r=0,e={getBuffer:function(){return t},getAt:function(r){var e=Math.floor(r/8);return 1==(t[e]>>>7-r%8&1)},put:function(t,r){for(var n=0;n<r;n+=1)e.putBit(1==(t>>>r-n-1&1))},getLengthInBits:function(){return r},putBit:function(e){var n=Math.floor(r/8);t.length<=n&&t.push(0),e&&(t[n]|=128>>>r%8),r+=1}};return e},M=function(t){var r=a,e=t,n={getMode:function(){return r},getLength:function(t){return e.length},write:function(t){for(var r=e,n=0;n+2<r.length;)t.put(o(r.substring(n,n+3)),10),n+=3;n<r.length&&(r.length-n==1?t.put(o(r.substring(n,n+1)),4):r.length-n==2&&t.put(o(r.substring(n,n+2)),7))}},o=function(t){for(var r=0,e=0;e<t.length;e+=1)r=10*r+i(t.charAt(e));return r},i=function(t){if("0"<=t&&t<="9")return t.charCodeAt(0)-"0".charCodeAt(0);throw"illegal char :"+t};return n},x=function(t){var r=u,e=t,n={getMode:function(){return r},getLength:function(t){return e.length},write:function(t){for(var r=e,n=0;n+1<r.length;)t.put(45*o(r.charAt(n))+o(r.charAt(n+1)),11),n+=2;n<r.length&&t.put(o(r.charAt(n)),6)}},o=function(t){if("0"<=t&&t<="9")return t.charCodeAt(0)-"0".charCodeAt(0);if("A"<=t&&t<="Z")return t.charCodeAt(0)-"A".charCodeAt(0)+10;switch(t){case" ":return 36;case"$":return 37;case"%":return 38;case"*":return 39;case"+":return 40;case"-":return 41;case".":return 42;case"/":return 43;case":":return 44;default:throw"illegal char :"+t}};return n},m=function(r){var e=f,n=t.stringToBytes(r),o={getMode:function(){return e},getLength:function(t){return n.length},write:function(t){for(var r=0;r<n.length;r+=1)t.put(n[r],8)}};return o},L=function(r){var e=c,n=t.stringToBytesFuncs.SJIS;if(!n)throw"sjis not supported.";!function(){
+// self test for sjis support.
+var t=n("友");if(2!=t.length||38726!=(t[0]<<8|t[1]))throw"sjis not supported."}();var o=n(r),i={getMode:function(){return e},getLength:function(t){return~~(o.length/2)},write:function(t){for(var r=o,e=0;e+1<r.length;){var n=(255&r[e])<<8|255&r[e+1];if(33088<=n&&n<=40956)n-=33088;else{if(!(57408<=n&&n<=60351))throw"illegal char at "+(e+1)+"/"+n;n-=49472}n=192*(n>>>8&255)+(255&n),t.put(n,13),e+=2}if(e<r.length)throw"illegal char at "+(e+1)}};return i},D=function(){var t=[],r={writeByte:function(r){t.push(255&r)},writeShort:function(t){r.writeByte(t),r.writeByte(t>>>8)},writeBytes:function(t,e,n){e=e||0,n=n||t.length;for(var o=0;o<n;o+=1)r.writeByte(t[o+e])},writeString:function(t){for(var e=0;e<t.length;e+=1)r.writeByte(t.charCodeAt(e))},toByteArray:function(){return t},toString:function(){var r="";r+="[";for(var e=0;e<t.length;e+=1)e>0&&(r+=","),r+=t[e];return r+="]"}};return r},S=function(t){var r=t,e=0,n=0,o=0,i={read:function(){for(;o<8;){if(e>=r.length){if(0==o)return-1;throw"unexpected end of file./"+o}var t=r.charAt(e);if(e+=1,"="==t)return o=0,-1;t.match(/^\s$/)||(n=n<<6|a(t.charCodeAt(0)),o+=6)}var i=n>>>o-8&255;return o-=8,i}},a=function(t){if(65<=t&&t<=90)return t-65;if(97<=t&&t<=122)return t-97+26;if(48<=t&&t<=57)return t-48+52;if(43==t)return 62;if(47==t)return 63;throw"c:"+t};return i},I=function(t,r,e){for(var n=function(t,r){var e=t,n=r,o=new Array(t*r),i={setPixel:function(t,r,n){o[r*e+t]=n},write:function(t){
+//---------------------------------
+// GIF Signature
+t.writeString("GIF87a"),
+//---------------------------------
+// Screen Descriptor
+t.writeShort(e),t.writeShort(n),t.writeByte(128),// 2bit
+t.writeByte(0),t.writeByte(0),
+//---------------------------------
+// Global Color Map
+// black
+t.writeByte(0),t.writeByte(0),t.writeByte(0),
+// white
+t.writeByte(255),t.writeByte(255),t.writeByte(255),
+//---------------------------------
+// Image Descriptor
+t.writeString(","),t.writeShort(0),t.writeShort(0),t.writeShort(e),t.writeShort(n),t.writeByte(0);
+//---------------------------------
+// Local Color Map
+//---------------------------------
+// Raster Data
+var r=a(2);t.writeByte(2);for(var o=0;r.length-o>255;)t.writeByte(255),t.writeBytes(r,o,255),o+=255;t.writeByte(r.length-o),t.writeBytes(r,o,r.length-o),t.writeByte(0),
+//---------------------------------
+// GIF Terminator
+t.writeString(";")}},a=function(t){for(var r=1<<t,e=1+(1<<t),n=t+1,i=u(),a=0;a<r;a+=1)i.add(String.fromCharCode(a));i.add(String.fromCharCode(r)),i.add(String.fromCharCode(e));var f,c,g,l=D(),h=(f=l,c=0,g=0,{write:function(t,r){if(t>>>r!=0)throw"length over";for(;c+r>=8;)f.writeByte(255&(t<<c|g)),r-=8-c,t>>>=8-c,g=0,c=0;g|=t<<c,c+=r},flush:function(){c>0&&f.writeByte(g)}});
+// clear code
+h.write(r,n);var s=0,v=String.fromCharCode(o[s]);for(s+=1;s<o.length;){var d=String.fromCharCode(o[s]);s+=1,i.contains(v+d)?v+=d:(h.write(i.indexOf(v),n),i.size()<4095&&(i.size()==1<<n&&(n+=1),i.add(v+d)),v=d)}return h.write(i.indexOf(v),n),
+// end code
+h.write(e,n),h.flush(),l.toByteArray()},u=function(){var t={},r=0,e={add:function(n){if(e.contains(n))throw"dup key:"+n;t[n]=r,r+=1},size:function(){return r},indexOf:function(r){return t[r]},contains:function(r){return void 0!==t[r]}};return e};return i}(t,r),o=0;o<r;o+=1)for(var i=0;i<t;i+=1)n.setPixel(i,o,e(i,o));var a=D();n.write(a);for(var u=function(){var t=0,r=0,e=0,n="",o={},i=function(t){n+=String.fromCharCode(a(63&t))},a=function(t){if(t<0);else{if(t<26)return 65+t;if(t<52)return t-26+97;if(t<62)return t-52+48;if(62==t)return 43;if(63==t)return 47}throw"n:"+t};return o.writeByte=function(n){for(t=t<<8|255&n,r+=8,e+=1;r>=6;)i(t>>>r-6),r-=6},o.flush=function(){if(r>0&&(i(t<<6-r),t=0,r=0),e%3!=0)for(
+// padding
+var o=3-e%3,a=0;a<o;a+=1)n+="="},o.toString=function(){return n},o}(),f=a.toByteArray(),c=0;c<f.length;c+=1)u.writeByte(f[c]);return u.flush(),"data:image/gif;base64,"+u};
+//---------------------------------------------------------------------
+// qrBitBuffer
+//---------------------------------------------------------------------
+//---------------------------------------------------------------------
+// returns qrcode function.
+return t}();
+// multibyte support
+qrcode.stringToBytesFuncs["UTF-8"]=function(t){
+// http://stackoverflow.com/questions/18729405/how-to-convert-utf8-string-to-byte-array
+return function(t){for(var r=[],e=0;e<t.length;e++){var n=t.charCodeAt(e);n<128?r.push(n):n<2048?r.push(192|n>>6,128|63&n):n<55296||n>=57344?r.push(224|n>>12,128|n>>6&63,128|63&n):(e++,
+// UTF-16 encodes 0x10000-0x10FFFF by
+// subtracting 0x10000 and splitting the
+// 20 bits of 0x0-0xFFFFF into two halves
+n=65536+((1023&n)<<10|1023&t.charCodeAt(e)),r.push(240|n>>18,128|n>>12&63,128|n>>6&63,128|63&n))}return r}(t)},function(t){"function"==typeof define&&define.amd?define([],t):"object"==typeof exports&&(module.exports=t())}(function(){return qrcode});</script>
+<script>
+(function () {
+  "use strict";
+  var D = {};
+  try { D = JSON.parse(document.getElementById("sub-data").textContent) || {}; } catch (e) {}
+  var $ = function (id) { return document.getElementById(id); };
+  var fa = function (n, d) { return Number(n).toLocaleString("fa-IR", { maximumFractionDigits: d == null ? 0 : d }); };
+
+  function size(b) {
+    b = Number(b) || 0;
+    var u = ["بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"], i = 0;
+    while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+    return fa(b, b >= 100 || i === 0 ? 0 : b >= 10 ? 1 : 2) + " " + u[i];
+  }
+  function ago(ms) {
+    var s = Math.max(0, (Date.now() - ms) / 1000);
+    if (s < 90) return "همین الان";
+    if (s < 3600) return fa(Math.round(s / 60)) + " دقیقه پیش";
+    if (s < 86400) return fa(Math.round(s / 3600)) + " ساعت پیش";
+    return fa(Math.round(s / 86400)) + " روز پیش";
+  }
+  function jdate(ms) {
+    try {
+      return new Date(ms).toLocaleDateString("fa-IR-u-ca-persian", { year: "numeric", month: "long", day: "numeric" });
+    } catch (e) { return new Date(ms).toLocaleDateString("fa-IR"); }
+  }
+  var toastT;
+  function toast(t) {
+    var el = $("toast"); el.textContent = t; el.classList.add("show");
+    clearTimeout(toastT); toastT = setTimeout(function () { el.classList.remove("show"); }, 1800);
+  }
+  function copy(text) {
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); toast("کپی شد"); } catch (e) { toast("کپی نشد؛ دستی انتخاب کنید"); }
+      document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { toast("کپی شد"); }, fallback);
+    } else fallback();
+  }
+
+  var qrText = "";
+  function showQR(text, title) {
+    qrText = text;
+    $("qr-title").textContent = title;
+    var box = $("qr");
+    box.innerHTML = "";
+    try {
+      var q = qrcode(0, text.length > 1200 ? "L" : "M");
+      q.addData(text, "Byte"); q.make();
+      box.innerHTML = q.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+    } catch (e) {
+      box.innerHTML = '<div style="color:#333;padding:20px 8px">این متن برای QR بیش از حد طولانی است؛ از دکمه‌ی کپی استفاده کنید.</div>';
+    }
+    $("modal").classList.add("show");
+  }
+  $("qr-close").onclick = function () { $("modal").classList.remove("show"); };
+  $("modal").onclick = function (e) { if (e.target === this) this.classList.remove("show"); };
+  $("qr-copy").onclick = function () { copy(qrText); };
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") $("modal").classList.remove("show"); });
+
+  // --- status: usage, time, stamp (re-run on every poll) ---
+  function render(d) {
+    var up = Number(d.uploadByte) || 0, down = Number(d.downloadByte) || 0, total = Number(d.totalByte) || 0, used = up + down;
+    var now = Date.now(), exp = Number(d.expire) || 0;
+    var expired = exp > 0 && exp * 1000 <= now;
+    var depleted = total > 0 && used >= total;
+    var off = d.enabled === false;
+
+    $("title").textContent = d.subTitle || "اشتراک شما";
+    var on = $("online");
+    on.classList.toggle("on", !!d.isOnline);
+    on.lastChild.textContent = d.isOnline ? "آنلاین" : (d.lastOnline > 0 ? "آخرین اتصال " + ago(d.lastOnline) : "هنوز وصل نشده");
+
+    $("used-line").textContent = size(used) + (total ? " از " + size(total) : "");
+    $("total").textContent = total ? size(total) : "نامحدود";
+    $("remain").textContent = total ? size(Math.max(0, total - used)) : "نامحدود";
+    $("down").textContent = size(down);
+    $("up").textContent = size(up);
+    var pct = total ? Math.min(100, used * 100 / total) : 0;
+    var bar = $("used-bar");
+    bar.style.width = (total ? pct : 0) + "%";
+    bar.className = pct >= 90 ? "bad" : pct >= 75 ? "warn" : "";
+    $("used-pct").textContent = total ? fa(pct, pct < 10 ? 1 : 0) + "٪ مصرف شده" : "";
+
+    var eb = $("exp-bar");
+    $("exp-barbox").hidden = true;
+    if (exp > 0) {
+      var left = exp * 1000 - now, days = left / 86400000;
+      $("exp-date").textContent = "تا " + jdate(exp * 1000);
+      if (expired) $("exp-line").textContent = "پایان یافته (" + ago(exp * 1000) + ")";
+      else if (days >= 1) $("exp-line").textContent = fa(Math.floor(days)) + " روز باقی مانده";
+      else $("exp-line").textContent = fa(Math.max(1, Math.floor(left / 3600000))) + " ساعت باقی مانده";
+      $("exp-barbox").hidden = false;
+      var dpct = Math.max(0, Math.min(100, days * 100 / 30));
+      eb.style.width = (expired ? 100 : dpct) + "%";
+      eb.className = expired || days < 3 ? "bad" : days < 7 ? "warn" : "";
+    } else if (exp < 0) {
+      $("exp-line").textContent = fa(Math.round(-exp / 86400)) + " روز، از اولین اتصال";
+      $("exp-date").textContent = "هنوز شروع نشده";
+    } else {
+      $("exp-line").textContent = "بدون محدودیت زمانی";
+      $("exp-date").textContent = "";
+    }
+
+    // the stamp: expired, out of data, both, or switched off by the admin
+    var word = expired && depleted ? "منقضی شده" : expired ? "منقضی شده" : depleted ? "حجم تمام شده" : off ? "غیرفعال" : "";
+    var sub = expired && depleted ? "و حجم هم تمام شده" : expired ? "زمان اشتراک به پایان رسیده" : depleted ? "حجم اشتراک مصرف شده" : off ? "این اشتراک غیرفعال شده" : "";
+    $("stamp-text").textContent = word;
+    $("stamp-sub").textContent = sub;
+    $("stamp").classList.toggle("show", !!word);
+    document.body.classList.toggle("dead", !!word);
+    $("alert").hidden = !word;
+    if (word) {
+      $("alert-title").textContent = word === "غیرفعال" ? "این اشتراک غیرفعال است" : "اشتراک شما " + word;
+      $("alert-text").textContent = "برای تمدید یا خرید حجم، با پشتیبانی تماس بگیرید. پس از تمدید، همین لینک دوباره کار می‌کند و نیاز به تغییر آن نیست.";
+    }
+    var sup = $("alert-support");
+    sup.hidden = !(word && d.subSupportUrl);
+    if (d.subSupportUrl) sup.firstChild.href = d.subSupportUrl;
+
+    var ann = $("announce");
+    ann.hidden = !d.announce;
+    ann.textContent = d.announce || "";
+  }
+
+  // --- the parts that do not change while the page is open ---
+  var subUrl = D.subUrl || location.href.split(/[?#]/)[0];
+  $("sub-url").textContent = subUrl;
+  $("copy-sub").onclick = function () { copy(subUrl); };
+  $("qr-sub").onclick = function () { showQR(subUrl, "لینک اشتراک"); };
+  if (D.subUpdates > 0) $("upd").textContent = " (هر " + fa(D.subUpdates) + " ساعت)";
+
+  var enc = encodeURIComponent(subUrl), name = encodeURIComponent(D.subTitle || D.sId || "sub");
+  var rocket = subUrl + (subUrl.indexOf("?") < 0 ? "?" : "&") + "flag=shadowrocket";
+  var A = {
+    hiddify: { n: "Hiddify", u: "hiddify://import/" + subUrl + "#" + name },
+    v2box: { n: "V2Box", u: "v2box://install-sub?url=" + enc + "&name=" + name },
+    v2raytun: { n: "V2RayTun", u: "v2raytun://import/" + subUrl },
+    happ: { n: "Happ", u: "happ://add/" + subUrl },
+    singbox: { n: "sing-box", u: "sing-box://import-remote-profile?url=" + enc + "#" + name },
+    v2rayng: { n: "v2rayNG", u: "v2rayng://install-config?url=" + enc },
+    streisand: { n: "Streisand", u: "streisand://import/" + enc },
+    rocket: { n: "Shadowrocket", u: (function () { try { return "shadowrocket://add/sub://" + btoa(rocket) + "?remark=" + name; } catch (e) { return ""; } })() }
+  };
+  var OS = [
+    { k: "android", n: "اندروید", a: ["v2rayng", "hiddify", "v2box", "v2raytun", "happ", "singbox"] },
+    { k: "ios", n: "آیفون", a: ["streisand", "v2box", "hiddify", "rocket", "v2raytun", "happ"] },
+    { k: "desktop", n: "ویندوز / مک", a: ["hiddify", "v2raytun", "happ", "singbox"] }
+  ];
+  var ua = navigator.userAgent || "";
+  var cur = /iPhone|iPad|iPod|Macintosh.*Mobile/i.test(ua) ? "ios" : /Android/i.test(ua) ? "android" : /Windows|Macintosh|Linux/i.test(ua) ? "desktop" : "android";
+  function drawApps() {
+    $("os-tabs").innerHTML = "";
+    OS.forEach(function (o) {
+      var b = document.createElement("button");
+      b.className = "tab" + (o.k === cur ? " on" : "");
+      b.textContent = o.n;
+      b.onclick = function () { cur = o.k; drawApps(); };
+      $("os-tabs").appendChild(b);
+    });
+    var box = $("apps");
+    box.innerHTML = "";
+    OS.filter(function (o) { return o.k === cur; })[0].a.forEach(function (k) {
+      if (!A[k].u) return;
+      var a = document.createElement("a");
+      a.className = "btn"; a.href = A[k].u; a.textContent = A[k].n; a.rel = "noopener";
+      box.appendChild(a);
+    });
+  }
+  drawApps();
+
+  var links = D.links || [];
+  $("cfg-n").textContent = links.length ? "(" + fa(links.length) + ")" : "";
+  $("cfg-card").hidden = !links.length;
+  links.forEach(function (l, i) {
+    var label = "";
+    var h = l.indexOf("#");
+    if (h >= 0) { try { label = decodeURIComponent(l.slice(h + 1)); } catch (e) { label = l.slice(h + 1); } }
+    var proto = (l.match(/^([a-z0-9]+):\/\//i) || [])[1] || "";
+    if (!label && proto === "vmess") {
+      try { label = JSON.parse(atob(l.slice(8))).ps || ""; } catch (e) {}
+    }
+    label = label || ("کانفیگ " + fa(i + 1));
+    var row = document.createElement("div");
+    row.className = "cfg";
+    var nm = document.createElement("div");
+    nm.className = "name";
+    nm.textContent = label;
+    if (proto) { var p = document.createElement("span"); p.className = "proto"; p.textContent = proto; nm.appendChild(p); }
+    var bt = document.createElement("div");
+    bt.className = "btns";
+    var c = document.createElement("button"); c.className = "btn"; c.textContent = "کپی"; c.onclick = function () { copy(l); };
+    var q = document.createElement("button"); q.className = "btn"; q.textContent = "QR"; q.onclick = function () { showQR(l, label); };
+    bt.appendChild(c); bt.appendChild(q);
+    row.appendChild(nm); row.appendChild(bt);
+    $("cfgs").appendChild(row);
+  });
+
+  render(D);
+  $("foot").textContent = "به‌روزرسانی: " + new Date().toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit" });
+
+  // keep the numbers fresh while the page stays open
+  var infoUrl = location.pathname + (location.search ? location.search + "&" : "?") + "format=info";
+  setInterval(function () {
+    if (document.hidden) return;
+    fetch(infoUrl, { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+      if (!d) return;
+      render(d);
+      $("foot").textContent = "به‌روزرسانی: " + new Date().toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit" });
+    }).catch(function () {});
+  }, 30000);
+})();
+</script>
+</body>
+</html>

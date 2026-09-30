@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""xui-subpage - a Persian subscription page, without touching the panel's own language.
+
+    xui-subpage status [--json]   which page the users see, and whether it renders
+    xui-subpage on [--src FILE]   serve the Persian page (right-to-left, Jalali dates, QR codes,
+                                  one-tap import into the common apps, and a red stamp across a
+                                  subscription that has expired or run out of data)
+    xui-subpage off               back to 3x-ui's own page
+
+3x-ui renders the page from "Sub Theme Directory" (Settings -> Subscription) when it is set:
+a Go html/template file, index.html, given the same data as its own page. The panel's
+language is a cookie of the browser that opens the panel, the subscription page's is another
+one (subLang), and a theme replaces the page altogether - so this changes nothing an admin
+sees. The setting is read on every request and the file is re-read when it changes: no
+restart. `on` checks a real subscription renders with the new page and puts the old setting
+back if it does not.
+"""
+import json, os, shutil, sqlite3, ssl, sys, urllib.request
+
+DB = "/etc/x-ui/x-ui.db"
+HOME = "/opt/xui-optimizer"
+SRC = HOME + "/subpage/index.html"
+DIR = "/usr/local/share/xui-optimizer/subpage"
+MARK = 'id="sub-data"'
+
+
+def setting(c, key, default=""):
+    r = c.execute("select value from settings where key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+
+def put(c, key, value):
+    if c.execute("update settings set value=? where key=?", (value, key)).rowcount == 0:
+        c.execute("insert into settings (key, value) values (?, ?)", (key, value))
+    c.commit()
+
+
+def probe(c):
+    """Fetch one real subscription as a browser would, from the hub itself."""
+    if setting(c, "subEnable", "true") != "true":
+        return None, "subscription is off in the panel"
+    row = c.execute("select c.sub_id from clients c join client_traffics t on t.email = c.email "
+                    "where c.sub_id != '' order by t.enable desc limit 1").fetchone()
+    if not row:
+        return None, "no client has a subscription id to test with"
+    tls = bool(setting(c, "subCertFile") and setting(c, "subKeyFile"))
+    path = "/" + setting(c, "subPath", "/sub/").strip("/") + "/"
+    url = "%s://127.0.0.1:%s%s%s" % ("https" if tls else "http", setting(c, "subPort", "2096"), path, row[0])
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE        # the name is the domain, not 127.0.0.1
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "text/html", "User-Agent": "xui-subpage"})
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+            return r.read().decode("utf-8", "replace"), ""
+    except Exception as e:
+        return None, str(e)
+
+
+def status(as_json=False):
+    c = sqlite3.connect(DB)
+    cur = setting(c, "subThemeDir")
+    ours = os.path.realpath(cur or "/nonexistent") == os.path.realpath(DIR)
+    body, err = probe(c)
+    st = {"theme_dir": cur, "ours": ours, "installed": os.path.isfile(DIR + "/index.html"),
+          "serving": "persian" if body and MARK in body else ("default" if body else "unknown"),
+          "error": err}
+    if as_json:
+        print(json.dumps(st))
+    else:
+        print("theme dir : %s" % (cur or "(empty - 3x-ui's own page)"))
+        print("serving   : %s%s" % (st["serving"], " (%s)" % err if err else ""))
+    return 0
+
+
+def on(src):
+    if not os.path.isfile(src):
+        sys.exit("no template at %s - run the installer, or pass --src" % src)
+    c = sqlite3.connect(DB)
+    before = setting(c, "subThemeDir")
+    os.makedirs(DIR, exist_ok=True)
+    shutil.copyfile(src, DIR + "/index.html.new")
+    os.chmod(DIR + "/index.html.new", 0o644)
+    os.replace(DIR + "/index.html.new", DIR + "/index.html")
+    put(c, "subThemeDir", DIR)
+    body, err = probe(c)
+    if body is not None and MARK not in body:
+        put(c, "subThemeDir", before)
+        sys.exit("the panel did not render the template (see `journalctl -u x-ui | grep sub:`) - "
+                 "setting put back to %r" % before)
+    print("Persian subscription page on%s" % (" (not verified: %s)" % err if body is None else ""))
+    return 0
+
+
+def off():
+    c = sqlite3.connect(DB)
+    put(c, "subThemeDir", "")
+    print("3x-ui's own subscription page is back")
+    return 0
+
+
+def main(a):
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if a[0] == "status":
+        return status("--json" in a)
+    if a[0] == "on":
+        return on(a[a.index("--src") + 1] if "--src" in a else SRC)
+    if a[0] == "off":
+        return off()
+    sys.exit("unknown command: %s (status | on | off)" % a[0])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

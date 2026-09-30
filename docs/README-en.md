@@ -22,6 +22,7 @@ The numbers below were measured on a production hub with about 140 users and two
 | `tools/mux-bench` | hub | measures whether mux pays off on your link |
 | `tools/xui-fix-inbound-lists` | hub (3.x) | repairs "inbound N: empty client ID" when a client is linked to an inbound the inbound does not list |
 | `tools/xui-probe-client` | hub (3.x) | connects with one user's own config and measures it, to answer "is it me or them?" |
+| `tools/xui-subpage` | hub (3.x) | Persian subscription page with an "expired / out of data" stamp; the panel's language is untouched |
 | `migrate/` | hub | 2.x -> 3.x upgrade, and folding old duplicate-client tricks into real multi-inbound clients |
 | `dash/` | hub | "Optimizer" page in the panel's sidebar: live traffic, users, a full check-up, a panel linter and every switch above |
 
@@ -397,6 +398,21 @@ remove buttons, a scan button, a field for typing an address, and the last moves
   certificates the panel, the subscription and nginx use and how each renews.
 - The page's check-up also opens a real subscription link as a browser (3x-ui 3.3+ serves a
   page: usage ring, quota, one-tap import, RTL) and as an app, and checks its certificate.
+
+## xui-subpage - a Persian subscription page
+
+3x-ui keeps the subscription page's language apart from the panel's (a `subLang` cookie in the
+user's browser) and defaults it to the phone's language, so an English phone gets English. It can
+also render the page from a template instead (Settings -> Subscription -> Sub Theme Directory).
+`xui-subpage on` installs this project's `subpage/index.html` there and switches it on: RTL,
+Jalali dates, Persian digits, dark mode, no external fonts or scripts; usage, days left, online
+state refreshed every 30 s; copy and QR for the subscription link and every config; one-tap
+import into v2rayNG, Hiddify, V2Box, Streisand and others; the panel's Title and Announce. A
+subscription that has **expired** or **run out of data** (or was disabled) gets a red stamp across
+the page and a note to contact support (with a button when Support URL is set). `on` renders a real
+subscription through the panel and restores the previous setting if the template is not served;
+`off` returns 3x-ui's own page; `status` says which one is served. No restart: the setting is read
+on every request, and re-running `install.sh` refreshes an installed template.
 
 ## config-guard - the routing comes back by itself
 

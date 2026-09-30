@@ -27,7 +27,7 @@ DEST=/usr/local/sbin
 TOOLS="xui-optimizer split/xui-split abroad/abroad-tune
        guard/tunnel-guard guard/config-guard guard/xui-path guard/xui-tunnel guard/awg-hop guard/awg-port
        tools/mux-bench tools/xui-fix-inbound-lists tools/xui-probe-client tools/path-score
-       tools/xui-reach tools/xui-geo tools/xui-cert"
+       tools/xui-reach tools/xui-geo tools/xui-cert tools/xui-subpage"
 UNITS="guard/tunnel-guard.service guard/tunnel-guard.timer
        guard/config-guard.service guard/config-guard.path guard/config-guard.timer
        guard/xui-tunnel.service guard/xui-tunnel.timer
@@ -55,6 +55,8 @@ done
 # --------------------------------------------------------------------- حذف
 if [ -n "$UNINSTALL" ]; then
   inf "خاموش کردن تایمرها و سرویس‌ها"
+  [ -f /usr/local/share/xui-optimizer/subpage/index.html ] && { "$DEST/xui-subpage" off || true; }
+  rm -rf /usr/local/share/xui-optimizer
   for t in $TIMERS xo-dash.service; do systemctl disable --now "$t" 2>/dev/null || true; done
   for f in $TOOLS; do rm -f "$DEST/$(basename "$f")"; done
   for u in $UNITS; do rm -f "/etc/systemd/system/$(basename "$u")"; done
@@ -114,6 +116,12 @@ ok "ابزارها در $DEST نصب شدند: $(for f in $TOOLS; do printf '%s 
 for t in $TIMERS; do
   systemctl is-enabled -q "$t" 2>/dev/null && systemctl restart "$t" && inf "$t با نسخه‌ی جدید ادامه می‌دهد"
 done
+
+# صفحه‌ی فارسی اشتراک (xui-subpage on): اگر روشن است، قالب هم به‌روز شود
+if [ -f /usr/local/share/xui-optimizer/subpage/index.html ]; then
+  install -m 644 "$SRC/subpage/index.html" /usr/local/share/xui-optimizer/subpage/index.html
+  ok "صفحه‌ی فارسی اشتراک به‌روز شد"
+fi
 
 # --------------------------------------------------------------------- ۳. صفحه‌ی Optimizer
 if [ -n "$DASH_PORT" ]; then
