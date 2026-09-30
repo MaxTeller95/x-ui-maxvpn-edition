@@ -1,27 +1,103 @@
 #!/usr/bin/env python3
-"""xui-subpage - a Persian subscription page, without touching the panel's own language.
+"""xui-subpage - 3x-ui's own subscription page, in Persian, with a stamp on dead subscriptions.
 
-    xui-subpage status [--json]   which page the users see, and whether it renders
-    xui-subpage on [--src FILE]   serve the Persian page (right-to-left, Jalali dates, QR codes,
-                                  one-tap import into the common apps, and a red stamp across a
-                                  subscription that has expired or run out of data)
-    xui-subpage off               back to 3x-ui's own page
+    xui-subpage status [--json]   which page the users see, and whether it is current
+    xui-subpage on                serve the panel's page in Persian (Jalali dates), with a red
+                                  stamp across a subscription that has expired, run out of data
+                                  or been disabled
+    xui-subpage refresh           rebuild after a panel update (xui-subpage.path runs it when
+                                  the x-ui binary changes); does nothing while off
+    xui-subpage off               back to the untouched page
 
-3x-ui renders the page from "Sub Theme Directory" (Settings -> Subscription) when it is set:
-a Go html/template file, index.html, given the same data as its own page. The panel's
-language is a cookie of the browser that opens the panel, the subscription page's is another
-one (subLang), and a theme replaces the page altogether - so this changes nothing an admin
-sees. The setting is read on every request and the file is re-read when it changes: no
-restart. `on` checks a real subscription renders with the new page and puts the old setting
-back if it does not.
+The page's language is a cookie of the user's browser (subLang), separate from the panel's,
+and defaults to the phone's language - an English phone gets English. 3x-ui can render the page
+from a template instead ("Sub Theme Directory"): this builds that template out of the panel's
+own page, taken from the x-ui binary, so it looks exactly the same. Added are only: Persian
+chosen once per browser (the page's language button still works afterwards), Jalali dates while
+the page is Persian, and the stamp. The panel's own language is untouched.
+
+The page's script and style file names change with every panel release, hence the rebuild on
+update. `on` renders a real subscription through the panel afterwards and puts the old setting
+back if the template is not served. No restart: the setting is read on every request.
 """
-import json, os, shutil, sqlite3, ssl, sys, urllib.request
+import json, os, re, sqlite3, ssl, subprocess, sys, urllib.request
 
 DB = "/etc/x-ui/x-ui.db"
-HOME = "/opt/xui-optimizer"
-SRC = HOME + "/subpage/index.html"
+XUI = "/usr/local/x-ui/x-ui"
 DIR = "/usr/local/share/xui-optimizer/subpage"
-MARK = 'id="sub-data"'
+MARK = 'id="xo-stamp"'                    # html/template drops JS comments, not this
+
+# First thing in <head>: pick Persian once per browser, before the page reads its cookie.
+BOOT = """<script>/* xui-subpage: Persian once, then whatever the user picks */
+(function () {
+  var has = function (n) { return document.cookie.split("; ").some(function (c) { return c.indexOf(n + "=") === 0; }); };
+  if (!has("xoFa")) {
+    var exp = new Date(Date.now() + 365 * 864e5).toUTCString();
+    document.cookie = "subLang=fa-IR;expires=" + exp + ";path=/";
+    document.cookie = "xoFa=1;expires=" + exp + ";path=/";
+  }
+})();
+</script>
+"""
+
+# In place of the data the panel would inject; Jalali dates while the page is Persian.
+DATA = """<script>/* xui-subpage: page data */
+window.X_UI_BASE_PATH = "%s";
+window.__SUB_PAGE_DATA__ = {{ . }};
+(function () {
+  var m = document.cookie.match(/(?:^|; )subLang=([^;]*)/);
+  if (m && /^fa/.test(decodeURIComponent(m[1]))) window.__SUB_PAGE_DATA__.datepicker = "jalali";
+})();
+</script>
+<style>/* xui-subpage: stamp */
+.xo-stamp { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+  pointer-events: none; z-index: 2000; overflow: hidden; }
+.xo-stamp.show { display: flex; }
+.xo-stamp div { color: #ff3b4e; border: 6px double #ff3b4e; border-radius: 18px; padding: 12px 26px 8px;
+  text-align: center; white-space: nowrap; font: 900 clamp(1.7rem, 9vw, 3.8rem)/1.35 Vazirmatn, "Segoe UI", Tahoma, sans-serif;
+  transform: rotate(-16deg); opacity: .92; background: rgba(40, 6, 12, .62); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  box-shadow: 0 0 0 3px rgba(255, 59, 78, .25) inset, 0 0 40px rgba(255, 59, 78, .25);
+  text-shadow: 0 0 12px rgba(255, 59, 78, .35); animation: xo-slam .45s cubic-bezier(.2, 1.6, .4, 1) both;
+  -webkit-mask-image: repeating-linear-gradient(35deg, #000 0 7px, rgba(0, 0, 0, .75) 7px 9px);
+          mask-image: repeating-linear-gradient(35deg, #000 0 7px, rgba(0, 0, 0, .75) 7px 9px); }
+.xo-stamp small { display: block; white-space: normal; font-size: .34em; font-weight: 700; margin-top: 2px; }
+@keyframes xo-slam { from { transform: rotate(-16deg) scale(2.2); opacity: 0; } to { transform: rotate(-16deg) scale(1); opacity: .92; } }
+</style>
+"""
+
+# Last thing in <body>: the stamp, kept current with the page's own ?format=info.
+STAMP = """<div class="xo-stamp" id="xo-stamp" aria-hidden="true"><div><span></span><small></small></div></div>
+<script>/* xui-subpage: stamp */
+(function () {
+  var fa = function () { var m = document.cookie.match(/(?:^|; )subLang=([^;]*)/); return !m || /^fa/.test(decodeURIComponent(m[1])); };
+  var T = {
+    fa: { exp: "منقضی شده", dep: "حجم تمام شده", off: "غیرفعال", expS: "زمان اشتراک به پایان رسیده",
+          bothS: "و حجم هم تمام شده", depS: "حجم اشتراک مصرف شده", offS: "این اشتراک غیرفعال شده" },
+    en: { exp: "EXPIRED", dep: "DATA USED UP", off: "DISABLED", expS: "the subscription has ended",
+          bothS: "and its data is used up", depS: "no data left", offS: "this subscription is disabled" }
+  };
+  function draw(d) {
+    if (!d) return;
+    var t = fa() ? T.fa : T.en;
+    var used = (Number(d.uploadByte) || 0) + (Number(d.downloadByte) || 0), total = Number(d.totalByte) || 0;
+    var exp = Number(d.expire) || 0;
+    var expired = exp > 0 && exp * 1000 <= Date.now(), depleted = total > 0 && used >= total, off = d.enabled === false;
+    var word = expired ? t.exp : depleted ? t.dep : off ? t.off : "";
+    var sub = expired && depleted ? t.bothS : expired ? t.expS : depleted ? t.depS : off ? t.offS : "";
+    var el = document.getElementById("xo-stamp");
+    el.querySelector("span").textContent = word;
+    el.querySelector("small").textContent = sub;
+    el.classList.toggle("show", !!word);
+  }
+  draw(window.__SUB_PAGE_DATA__);
+  var url = location.pathname + (location.search ? location.search + "&" : "?") + "format=info";
+  setInterval(function () {
+    if (document.hidden) return;
+    fetch(url, { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).then(draw).catch(function () {});
+  }, 30000);
+})();
+</script>
+"""
 
 
 def setting(c, key, default=""):
@@ -35,6 +111,42 @@ def put(c, key, value):
     c.commit()
 
 
+def original():
+    """The panel's subscription page as built into this x-ui binary (Go embeds files as is)."""
+    b = open(XUI, "rb").read()
+    for m in re.finditer(rb"<!doctype html>", b, re.I):
+        end = b.find(b"</html>", m.start())
+        page = b[m.start():end + 7]
+        if end > 0 and len(page) < 50000 and b"/subpage-" in page:
+            return page.decode("utf-8")
+    sys.exit("the subscription page was not found in %s - is this 3x-ui 3.x?" % XUI)
+
+
+def build(c):
+    page = original()
+    base = "/" + setting(c, "subPath", "/sub/").strip("/") + "/"
+    base = "/" if base == "//" else base
+    if base != "/":                                           # what the panel does to its own page
+        page = page.replace('src="/assets/', 'src="%sassets/' % base).replace('href="/assets/', 'href="%sassets/' % base)
+    if "{{" in page or page.count("<head>") != 1 or page.count("</head>") != 1 or page.count("</body>") != 1:
+        sys.exit("the panel's page does not look as expected; nothing changed")
+    js_base = json.dumps(base)[1:-1].replace("<", "\\u003c")
+    page = page.replace("<head>", "<head>\n" + BOOT, 1)
+    page = page.replace("</head>", DATA % js_base + "</head>", 1)
+    page = page.replace("</body>", STAMP + "</body>", 1)
+    os.makedirs(DIR, exist_ok=True)
+    with open(DIR + "/index.html.new", "w", encoding="utf-8") as f:
+        f.write(page)
+    os.chmod(DIR + "/index.html.new", 0o644)
+    os.replace(DIR + "/index.html.new", DIR + "/index.html")
+    return assets(page)
+
+
+def assets(page):
+    m = re.search(r"/(subpage-[\w-]+\.js)", page or "")
+    return m.group(1) if m else ""
+
+
 def probe(c):
     """Fetch one real subscription as a browser would, from the hub itself."""
     if setting(c, "subEnable", "true") != "true":
@@ -45,7 +157,7 @@ def probe(c):
         return None, "no client has a subscription id to test with"
     tls = bool(setting(c, "subCertFile") and setting(c, "subKeyFile"))
     path = "/" + setting(c, "subPath", "/sub/").strip("/") + "/"
-    url = "%s://127.0.0.1:%s%s%s" % ("https" if tls else "http", setting(c, "subPort", "2096"), path, row[0])
+    url = "%s://127.0.0.1:%s%s%s" % ("https" if tls else "http", setting(c, "subPort", "2096"), path.replace("//", "/"), row[0])
     ctx = ssl.create_default_context()
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE        # the name is the domain, not 127.0.0.1
     try:
@@ -56,45 +168,67 @@ def probe(c):
         return None, str(e)
 
 
+def ours(c):
+    cur = setting(c, "subThemeDir")
+    return bool(cur) and os.path.realpath(cur) == os.path.realpath(DIR)
+
+
+def path_unit(enable):
+    if os.path.exists("/etc/systemd/system/xui-subpage.path"):
+        subprocess.run(["systemctl", "enable" if enable else "disable", "--now", "xui-subpage.path"],
+                       capture_output=True)
+
+
 def status(as_json=False):
     c = sqlite3.connect(DB)
-    cur = setting(c, "subThemeDir")
-    ours = os.path.realpath(cur or "/nonexistent") == os.path.realpath(DIR)
     body, err = probe(c)
-    st = {"theme_dir": cur, "ours": ours, "installed": os.path.isfile(DIR + "/index.html"),
-          "serving": "persian" if body and MARK in body else ("default" if body else "unknown"),
-          "error": err}
+    try:
+        current = assets(open(DIR + "/index.html", encoding="utf-8").read())
+    except OSError:
+        current = ""
+    panel = assets(original())
+    st = {"theme_dir": setting(c, "subThemeDir"), "on": ours(c),
+          "serving": "persian" if body and MARK in body else ("panel" if body else "unknown"),
+          "current": bool(current) and current == panel, "error": err}
     if as_json:
         print(json.dumps(st))
     else:
-        print("theme dir : %s" % (cur or "(empty - 3x-ui's own page)"))
+        print("theme dir : %s" % (st["theme_dir"] or "(empty - the panel's own page)"))
         print("serving   : %s%s" % (st["serving"], " (%s)" % err if err else ""))
+        if st["on"] and not st["current"]:
+            print("outdated  : the panel was updated - run `xui-subpage refresh`")
     return 0
 
 
-def on(src):
-    if not os.path.isfile(src):
-        sys.exit("no template at %s - run the installer, or pass --src" % src)
+def on():
     c = sqlite3.connect(DB)
     before = setting(c, "subThemeDir")
-    os.makedirs(DIR, exist_ok=True)
-    shutil.copyfile(src, DIR + "/index.html.new")
-    os.chmod(DIR + "/index.html.new", 0o644)
-    os.replace(DIR + "/index.html.new", DIR + "/index.html")
+    build(c)
     put(c, "subThemeDir", DIR)
     body, err = probe(c)
     if body is not None and MARK not in body:
         put(c, "subThemeDir", before)
         sys.exit("the panel did not render the template (see `journalctl -u x-ui | grep sub:`) - "
                  "setting put back to %r" % before)
+    path_unit(True)
     print("Persian subscription page on%s" % (" (not verified: %s)" % err if body is None else ""))
+    return 0
+
+
+def refresh():
+    c = sqlite3.connect(DB)
+    if not ours(c):
+        print("off - nothing to refresh")
+        return 0
+    print("rebuilt for %s" % build(c))
     return 0
 
 
 def off():
     c = sqlite3.connect(DB)
     put(c, "subThemeDir", "")
-    print("3x-ui's own subscription page is back")
+    path_unit(False)
+    print("the panel's own subscription page is back")
     return 0
 
 
@@ -102,13 +236,10 @@ def main(a):
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
-    if a[0] == "status":
-        return status("--json" in a)
-    if a[0] == "on":
-        return on(a[a.index("--src") + 1] if "--src" in a else SRC)
-    if a[0] == "off":
-        return off()
-    sys.exit("unknown command: %s (status | on | off)" % a[0])
+    cmds = {"status": lambda: status("--json" in a), "on": on, "refresh": refresh, "off": off}
+    if a[0] not in cmds:
+        sys.exit("unknown command: %s (status | on | refresh | off)" % a[0])
+    return cmds[a[0]]()
 
 
 if __name__ == "__main__":

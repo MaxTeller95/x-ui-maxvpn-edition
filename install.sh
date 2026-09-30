@@ -31,8 +31,9 @@ TOOLS="xui-optimizer split/xui-split abroad/abroad-tune
 UNITS="guard/tunnel-guard.service guard/tunnel-guard.timer
        guard/config-guard.service guard/config-guard.path guard/config-guard.timer
        guard/xui-tunnel.service guard/xui-tunnel.timer
-       tools/xui-reach.service tools/xui-reach.timer tools/xui-geo.service tools/xui-geo.timer"
-TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer xui-reach.timer xui-geo.timer"
+       tools/xui-reach.service tools/xui-reach.timer tools/xui-geo.service tools/xui-geo.timer
+       tools/xui-subpage.service tools/xui-subpage.path"
+TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer xui-reach.timer xui-geo.timer xui-subpage.path"
 
 red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 inf() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -117,10 +118,9 @@ for t in $TIMERS; do
   systemctl is-enabled -q "$t" 2>/dev/null && systemctl restart "$t" && inf "$t با نسخه‌ی جدید ادامه می‌دهد"
 done
 
-# صفحه‌ی فارسی اشتراک (xui-subpage on): اگر روشن است، قالب هم به‌روز شود
+# صفحه‌ی فارسی اشتراک (xui-subpage on): اگر روشن است، با نسخه‌ی جدید دوباره ساخته شود
 if [ -f /usr/local/share/xui-optimizer/subpage/index.html ]; then
-  install -m 644 "$SRC/subpage/index.html" /usr/local/share/xui-optimizer/subpage/index.html
-  ok "صفحه‌ی فارسی اشتراک به‌روز شد"
+  "$DEST/xui-subpage" refresh >/dev/null && ok "صفحه‌ی فارسی اشتراک به‌روز شد"
 fi
 
 # --------------------------------------------------------------------- ۳. صفحه‌ی Optimizer

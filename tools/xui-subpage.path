@@ -1,0 +1,8 @@
+[Unit]
+Description=Rebuild the Persian subscription page when x-ui is updated
+
+[Path]
+PathChanged=/usr/local/x-ui/x-ui
+
+[Install]
+WantedBy=multi-user.target
