@@ -342,6 +342,11 @@
           <label class="switch"><input type="checkbox" id="ads"><span></span></label>
         </div>
         <div class="row">
+          <div>بستن QUIC (UDP 443)<div class="muted">یوتیوب، اینستاگرام و مرورگرها بی‌درنگ به HTTPS روی TCP برمی‌گردند؛
+            داخل تانل معمولاً سریع‌تر و پایدارتر است</div><div class="muted sm" id="quic-share"></div></div>
+          <label class="switch"><input type="checkbox" id="quic"><span></span></label>
+        </div>
+        <div class="row">
           <div>بستن بدافزار، فیشینگ و استخراج رمزارز<div class="muted">از فهرست امنیتی Iran-v2ray-rules</div></div>
           <label class="switch"><input type="checkbox" id="sec"><span></span></label>
         </div>
@@ -613,6 +618,11 @@ function renderStatus(s) {
     : `${Math.round(gf.age_days)} روز پیش به‌روز شده` + (geo.installed_tag ? ` (${geo.installed_tag})` : "")
       + (gf.age_days > 14 ? " — قدیمی است" : "");
   if (!$("#sec").disabled) $("#sec").checked = !!geo.security;
+  if (!$("#quic").disabled) $("#quic").checked = !!s.features.quic_block;
+  const q = s.features.quic || {};
+  $("#quic-share").textContent = !q.total ? "" : s.features.quic_block
+    ? `از ${q.total} اتصال اخیر، ${q.quic} تلاش QUIC بود و ${q.refused} تای آن‌ها به TCP برگردانده شد`
+    : `${q.pct}٪ از ${q.total} اتصال اخیر کاربران QUIC است`;
   const auto = ((s.certs || {}).certs || []).find((c) => c.used_by.includes("panel")) || ((s.certs || {}).certs || [])[0];
   $("#cert-mode").innerHTML = !auto ? "" : auto.auto
     ? `<span class="chip ok">تمدید خودکار</span> <span class="muted">${esc((auto.acme || {}).mode || "")}${(auto.acme || {}).next ? " · بعدی " + esc(auto.acme.next.slice(0, 10)) : ""}</span>`
@@ -1124,6 +1134,16 @@ $("#geo-update").onclick = async (e) => {
   const r = await post("geo-update");
   e.target.disabled = false;
   toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+  loadStatus();
+};
+$("#quic").onchange = async (e) => {
+  const on = e.target.checked;
+  if (!confirm((on ? "QUIC (UDP 443) برای کاربران بسته بشه؟ اپ‌ها خودکار به HTTPS روی TCP برمی‌گردند." : "QUIC دوباره آزاد بشه؟")
+      + " فقط همین یک قانون عوض می‌شه، قبلش بکاپ گرفته می‌شه و x-ui ری‌استارت می‌شه.")) { e.target.checked = !on; return; }
+  e.target.disabled = true; toast("در حال اعمال...");
+  const r = await post("quic", { on });
+  e.target.disabled = false;
+  toast(r.ok ? (r.msg || "انجام شد") : "خطا: " + (r.msg || ""));
   loadStatus();
 };
 $("#sec").onchange = async (e) => {

@@ -82,7 +82,16 @@ On each server abroad: `abroad-tune && abroad-tune apply`, plus the sysctl file.
 xui-optimizer --dry-run   # build and test, change nothing
 xui-optimizer             # back up, test, apply, restart x-ui
 xui-optimizer --remove    # undo (sniffing is left as it is)
+xui-optimizer --adblock on|off     # only the ad block; no other rule moves
+xui-optimizer --quic block|allow   # only the QUIC (UDP 443) block
 ```
+
+**QUIC block.** YouTube, Instagram and browsers try QUIC (HTTP/3 over UDP 443) first. Inside a
+TCP tunnel it rides under two congestion controls and is the first thing throttled on the way;
+refused, the apps reconnect over HTTPS/TCP within a second, which inside a tunnel is usually
+faster and steadier. On a production hub about 14 % of user connections were QUIC; with the
+block on every QUIC attempt was refused and the same apps came back over TCP. The Optimizer
+page shows the QUIC share and how many were turned back, from the access log.
 
 `--dns-via OUTBOUND` picks the path for DoH, `--no-adblock` / `--no-dns` skip a part.
 Inbounds routed to `direct` are left alone. Devices using Private DNS / DoH bypass the

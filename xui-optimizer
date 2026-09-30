@@ -9,6 +9,9 @@ to a proxy outbound (another server, usually through a tunnel):
     xui-optimizer --remove      take the ad block and DNS cache out again
     xui-optimizer --adblock on|off   only the ad block; the DNS cache and every other rule
                                 stay exactly as they are (what the Optimizer page's switch runs)
+    xui-optimizer --quic block|allow  refuse QUIC (UDP 443) for users: YouTube, Instagram and
+                                browsers fall back to HTTPS over TCP within a second, which inside
+                                a TCP tunnel is usually faster and steadier than UDP carried in it
 
 What it changes, in the panel's own database so the panel keeps it:
 
@@ -119,15 +122,29 @@ def is_ad(rule):
     return rule.get("domain") == ["geosite:category-ads-all"]
 
 
-def adblock_only(db_path, on, restart=True, dry=False):
-    """Add or remove the one ad-block rule and nothing else. A full run would rebuild the DNS
-    rules too, under this tool's own tags, and a hub whose guard and config-guard know those
-    rules by other names (dns-upstream, ...) must not have them renamed."""
+# One rule each, switched on its own: nothing else in the routing moves.
+TOGGLES = {
+    "adblock": {"tag": f"{TAG}-adblock", "sniff": True, "name": "ad block",
+                "match": lambda r: is_ad(r) or r.get("ruleTag") == f"{TAG}-adblock",
+                "rule": lambda ib, bh: {"domain": ["geosite:category-ads-all"], "inboundTag": ib, "outboundTag": bh}},
+    # QUIC is HTTP/3 over UDP 443. Carried inside a TCP tunnel it pays for two congestion
+    # controls and is the first thing throttled on the way; refused, apps retry over TCP at once.
+    "quic": {"tag": f"{TAG}-noquic", "sniff": False, "name": "QUIC block",
+             "match": lambda r: r.get("ruleTag") == f"{TAG}-noquic",
+             "rule": lambda ib, bh: {"network": "udp", "port": "443", "inboundTag": ib, "outboundTag": bh}},
+}
+
+
+def toggle(key, db_path, on, restart=True, dry=False):
+    """Add or remove one of TOGGLES and nothing else. A full run would rebuild the DNS rules
+    too, under this tool's own tags, and a hub whose guard and config-guard know those rules by
+    other names (dns-upstream, ...) must not have them renamed."""
+    spec = TOGGLES[key]
     db = sqlite3.connect(db_path)
     tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
     rules = tpl["routing"]["rules"]
-    had = any(is_ad(r) for r in rules)
-    tpl["routing"]["rules"] = rules = [r for r in rules if not is_ad(r)]
+    had = any(spec["match"](r) for r in rules)
+    tpl["routing"]["rules"] = rules = [r for r in rules if not spec["match"](r)]
     abroad = {}
     if on:
         abroad, _, blackhole = plan(tpl, None)
@@ -135,21 +152,21 @@ def adblock_only(db_path, on, restart=True, dry=False):
             tpl["outbounds"].append({"tag": "blocked", "protocol": "blackhole", "settings": {}})
             blackhole = "blocked"
         at = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
-        rules.insert(at, {"type": "field", "ruleTag": f"{TAG}-adblock", "inboundTag": sorted(abroad),
-                          "domain": ["geosite:category-ads-all"], "outboundTag": blackhole})
+        rules.insert(at, dict({"type": "field", "ruleTag": spec["tag"]}, **spec["rule"](sorted(abroad), blackhole)))
     elif not had:
-        print("ad block is already off")
+        print(f"{spec['name']} is already off")
         return
     with open(f"{BIN}/config.json") as f:
         cfg = json.load(f)
     cfg.update({k: v for k, v in tpl.items() if k != "inbounds"})
+    sniff = abroad if spec["sniff"] else {}
     for ib in cfg.get("inbounds", []):
-        if ib.get("tag") in abroad:
+        if ib.get("tag") in sniff:
             ib["sniffing"] = SNIFF                       # the rule matches domains: sniffing has to see them
     xray_test(cfg)
     if dry:
-        print("dry run - xray: Configuration OK; would turn the ad block %s for: %s"
-              % ("on" if on else "off", ", ".join(sorted(abroad)) or "-"))
+        print("dry run - xray: Configuration OK; would turn the %s %s for: %s"
+              % (spec["name"], "on" if on else "off", ", ".join(sorted(abroad)) or "-"))
         return
     backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
     os.makedirs(backup)
@@ -158,7 +175,7 @@ def adblock_only(db_path, on, restart=True, dry=False):
     shutil.copy2(f"{BIN}/config.json", backup)
     db = sqlite3.connect(db_path)
     db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
-    for tag in abroad:
+    for tag in sniff:
         db.execute("update inbounds set sniffing=? where tag=?", (json.dumps(SNIFF, indent=2), tag))
     db.commit()
     db.close()
@@ -166,8 +183,12 @@ def adblock_only(db_path, on, restart=True, dry=False):
     if restart:                                          # position matters, and the API only appends
         subprocess.run(["systemctl", "restart", "x-ui"], check=True)
         time.sleep(5)
-    print(("ad block on for: " + ", ".join(sorted(abroad))) if on else "ad block off")
+    print(("%s on for: %s" % (spec["name"], ", ".join(sorted(abroad)))) if on else "%s off" % spec["name"])
     print(f"backup in {backup}")
+
+
+def adblock_only(db_path, on, restart=True, dry=False):
+    return toggle("adblock", db_path, on, restart, dry)
 
 
 def accept_in_config_guard():
@@ -202,6 +223,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="test only, change nothing")
     ap.add_argument("--no-restart", action="store_true")
     ap.add_argument("--adblock", choices=("on", "off"), help="only switch the ad block")
+    ap.add_argument("--quic", choices=("block", "allow"), help="only switch the QUIC (UDP 443) block")
     a = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -211,6 +233,8 @@ def main():
 
     if a.adblock:
         return adblock_only(a.db, a.adblock == "on", not a.no_restart, a.dry_run)
+    if a.quic:
+        return toggle("quic", a.db, a.quic == "block", not a.no_restart, a.dry_run)
 
     db = sqlite3.connect(a.db)
     row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
