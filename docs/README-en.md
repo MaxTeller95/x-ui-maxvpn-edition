@@ -412,6 +412,11 @@ names change with each panel release, so `xui-subpage.path` rebuilds it when the
 changes. `on` renders a real subscription through the panel and restores the previous setting if
 the template is not served; `off` returns the untouched page; `status` also says whether the
 template matches the installed panel. No restart: the setting is read on every request.
+The database is detected the way x-ui sees it (the running process's environment, then the
+service's Environment= / EnvironmentFile=, then SQLite in /etc/x-ui), so panels on PostgreSQL work
+too (needs psql); `xui-subpage detect` shows it. `on` takes `--no-jalali`, `--no-stamp`, `--always`
+and `--sub LINK`. The same tool is published on its own as
+[3x-ui-sub-fa](https://github.com/MaxTeller95/3x-ui-sub-fa).
 
 ## config-guard - the routing comes back by itself
 

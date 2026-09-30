@@ -1,37 +1,52 @@
 #!/usr/bin/env python3
 """xui-subpage - 3x-ui's own subscription page, in Persian, with a stamp on dead subscriptions.
 
-    xui-subpage status [--json]   which page the users see, and whether it is current
-    xui-subpage on                serve the panel's page in Persian (Jalali dates), with a red
-                                  stamp across a subscription that has expired, run out of data
-                                  or been disabled
-    xui-subpage refresh           rebuild after a panel update (xui-subpage.path runs it when
-                                  the x-ui binary changes); does nothing while off
-    xui-subpage off               back to the untouched page
+    xui-subpage on [options]     serve the panel's page in Persian
+        --no-jalali               keep the panel's calendar (default: Jalali while the page is Persian)
+        --no-stamp                no stamp on expired / used-up / disabled subscriptions
+        --always                  Persian on every visit (default: once per browser, after which the
+                                  page's own language button is respected)
+        --sub ID|LINK             test with this subscription (default: the first one in the panel)
+    xui-subpage status [--sub ID|LINK] [--json]
+                                which page the users see, and whether it matches the installed panel
+    xui-subpage refresh          rebuild after a panel update (xui-subpage.path runs it by itself
+                                when the x-ui binary changes); does nothing while off
+    xui-subpage off              back to the untouched page
+    xui-subpage detect [--shell] where the panel keeps its data and which binary it runs
 
-The page's language is a cookie of the user's browser (subLang), separate from the panel's,
-and defaults to the phone's language - an English phone gets English. 3x-ui can render the page
-from a template instead ("Sub Theme Directory"): this builds that template out of the panel's
-own page, taken from the x-ui binary, so it looks exactly the same. Added are only: Persian
-chosen once per browser (the page's language button still works afterwards), Jalali dates while
-the page is Persian, and the stamp. The panel's own language is untouched.
+The database and the binary are found the way the panel itself sees them: the environment of
+the running x-ui process (XUI_DB_TYPE, XUI_DB_DSN, XUI_DB_FOLDER), else the x-ui service's
+Environment= and EnvironmentFile= (/etc/default/x-ui), else SQLite in /etc/x-ui. PostgreSQL is
+reached with psql. `xui-subpage detect` shows what was found; XUI_BIN, XUI_DB, XUI_DB_TYPE and
+XUI_DB_DSN in this tool's own environment override it.
+
+The subscription page's language is a cookie in the user's browser (subLang), separate from the
+panel's, and defaults to the phone's language - an English phone gets English. 3x-ui can render
+the page from a template instead ("Sub Theme Directory"): this builds that template out of the
+panel's own page, taken from the x-ui binary, so it looks exactly the same. Added are only the
+Persian cookie, Jalali dates and the stamp. The panel's own language is untouched, and so are the
+apps: they never get the page, only the configs.
 
 The page's script and style file names change with every panel release, hence the rebuild on
 update. `on` renders a real subscription through the panel afterwards and puts the old setting
-back if the template is not served. No restart: the setting is read on every request.
+back if the template is not served. No restart: 3x-ui reads the setting on every request.
 """
-import json, os, re, sqlite3, ssl, subprocess, sys, urllib.request
+import json, os, re, shutil, sqlite3, ssl, subprocess, sys, urllib.error, urllib.parse, urllib.request
 
-DB = "/etc/x-ui/x-ui.db"
-XUI = "/usr/local/x-ui/x-ui"
+VERSION = "1.3.0"
+SERVICE = "x-ui"
+DB_KEYS = ("XUI_DB_TYPE", "XUI_DB_DSN", "XUI_DB_FOLDER")
 DIR = "/usr/local/share/xui-optimizer/subpage"
-MARK = 'id="xo-stamp"'                    # html/template drops JS comments, not this
+CONF = "/etc/xui-subpage.json"
+MARK = 'id="xo-stamp"'                  # html/template drops JS comments, not this
+DEFAULTS = {"jalali": True, "stamp": True, "always": False}
 
-# First thing in <head>: pick Persian once per browser, before the page reads its cookie.
-BOOT = """<script>/* xui-subpage: Persian once, then whatever the user picks */
+# First thing in <head>: pick Persian before the page reads its cookie.
+BOOT = """<script>
 (function () {
+  var always = %s;
   var has = function (n) { return document.cookie.split("; ").some(function (c) { return c.indexOf(n + "=") === 0; }); };
-  if (!has("xoFa")) {
+  if (always || !has("xoFa")) {
     var exp = new Date(Date.now() + 365 * 864e5).toUTCString();
     document.cookie = "subLang=fa-IR;expires=" + exp + ";path=/";
     document.cookie = "xoFa=1;expires=" + exp + ";path=/";
@@ -40,22 +55,25 @@ BOOT = """<script>/* xui-subpage: Persian once, then whatever the user picks */
 </script>
 """
 
-# In place of the data the panel would inject; Jalali dates while the page is Persian.
-DATA = """<script>/* xui-subpage: page data */
+# In place of the data the panel would inject.
+DATA = """<script>
 window.X_UI_BASE_PATH = "%s";
 window.__SUB_PAGE_DATA__ = {{ . }};
 (function () {
   var m = document.cookie.match(/(?:^|; )subLang=([^;]*)/);
-  if (m && /^fa/.test(decodeURIComponent(m[1]))) window.__SUB_PAGE_DATA__.datepicker = "jalali";
+  if (%s && m && /^fa/.test(decodeURIComponent(m[1]))) window.__SUB_PAGE_DATA__.datepicker = "jalali";
 })();
 </script>
-<style>/* xui-subpage: stamp */
+"""
+
+STYLE = """<style>
 .xo-stamp { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
   pointer-events: none; z-index: 2000; overflow: hidden; }
 .xo-stamp.show { display: flex; }
 .xo-stamp div { color: #ff3b4e; border: 6px double #ff3b4e; border-radius: 18px; padding: 12px 26px 8px;
   text-align: center; white-space: nowrap; font: 900 clamp(1.7rem, 9vw, 3.8rem)/1.35 Vazirmatn, "Segoe UI", Tahoma, sans-serif;
-  transform: rotate(-16deg); opacity: .92; background: rgba(40, 6, 12, .62); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  transform: rotate(-16deg); opacity: .92; background: rgba(40, 6, 12, .62);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
   box-shadow: 0 0 0 3px rgba(255, 59, 78, .25) inset, 0 0 40px rgba(255, 59, 78, .25);
   text-shadow: 0 0 12px rgba(255, 59, 78, .35); animation: xo-slam .45s cubic-bezier(.2, 1.6, .4, 1) both;
   -webkit-mask-image: repeating-linear-gradient(35deg, #000 0 7px, rgba(0, 0, 0, .75) 7px 9px);
@@ -67,7 +85,7 @@ window.__SUB_PAGE_DATA__ = {{ . }};
 
 # Last thing in <body>: the stamp, kept current with the page's own ?format=info.
 STAMP = """<div class="xo-stamp" id="xo-stamp" aria-hidden="true"><div><span></span><small></small></div></div>
-<script>/* xui-subpage: stamp */
+<script>
 (function () {
   var fa = function () { var m = document.cookie.match(/(?:^|; )subLang=([^;]*)/); return !m || /^fa/.test(decodeURIComponent(m[1])); };
   var T = {
@@ -100,72 +118,281 @@ STAMP = """<div class="xo-stamp" id="xo-stamp" aria-hidden="true"><div><span></s
 """
 
 
+def die(msg):
+    sys.stderr.write("xui-subpage: %s\n" % msg)
+    sys.exit(1)
+
+
+def conf():
+    try:
+        with open(CONF) as f:
+            return dict(DEFAULTS, **json.load(f))
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
+
+
+def save_conf(c):
+    with open(CONF, "w") as f:
+        json.dump(c, f, indent=2)
+
+
+def parse_env(text, sep="\n"):
+    env = {}
+    for line in text.split(sep):
+        m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", line)
+        if m:
+            env[m.group(1)] = m.group(2).strip("'\"")
+    return env
+
+
+def running_pid():
+    """x-ui's main process: from systemd, else any process whose binary is called x-ui."""
+    r = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", SERVICE], capture_output=True, text=True)
+    pid = (r.stdout or "").strip()
+    if pid.isdigit() and pid != "0":
+        return pid
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if os.path.basename(os.readlink("/proc/%s/exe" % pid)) == "x-ui":
+                return pid
+        except OSError:
+            pass
+    return None
+
+
+def service_env():
+    """What systemd would hand x-ui on its next start: Environment= and EnvironmentFile=."""
+    env = {}
+    r = subprocess.run(["systemctl", "show", "-p", "EnvironmentFiles", "-p", "Environment", SERVICE],
+                       capture_output=True, text=True)
+    files = []
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("EnvironmentFiles="):
+            files += [f.split(" ")[0].lstrip("-") for f in line[17:].split("\n") if f]
+    for f in files + ["/etc/default/x-ui"]:
+        try:
+            env.update({k: v for k, v in parse_env(open(f).read()).items() if k in DB_KEYS and k not in env})
+        except OSError:
+            pass
+    for line in (r.stdout or "").splitlines():                # Environment= wins over the files
+        if line.startswith("Environment="):
+            for item in re.findall(r'(?:"[^"]*"|\S)+', line[12:]):
+                env.update({k: v for k, v in parse_env(item.strip('"')).items() if k in DB_KEYS})
+    return env
+
+
+_FOUND = None
+
+
+def detect():
+    """Where this panel keeps its data, and which binary it runs - as the panel sees it."""
+    global _FOUND
+    if _FOUND:
+        return _FOUND
+    env, source, pid = {}, "default", running_pid()
+    xui = "/usr/local/x-ui/x-ui"
+    if pid:
+        try:
+            raw = open("/proc/%s/environ" % pid, "rb").read().decode("utf-8", "replace")
+            env = {k: v for k, v in parse_env(raw, "\0").items() if k in DB_KEYS}
+            source = "running x-ui (pid %s)" % pid
+            exe = os.readlink("/proc/%s/exe" % pid).replace(" (deleted)", "")
+            xui = exe if os.path.isfile(exe) else xui
+            if os.stat("/proc/%s/root/" % pid).st_ino != os.stat("/").st_ino:
+                die("x-ui runs in a container (Docker?) - install inside the container instead")
+        except OSError:
+            pid = None
+    if not pid:
+        env = service_env()
+        source = "x-ui service settings" if env else "default"
+    env.update({k: os.environ[k] for k in DB_KEYS if os.environ.get(k)})   # ours override
+    kind = "postgres" if env.get("XUI_DB_TYPE", "").strip().lower() in ("postgres", "postgresql", "pg") else "sqlite"
+    path = os.environ.get("XUI_DB") or "%s/x-ui.db" % (env.get("XUI_DB_FOLDER") or "/etc/x-ui").rstrip("/")
+    _FOUND = {"kind": kind, "dsn": env.get("XUI_DB_DSN", "").strip(), "path": path, "source": source,
+              "bin": os.environ.get("XUI_BIN") or xui, "running": bool(pid)}
+    return _FOUND
+
+
+def xui_bin():
+    return detect()["bin"]
+
+
+class Sqlite:
+    def __init__(self, path):
+        if not os.path.isfile(path):
+            die("no 3x-ui database at %s (set XUI_DB, or XUI_DB_TYPE/XUI_DB_DSN)" % path)
+        self.c = sqlite3.connect(path)
+
+    def rows(self, sql):
+        return self.c.execute(sql).fetchall()
+
+    def tables(self):
+        return {r[0] for r in self.rows("select name from sqlite_master where type='table'")}
+
+    def columns(self, table):
+        return {r[1] for r in self.rows("pragma table_info(%s)" % table)}
+
+    def get(self, key, default):
+        r = self.c.execute("select value from settings where key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def put(self, key, value):
+        if self.c.execute("update settings set value=? where key=?", (value, key)).rowcount == 0:
+            self.c.execute("insert into settings (key, value) values (?, ?)", (key, value))
+        self.c.commit()
+
+
+class Postgres:
+    """3x-ui 3.x can keep its data in PostgreSQL (XUI_DB_TYPE=postgres). Talked to with psql;
+    the connection goes through libpq's environment so the password is not on a command line."""
+    def __init__(self, dsn):
+        if not shutil.which("psql"):
+            die("the panel uses PostgreSQL and psql is missing (apt install postgresql-client)")
+        u = urllib.parse.urlsplit(dsn)
+        q = dict(urllib.parse.parse_qsl(u.query))
+        self.env = dict(os.environ, PGHOST=u.hostname or "127.0.0.1", PGPORT=str(u.port or 5432),
+                        PGUSER=urllib.parse.unquote(u.username or ""), PGPASSWORD=urllib.parse.unquote(u.password or ""),
+                        PGDATABASE=u.path.lstrip("/"), PGSSLMODE=q.get("sslmode", "prefer"), PGCONNECT_TIMEOUT="10")
+        self.rows("select 1")
+
+    @staticmethod
+    def lit(v):
+        return "'" + str(v).replace("'", "''") + "'"
+
+    def rows(self, sql):
+        r = subprocess.run(["psql", "-X", "-q", "-At", "-F", "\x1f", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                           capture_output=True, text=True, env=self.env, timeout=30)
+        if r.returncode:
+            die("PostgreSQL: %s" % (r.stderr.strip().splitlines() or ["error"])[-1])
+        return [tuple(l.split("\x1f")) for l in r.stdout.splitlines() if l]
+
+    def tables(self):
+        return {r[0] for r in self.rows("select table_name from information_schema.tables where table_schema = current_schema()")}
+
+    def columns(self, table):
+        return {r[0] for r in self.rows("select column_name from information_schema.columns where table_schema = "
+                                         "current_schema() and table_name = %s" % self.lit(table))}
+
+    def get(self, key, default):
+        r = self.rows("select value from settings where key = %s limit 1" % self.lit(key))
+        return r[0][0] if r else default
+
+    def put(self, key, value):
+        k, v = self.lit(key), self.lit(value)
+        self.rows("with u as (update settings set value = %s where key = %s returning 1) "
+                  "insert into settings (key, value) select %s, %s where not exists (select 1 from u)" % (v, k, k, v))
+
+
+def db():
+    d = detect()
+    if d["kind"] == "postgres":
+        if not d["dsn"]:
+            die("x-ui is set to PostgreSQL but has no XUI_DB_DSN")
+        return Postgres(d["dsn"])
+    return Sqlite(d["path"])
+
+
+def describe():
+    d = detect()
+    where = re.sub(r"//[^@/]*@", "//", d["dsn"]) if d["kind"] == "postgres" else d["path"]   # no password
+    return "%s %s (from %s)" % (d["kind"], where, d["source"])
+
+
 def setting(c, key, default=""):
-    r = c.execute("select value from settings where key=?", (key,)).fetchone()
-    return r[0] if r else default
+    return c.get(key, default)
 
 
 def put(c, key, value):
-    if c.execute("update settings set value=? where key=?", (value, key)).rowcount == 0:
-        c.execute("insert into settings (key, value) values (?, ?)", (key, value))
-    c.commit()
+    c.put(key, value)
 
 
 def original():
-    """The panel's subscription page as built into this x-ui binary (Go embeds files as is)."""
-    b = open(XUI, "rb").read()
+    """The panel's subscription page as built into this x-ui binary (Go embeds files as they are)."""
+    xui = xui_bin()
+    if not os.path.isfile(xui):
+        die("no x-ui binary at %s (set XUI_BIN)" % xui)
+    b = open(xui, "rb").read()
+    if b"subThemeDir" not in b:
+        die("this 3x-ui has no \"Sub Theme Directory\" setting - update the panel first")
     for m in re.finditer(rb"<!doctype html>", b, re.I):
         end = b.find(b"</html>", m.start())
         page = b[m.start():end + 7]
         if end > 0 and len(page) < 50000 and b"/subpage-" in page:
             return page.decode("utf-8")
-    sys.exit("the subscription page was not found in %s - is this 3x-ui 3.x?" % XUI)
+    die("the subscription page was not found in %s - this needs 3x-ui 3.x" % xui)
 
 
-def build(c):
+def asset(page):
+    m = re.search(r"/(subpage-[\w-]+\.js)", page or "")
+    return m.group(1) if m else ""
+
+
+def build(c, cf):
     page = original()
     base = "/" + setting(c, "subPath", "/sub/").strip("/") + "/"
     base = "/" if base == "//" else base
     if base != "/":                                           # what the panel does to its own page
         page = page.replace('src="/assets/', 'src="%sassets/' % base).replace('href="/assets/', 'href="%sassets/' % base)
     if "{{" in page or page.count("<head>") != 1 or page.count("</head>") != 1 or page.count("</body>") != 1:
-        sys.exit("the panel's page does not look as expected; nothing changed")
+        die("the panel's page does not look as expected; nothing changed")
     js_base = json.dumps(base)[1:-1].replace("<", "\\u003c")
-    page = page.replace("<head>", "<head>\n" + BOOT, 1)
-    page = page.replace("</head>", DATA % js_base + "</head>", 1)
-    page = page.replace("</body>", STAMP + "</body>", 1)
+    page = page.replace("<head>", "<head>\n" + BOOT % ("true" if cf["always"] else "false"), 1)
+    page = page.replace("</head>", DATA % (js_base, "true" if cf["jalali"] else "false") + STYLE + "</head>", 1)
+    page = page.replace("</body>", STAMP.replace('class="xo-stamp"', 'class="xo-stamp"%s' % ("" if cf["stamp"] else " hidden style=\"display:none!important\"")) + "</body>", 1)
     os.makedirs(DIR, exist_ok=True)
     with open(DIR + "/index.html.new", "w", encoding="utf-8") as f:
         f.write(page)
     os.chmod(DIR + "/index.html.new", 0o644)
     os.replace(DIR + "/index.html.new", DIR + "/index.html")
-    return assets(page)
+    return asset(page)
 
 
-def assets(page):
-    m = re.search(r"/(subpage-[\w-]+\.js)", page or "")
-    return m.group(1) if m else ""
+def sub_ids(c):
+    """Subscription ids the panel knows, wherever this version keeps them."""
+    found = []
+    tables = c.tables()
+    for table in ("clients", "client_traffics"):
+        if table in tables:
+            cols = c.columns(table)
+            for col in ("sub_id", "subId"):
+                if col in cols:
+                    found += [r[0] for r in c.rows("select %s from %s where coalesce(%s, '') <> '' limit 5" % (col, table, col))]
+    if not found and "inbounds" in tables:                    # clients inside each inbound's settings
+        for (s,) in c.rows("select settings from inbounds"):
+            try:
+                found += [x.get("subId") for x in json.loads(s or "{}").get("clients", []) if x.get("subId")]
+            except (ValueError, AttributeError):
+                pass
+    return found
 
 
-def probe(c):
-    """Fetch one real subscription as a browser would, from the hub itself."""
+def probe(c, sid=None):
+    """Fetch one real subscription as a browser would, from this server itself."""
     if setting(c, "subEnable", "true") != "true":
-        return None, "subscription is off in the panel"
-    row = c.execute("select c.sub_id from clients c join client_traffics t on t.email = c.email "
-                    "where c.sub_id != '' order by t.enable desc limit 1").fetchone()
-    if not row:
-        return None, "no client has a subscription id to test with"
+        return None, "subscriptions are off in the panel (Settings -> Subscription)"
+    if sid:
+        sid = sid.rstrip("/").split("?")[0].rsplit("/", 1)[-1]   # a whole link works too
+    else:
+        ids = sub_ids(c)
+        if not ids:
+            return None, ("no client has a subscription id yet - add one to a client, or open a "
+                          "subscription link in a browser, or pass --sub ID")
+        sid = ids[0]
     tls = bool(setting(c, "subCertFile") and setting(c, "subKeyFile"))
-    path = "/" + setting(c, "subPath", "/sub/").strip("/") + "/"
-    url = "%s://127.0.0.1:%s%s%s" % ("https" if tls else "http", setting(c, "subPort", "2096"), path.replace("//", "/"), row[0])
+    host = setting(c, "subListen") or "127.0.0.1"
+    host = "127.0.0.1" if host in ("0.0.0.0", "::") else ("[%s]" % host if ":" in host else host)
+    path = ("/" + setting(c, "subPath", "/sub/").strip("/") + "/").replace("//", "/")
+    url = "%s://%s:%s%s%s" % ("https" if tls else "http", host, setting(c, "subPort", "2096"), path, sid)
     ctx = ssl.create_default_context()
-    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE        # the name is the domain, not 127.0.0.1
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE        # the certificate names the domain
     try:
         req = urllib.request.Request(url, headers={"Accept": "text/html", "User-Agent": "xui-subpage"})
         with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
             return r.read().decode("utf-8", "replace"), ""
+    except urllib.error.HTTPError as e:
+        return None, "%s answered HTTP %s%s" % (url, e.code, " (unknown subscription id)" if e.code in (400, 404) else "")
     except Exception as e:
-        return None, str(e)
+        return None, "%s: %s" % (url, e)
 
 
 def ours(c):
@@ -179,66 +406,119 @@ def path_unit(enable):
                        capture_output=True)
 
 
-def status(as_json=False):
-    c = sqlite3.connect(DB)
-    body, err = probe(c)
+def status(as_json=False, sid=None):
+    c = db()
+    body, err = probe(c, sid)
     try:
-        current = assets(open(DIR + "/index.html", encoding="utf-8").read())
+        current = asset(open(DIR + "/index.html", encoding="utf-8").read())
     except OSError:
         current = ""
-    panel = assets(original())
-    st = {"theme_dir": setting(c, "subThemeDir"), "on": ours(c),
+    st = {"version": VERSION, "database": describe(), "theme_dir": setting(c, "subThemeDir"), "on": ours(c),
           "serving": "persian" if body and MARK in body else ("panel" if body else "unknown"),
-          "current": bool(current) and current == panel, "error": err}
+          "current": bool(current) and current == asset(original()), "options": conf(), "error": err}
     if as_json:
         print(json.dumps(st))
-    else:
-        print("theme dir : %s" % (st["theme_dir"] or "(empty - the panel's own page)"))
-        print("serving   : %s%s" % (st["serving"], " (%s)" % err if err else ""))
-        if st["on"] and not st["current"]:
+        return 0
+    print("database  : %s" % st["database"])
+    print("theme dir : %s" % (st["theme_dir"] or "(empty - the panel's own page)"))
+    print("serving   : %s%s" % (st["serving"], " (%s)" % err if err else ""))
+    if st["on"]:
+        o = st["options"]
+        print("options   : jalali=%s stamp=%s always=%s" % (o["jalali"], o["stamp"], o["always"]))
+        if not st["current"]:
             print("outdated  : the panel was updated - run `xui-subpage refresh`")
     return 0
 
 
-def on():
-    c = sqlite3.connect(DB)
+def on(args):
+    cf = conf()
+    sid = opt(args, "--sub")
+    for a in args:
+        if a == sid or a == "--sub":
+            continue
+        if a == "--no-jalali":
+            cf["jalali"] = False
+        elif a == "--jalali":
+            cf["jalali"] = True
+        elif a == "--no-stamp":
+            cf["stamp"] = False
+        elif a == "--stamp":
+            cf["stamp"] = True
+        elif a == "--always":
+            cf["always"] = True
+        elif a == "--once":
+            cf["always"] = False
+        else:
+            die("unknown option: %s" % a)
+    c = db()
     before = setting(c, "subThemeDir")
-    build(c)
+    build(c, cf)
+    save_conf(cf)
     put(c, "subThemeDir", DIR)
-    body, err = probe(c)
+    body, err = probe(c, sid)
     if body is not None and MARK not in body:
         put(c, "subThemeDir", before)
-        sys.exit("the panel did not render the template (see `journalctl -u x-ui | grep sub:`) - "
-                 "setting put back to %r" % before)
+        die("the panel did not serve the template (see `journalctl -u x-ui | grep sub:`) - "
+            "setting put back to %r" % before)
     path_unit(True)
     print("Persian subscription page on%s" % (" (not verified: %s)" % err if body is None else ""))
     return 0
 
 
 def refresh():
-    c = sqlite3.connect(DB)
+    c = db()
     if not ours(c):
         print("off - nothing to refresh")
         return 0
-    print("rebuilt for %s" % build(c))
+    print("rebuilt for %s" % build(c, conf()))
     return 0
 
 
 def off():
-    c = sqlite3.connect(DB)
-    put(c, "subThemeDir", "")
+    c = db()
+    if ours(c):
+        put(c, "subThemeDir", "")
     path_unit(False)
     print("the panel's own subscription page is back")
     return 0
+
+
+def show_detect(shell=False):
+    d = detect()
+    if shell:                                                 # for install.sh
+        print("XUI_KIND=%s" % d["kind"])
+        print("XUI_BIN_FOUND=%s" % d["bin"])
+        return 0
+    print("database : %s" % describe())
+    print("binary   : %s" % d["bin"])
+    print("running  : %s" % ("yes" if d["running"] else "no"))
+    return 0
+
+
+def opt(args, name):
+    if name in args:
+        i = args.index(name)
+        if i + 1 >= len(args):
+            die("%s needs a value" % name)
+        return args[i + 1]
+    return None
 
 
 def main(a):
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
-    cmds = {"status": lambda: status("--json" in a), "on": on, "refresh": refresh, "off": off}
+    if a[0] in ("-v", "--version", "version"):
+        print(VERSION)
+        return 0
+    if os.geteuid() != 0:
+        die("run as root")
+    if a[0] == "on":
+        return on(a[1:])
+    cmds = {"status": lambda: status("--json" in a, opt(a, "--sub")), "refresh": refresh, "off": off,
+            "detect": lambda: show_detect("--shell" in a)}
     if a[0] not in cmds:
-        sys.exit("unknown command: %s (status | on | refresh | off)" % a[0])
+        die("unknown command: %s (on | status | refresh | off)" % a[0])
     return cmds[a[0]]()
 
 
