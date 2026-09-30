@@ -12,8 +12,11 @@
 #        https://raw.githubusercontent.com/MaxTeller95/xui-optimizer/main/install.sh)
 #
 #  گزینه‌ها:
-#      --dash PORT        صفحه‌ی Optimizer را هم نصب کن (nginx جلوی پنل روی این پورت)
-#      --move             با --dash: پورت خود پنل را بگیر و x-ui را به 127.0.0.1 ببر
+#      (بدون گزینه)       صفحه‌ی Optimizer هم نصب می‌شود، یکپارچه روی پورت اصلی پنل: nginx پورت پنل را
+#                         می‌گیرد و x-ui به 127.0.0.1 می‌رود. اگر پنل گواهی ندارد، صفحه رد می‌شود.
+#      --no-dash          فقط ابزارها؛ صفحه‌ی Optimizer نصب نشود
+#      --dash PORT        صفحه‌ی Optimizer روی پورت دیگری (آزمایشی؛ پنل روی پورت خودش هم می‌ماند)
+#      --move             با --dash PORT: PORT باید پورت خود پنل باشد (همان حالت پیش‌فرض)
 #      --uninstall        ابزارها، سرویس‌ها و صفحه را حذف کن (تنظیمات و بکاپ‌ها می‌مانند)
 #
 #  نصب به تنهایی چیزی را در پنل عوض نمی‌کند: هیچ تایمری روشن نمی‌شود و هر ابزار
@@ -39,13 +42,14 @@ red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 inf() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 ok()  { printf '\033[32m✔\033[0m %s\n' "$*"; }
 
-DASH_PORT="" MOVE="" UNINSTALL=""
+DASH_PORT="" MOVE="" UNINSTALL="" NO_DASH=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dash)      DASH_PORT=${2:?"بعد از --dash شماره‌ی پورت را بنویسید"}; shift ;;
     --move)      MOVE=move ;;
+    --no-dash)   NO_DASH=1 ;;
     --uninstall) UNINSTALL=1 ;;
-    -h|--help)   sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,28p' "$0"; exit 0 ;;
     *)           red "گزینه‌ی ناشناخته: $1"; exit 1 ;;
   esac
   shift
@@ -78,7 +82,7 @@ fi
 # --------------------------------------------------------------------- پیش‌نیازها
 need=""
 for p in git python3 curl sqlite3; do command -v "$p" >/dev/null || need="$need $p"; done
-[ -n "$DASH_PORT" ] && ! command -v nginx >/dev/null && need="$need nginx"
+[ -z "$NO_DASH" ] && ! command -v nginx >/dev/null && need="$need nginx"
 if [ -n "$need" ]; then
   inf "نصب پیش‌نیازها:$need"
   apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $need >/dev/null
@@ -150,6 +154,18 @@ elif [ -f /opt/xo-dash/xo-dash ]; then          # اگر از قبل نصب بو
   install -m 755 "$SRC/dash/xo-dash" /opt/xo-dash/xo-dash
   install -m 644 "$SRC/dash/index.html" "$SRC/dash/inject.js" /opt/xo-dash/
   systemctl restart xo-dash.service && ok "صفحه‌ی Optimizer به‌روز شد"
+elif [ -z "$NO_DASH" ]; then                    # پیش‌فرض: یکپارچه روی پورت اصلی پنل
+  PANEL_PORT=$(python3 -c "import sys; sys.path[:0] = ['$SRC/lib']; import xuidb; r = xuidb.connect().execute('select value from settings where key=?', ('webPort',)).fetchone(); print(r[0] if r else '')" 2>/dev/null || true)
+  if [ -z "$PANEL_PORT" ]; then
+    red "پورت پنل پیدا نشد؛ صفحه‌ی Optimizer نصب نشد. بعد از نصب پنل دوباره اجرا کنید: sudo bash $SRC/install.sh"
+  else
+    inf "نصب صفحه‌ی Optimizer روی پورت اصلی پنل ($PANEL_PORT)"
+    if bash "$SRC/dash/install-dash.sh" "$PANEL_PORT" move; then
+      ok "صفحه‌ی Optimizer در منوی پنل نصب شد"
+    else
+      red "صفحه‌ی Optimizer نصب نشد (پنل گواهی TLS دارد؟). ابزارها نصب هستند؛ برای نصب بدون صفحه: --no-dash"
+    fi
+  fi
 fi
 
 ver=$(git -C "$SRC" log -1 --format='%h %cs' 2>/dev/null || echo "?")
@@ -167,6 +183,6 @@ xui-optimizer ($ver) نصب شد. قدم‌های بعدی (هر ابزار او
   xui-geo update --restart && systemctl enable --now xui-geo.timer   # فهرست‌های ایران، هفتگی
   xui-cert status                                 # گواهی‌ها؛ تمدید خودکار: xui-cert auto DOMAIN --dns dns_arvan
 
-  صفحه‌ی Optimizer (اول روی پورت آزمایشی):  sudo bash $SRC/install.sh --dash 59085
+  صفحه‌ی Optimizer: پیش‌فرض نصب می‌شود (یکپارچه روی پورت پنل)؛ بدون آن: sudo bash $SRC/install.sh --no-dash
   به‌روزرسانی: همین اسکریپت را دوباره اجرا کنید.   حذف: sudo bash $SRC/install.sh --uninstall
 EOF
