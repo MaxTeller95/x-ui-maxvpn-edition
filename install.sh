@@ -26,11 +26,13 @@ HOME_DIR=/opt/xui-optimizer
 DEST=/usr/local/sbin
 TOOLS="xui-optimizer split/xui-split abroad/abroad-tune
        guard/tunnel-guard guard/config-guard guard/xui-path guard/xui-tunnel guard/awg-hop guard/awg-port
-       tools/mux-bench tools/xui-fix-inbound-lists tools/xui-probe-client tools/path-score"
+       tools/mux-bench tools/xui-fix-inbound-lists tools/xui-probe-client tools/path-score
+       tools/xui-reach tools/xui-geo tools/xui-cert"
 UNITS="guard/tunnel-guard.service guard/tunnel-guard.timer
        guard/config-guard.service guard/config-guard.path guard/config-guard.timer
-       guard/xui-tunnel.service guard/xui-tunnel.timer"
-TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer"
+       guard/xui-tunnel.service guard/xui-tunnel.timer
+       tools/xui-reach.service tools/xui-reach.timer tools/xui-geo.service tools/xui-geo.timer"
+TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer xui-reach.timer xui-geo.timer"
 
 red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 inf() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -135,6 +137,9 @@ xui-optimizer ($ver) نصب شد. قدم‌های بعدی (هر ابزار او
   nano /etc/tunnel-guard.json && tunnel-guard --check && systemctl enable --now tunnel-guard.timer
   config-guard && systemctl enable --now config-guard.path config-guard.timer
   systemctl enable --now xui-tunnel.timer         # جابجایی خودکار بین تانل‌های یک سرور
+  systemctl enable --now xui-reach.timer          # دسترسی هاب از داخل ایران، هر ۱۰ دقیقه
+  xui-geo update --restart && systemctl enable --now xui-geo.timer   # فهرست‌های ایران، هفتگی
+  xui-cert status                                 # گواهی‌ها؛ تمدید خودکار: xui-cert auto DOMAIN --dns dns_arvan
 
   صفحه‌ی Optimizer (اول روی پورت آزمایشی):  sudo bash $SRC/install.sh --dash 59085
   به‌روزرسانی: همین اسکریپت را دوباره اجرا کنید.   حذف: sudo bash $SRC/install.sh --uninstall

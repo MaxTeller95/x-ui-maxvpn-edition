@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""xui-geo - keep the Iran routing lists fresh, and block malware / phishing / miners.
+
+    xui-geo status [--json]       the lists Xray uses, their age, and the newest release
+    xui-geo update [--restart]    download the newest lists, check their sha256, swap them in;
+                                  Xray reads them only at start, so --restart restarts x-ui
+                                  (only when something changed). The timer runs this weekly.
+    xui-geo security on|off       block geosite malware, phishing and cryptominers for every
+                                  user inbound (one tagged rule; tested, backed up, x-ui restart)
+
+The lists come from Chocolate4U/Iran-v2ray-rules - the same files 3x-ui ships as
+geosite_IR.dat / geoip_IR.dat: Iranian domains outside .ir, Iranian IP ranges (with the
+local messengers), ads, and malware / phishing / cryptominer lists. 3x-ui only replaces
+them when the panel itself is updated, so on a long-running hub they grow old while the
+"ir-direct" rules keep trusting them.
+
+Downloads go direct first and through the guard's probe ports (the tunnels) when GitHub
+does not answer from the hub.
+"""
+import glob, hashlib, json, os, shutil, sqlite3, subprocess, sys, time
+
+DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
+CFG = BIN + "/config.json"
+REPO = "Chocolate4U/Iran-v2ray-rules"
+FILES = {"geosite.dat": "geosite_IR.dat", "geoip.dat": "geoip_IR.dat"}     # release asset -> local name
+STATE = "/var/lib/xui-geo/state.json"
+TAG = "xui-optimizer-security"
+SECURITY = ["ext:geosite_IR.dat:malware", "ext:geosite_IR.dat:phishing", "ext:geosite_IR.dat:cryptominers"]
+NOT_PROXY = {"freedom", "blackhole", "dns"}
+XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def socks_ports():
+    try:
+        return [i["port"] for i in load(CFG, {}).get("inbounds", []) if (i.get("tag") or "").startswith("guard-")]
+    except Exception:
+        return []
+
+
+def fetch(url, out, timeout=120):
+    """curl, direct first, then through each tunnel's probe port."""
+    for via in [None] + socks_ports()[:3]:
+        cmd = ["curl", "-fsSL", "-m", str(timeout), "-o", out, url]
+        if via:
+            cmd[1:1] = ["--socks5-hostname", "127.0.0.1:%d" % via]
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            return True
+    return False
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def latest():
+    """Tag and date of the newest release (from GitHub's API, direct or through a tunnel)."""
+    tmp = "/tmp/xui-geo-release.json"
+    if not fetch("https://api.github.com/repos/%s/releases/latest" % REPO, tmp, 30):
+        return {}
+    r = load(tmp, {})
+    os.remove(tmp)
+    return {"tag": r.get("tag_name"), "date": r.get("published_at")}
+
+
+def status():
+    st = load(STATE, {})
+    files = {}
+    for asset, local in FILES.items():
+        p = os.path.join(BIN, local)
+        files[local] = {"exists": os.path.exists(p),
+                        "age_days": round((time.time() - os.path.getmtime(p)) / 86400, 1) if os.path.exists(p) else None,
+                        "size": os.path.getsize(p) if os.path.exists(p) else 0}
+    rules = load(CFG, {}).get("routing", {}).get("rules", [])
+    return {"files": files, "installed_tag": st.get("tag"), "updated": st.get("updated"),
+            "security": any(r.get("ruleTag") == TAG for r in rules),
+            "ir_direct": [r.get("ruleTag") for r in rules if (r.get("ruleTag") or "").startswith("ir-direct")]}
+
+
+def xray_accepts(path):
+    """Would Xray load this list? A rule on a category that must exist, tested with xray -test."""
+    probe = {"log": {"loglevel": "none"}, "outbounds": [{"protocol": "freedom", "tag": "d"}],
+             "routing": {"rules": [{"type": "field", "outboundTag": "d",
+                                    **({"domain": ["ext:%s:ir" % os.path.basename(path)]} if "site" in path
+                                       else {"ip": ["ext:%s:ir" % os.path.basename(path)]})}]}}
+    tmp = "/tmp/xui-geo-probe.json"
+    with open(tmp, "w") as f:
+        json.dump(probe, f)
+    r = subprocess.run([XRAY, "run", "-test", "-c", tmp], cwd=os.path.dirname(path), capture_output=True, text=True)
+    os.remove(tmp)
+    return r.returncode == 0
+
+
+def update(restart):
+    rel = latest()
+    st = load(STATE, {})
+    if rel.get("tag") and rel["tag"] == st.get("tag"):
+        return {"ok": True, "changed": False, "msg": "فهرست‌ها به‌روزند (%s)" % rel["tag"]}
+    work = "/tmp/xui-geo-" + str(os.getpid())
+    os.makedirs(work, exist_ok=True)
+    try:
+        for asset, local in FILES.items():
+            base = "https://github.com/%s/releases/latest/download/%s" % (REPO, asset)
+            if not fetch(base, os.path.join(work, local)) or not fetch(base + ".sha256sum", os.path.join(work, local + ".sum")):
+                return {"ok": False, "changed": False, "msg": "دانلود %s نشد (نه مستقیم، نه از تانل‌ها)" % asset}
+            want = open(os.path.join(work, local + ".sum")).read().split()[0].lower()
+            if sha256(os.path.join(work, local)) != want:
+                return {"ok": False, "changed": False, "msg": "sha256 فایل %s نمی‌خواند؛ چیزی عوض نشد" % asset}
+            if not xray_accepts(os.path.join(work, local)):
+                return {"ok": False, "changed": False, "msg": "Xray فایل %s را نپذیرفت؛ چیزی عوض نشد" % asset}
+        changed = False
+        backup = "/root/xui-geo-backup-" + time.strftime("%Y%m%d-%H%M%S")
+        for local in FILES.values():
+            new, cur = os.path.join(work, local), os.path.join(BIN, local)
+            if os.path.exists(cur) and sha256(cur) == sha256(new):
+                continue
+            os.makedirs(backup, exist_ok=True)
+            if os.path.exists(cur):
+                shutil.copy2(cur, backup)
+            shutil.copyfile(new, cur + ".new")
+            shutil.copymode(cur, cur + ".new") if os.path.exists(cur) else None
+            os.replace(cur + ".new", cur)
+            changed = True
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    save(STATE, {"tag": rel.get("tag"), "date": rel.get("date"), "updated": int(time.time())})
+    if changed and restart:
+        subprocess.run(["systemctl", "restart", "x-ui"], check=False)
+    return {"ok": True, "changed": changed,
+            "msg": ("فهرست‌های ایران به %s به‌روز شد%s" % (rel.get("tag") or "?", " و x-ui ری‌استارت شد" if restart
+                                                          else "؛ با ری‌استارت بعدی x-ui اعمال می‌شود"))
+                   if changed else "فایل‌ها همان نسخه‌ی قبلی بودند"}
+
+
+def security(on):
+    """One rule: the security categories go to the blackhole outbound, for every user inbound.
+    Only this rule changes; config-guard learns it before x-ui restarts."""
+    db = sqlite3.connect(DB)
+    tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    rules = [r for r in tpl["routing"]["rules"] if r.get("ruleTag") != TAG]
+    kinds = {o.get("tag"): o.get("protocol") for o in tpl["outbounds"]}
+    if on:
+        blackhole = next((t for t, p in kinds.items() if p == "blackhole"), None)
+        if not blackhole:
+            tpl["outbounds"].append({"tag": "blocked", "protocol": "blackhole", "settings": {}})
+            blackhole = "blocked"
+        users = sorted({i for r in rules for i in (r.get("inboundTag") or [])
+                        if not i.startswith("guard-") and i not in ("api", "dns-internal")
+                        and kinds.get(r.get("outboundTag")) not in (None, *NOT_PROXY)})
+        if not users:
+            return {"ok": False, "msg": "اینباندی که به تانل برود پیدا نشد"}
+        at = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
+        rules.insert(at, {"type": "field", "ruleTag": TAG, "inboundTag": users,
+                          "domain": SECURITY, "outboundTag": blackhole})
+    elif len(rules) == len(tpl["routing"]["rules"]):
+        return {"ok": True, "msg": "بستن بدافزار و فیشینگ از قبل خاموش است"}
+    tpl["routing"]["rules"] = rules
+    cfg = load(CFG, {})
+    for k in ("outbounds", "routing"):
+        cfg[k] = tpl[k]
+    tmp = "/tmp/xui-geo-candidate.json"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(tmp, 0o600)
+    r = subprocess.run([XRAY, "run", "-test", "-c", tmp], cwd=BIN, capture_output=True, text=True)
+    os.remove(tmp)
+    if r.returncode:
+        return {"ok": False, "msg": "Xray نپذیرفت: " + ((r.stdout + r.stderr).strip().splitlines() or [""])[-1]}
+    backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
+    os.makedirs(backup)
+    db.close()
+    for f in (DB, CFG):
+        shutil.copy2(f, backup)
+    db = sqlite3.connect(DB)
+    db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
+    db.commit()
+    db.close()
+    if shutil.which("config-guard"):                   # before x-ui rewrites config.json
+        subprocess.run(["config-guard", "--save"], capture_output=True)
+    subprocess.run(["systemctl", "restart", "x-ui"], check=False)
+    return {"ok": True, "backup": backup,
+            "msg": "بستن بدافزار، فیشینگ و استخراج رمزارز %s شد" % ("روشن" if on else "خاموش")}
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    mode = args[0] if args and not args[0].startswith("--") else "status"
+    out = lambda d: print(json.dumps(d, ensure_ascii=False) if as_json else d.get("msg") or json.dumps(d, indent=1))
+    if not XRAY:
+        sys.exit("no xray in " + BIN)
+    if mode == "status":
+        s = status()
+        if "--latest" in args:
+            s["latest"] = latest()
+        out(s)
+    elif mode == "update":
+        r = update("--restart" in args)
+        out(r)
+        sys.exit(0 if r["ok"] else 1)
+    elif mode == "security" and len(args) > 1 and args[1] in ("on", "off"):
+        r = security(args[1] == "on")
+        out(r)
+        sys.exit(0 if r["ok"] else 1)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()

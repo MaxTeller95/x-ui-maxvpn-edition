@@ -427,6 +427,32 @@ def split_check():
     return _split_cache[1]
 
 
+_slow = {}
+
+
+def cached(key, secs, fn):
+    """A slow helper (a tool run) at most once per `secs`."""
+    hit = _slow.get(key)
+    if not hit or time.time() - hit[0] > secs:
+        _slow[key] = hit = (time.time(), fn())
+    return hit[1]
+
+
+def reach_view():
+    """The last round of xui-reach (from its history file; the tool itself runs on a timer)."""
+    h = json.loads(read("/var/lib/xui-reach/history.json", "{}") or "{}")
+    rounds = h.get("rounds") or []
+    if not rounds:
+        return {"installed": os.path.exists("/usr/local/sbin/xui-reach"), "last": None}
+    last = rounds[-1]
+    trend = {}
+    for r in rounds[-36:]:                                 # 6 hours at one round per 10 minutes
+        for p, got in r.get("res", {}).items():
+            ok = [v for v in got.values() if v not in (None, "x")]
+            trend.setdefault(p, []).append([r["t"], len(ok), len([v for v in got.values() if v is not None])])
+    return {"installed": True, "last": last, "trend": trend, "down": h.get("down", {})}
+
+
 def status():
     st = json.loads(read(GUARD_STATE, "{}") or "{}")
     c, cfg = conf(), xray_cfg()
@@ -451,6 +477,8 @@ def status():
 
         },
         "cert": {"file": c.get("cert"), "days": cert_days(c["cert"]) if c.get("cert") else None},
+        "certs": cached("certs", 600, lambda: jrun("xui-cert", "status", "--json", timeout=40)),
+        "geo": cached("geo", 300, lambda: jrun("xui-geo", "status", "--json", timeout=20)),
         "inbounds": {i["tag"]: (i["remark"] or i["tag"]) for i in inbound_rows()},
         "res": resources(), "month": vnstat_month(), "backups": backups(),
         "xray": run(XRAY, "version", timeout=5)[1].split("\n")[0] if os.path.exists(XRAY) else "",
@@ -897,6 +925,56 @@ def checkup():
             return add("warn", "گواهی TLS", "خوانده نشد")
         add("ok" if d > 20 else "warn" if d > 7 else "bad", "گواهی TLS", "%d روز اعتبار دارد" % d)
 
+    def subscription():
+        """3x-ui 3.3+: a browser opening a subscription link gets a page (usage ring, quota,
+        one-tap import, right-to-left for Persian); apps get their configs. Both, for real."""
+        if setting("subEnable") != "true":
+            return add("warn", "لینک اشتراک", "سرویس اشتراک پنل خاموش است",
+                       "در تنظیمات پنل ← اشتراک روشنش کنید تا کاربران لینک اشتراک بگیرند.")
+        port, path = setting("subPort") or "2096", setting("subPath") or "/sub/"
+        with db() as cn:
+            row = cn.execute("select sub_id from clients where enable=1 and sub_id!='' limit 1").fetchone()
+        if not row:
+            return add("warn", "لینک اشتراک", "کلاینت فعالی با لینک اشتراک نیست")
+        url = "https://127.0.0.1:%s%s%s" % (port, path, row[0])
+        page = run("curl", "-sk", "-m", "8", "-H", "Accept: text/html", "-A", "Mozilla/5.0 (Android 14) Mobile",
+                   "-o", "/dev/null", "-w", "%{http_code} %{content_type}", url, timeout=12)[1]
+        app = run("curl", "-sk", "-m", "8", "-A", "v2rayNG/1.9", "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
+                  url, timeout=12)[1]
+        page_ok = page.startswith("200") and "text/html" in page
+        app_ok = app.startswith("200") and int((app.split() + ["0", "0"])[1] or 0) > 20
+        d = cert_days(setting("subCertFile")) if setting("subCertFile") else None
+        detail = "صفحه‌ی اشتراک برای مرورگر %s · کانفیگ برای اپ %s%s" % (
+            "باز می‌شود" if page_ok else "باز نمی‌شود", "می‌رسد" if app_ok else "نمی‌رسد",
+            (" · گواهی %d روز" % d) if d is not None else "")
+        add("ok" if page_ok and app_ok and (d is None or d > 20) else "bad" if not app_ok else "warn",
+            "لینک اشتراک (پورت %s)" % port, detail,
+            "" if page_ok else "نسخه‌ی پنل صفحه‌ی اشتراک ندارد یا پاسخ نمی‌دهد؛ پنل 3.3 به بعد لازم است.")
+
+    def geo():
+        g = jrun("xui-geo", "status", "--json", timeout=20) or {}
+        f = (g.get("files") or {}).get("geosite_IR.dat") or {}
+        if f.get("age_days") is None:
+            return
+        add("ok" if f["age_days"] < 14 else "warn", "فهرست‌های ایران (ir-direct)",
+            "%.0f روز پیش به‌روز شده%s" % (f["age_days"], " · بستن بدافزار روشن" if g.get("security") else ""),
+            "" if f["age_days"] < 14 else "xui-geo update --restart (یا دکمه‌ی به‌روزرسانی در ابزارها)")
+
+    def reach():
+        r = reach_view()
+        if not r.get("last"):
+            return
+        v, bad = r["last"], []
+        for p in v["ports"]:
+            got = v["res"].get(str(p["port"])) or {}          # JSON keys are strings
+            answered = [x for x in got.values() if x is not None]
+            if answered and 2 * len([x for x in answered if x != "x"]) < len(answered):
+                bad.append(p["port"])
+        add("ok" if not bad else "bad", "دسترسی از داخل ایران",
+            ("همه‌ی %d پورت از %d نقطه‌ی داخل در دسترس‌اند" % (len(v["ports"]), len(v["nodes"]))) if not bad
+            else "از داخل ایران وصل نمی‌شوند: " + "، ".join(map(str, bad)),
+            "" if not bad else "فیلتر پورت یا مسیر داخلی؛ جدول کامل در کارت «دسترسی از داخل ایران».")
+
     def panel():
         r = lint()
         bad = [f for f in r["findings"] if f["level"] == "bad"]
@@ -932,7 +1010,8 @@ def checkup():
             "هر سه اعمال شده" if not off else "اعمال نشده: " + "، ".join(off),
             "" if not off else "فایل sysctl/99-proxy-tcp.conf را در /etc/sysctl.d بگذارید و sysctl -p بزنید.")
 
-    for fn in (clock, xray_test, paths, speed, dns, mtu, machine, cert, panel, config_guard, backup, kernel):
+    for fn in (clock, xray_test, paths, speed, dns, mtu, machine, cert, subscription, geo, reach, panel,
+               config_guard, backup, kernel):
         try:
             fn()
         except Exception as e:
@@ -1065,6 +1144,16 @@ def action(name, body):
             _split_cache[0] = 0
             return {"ok": rc == 0, "msg": out.splitlines()[-2] if rc == 0 and len(out.splitlines()) > 1 else out[-200:]}
         return jrun_any("xui-split", "fix", "--json", "--no-tg-backup", timeout=180) or r   # mux settings: live
+    if name == "reach-run":                      # a round takes a minute or two: started, then polled
+        rc, out = run("systemctl", "start", "--no-block", "xui-reach.service", timeout=15)
+        return {"ok": rc == 0, "msg": out, "since": int(time.time())}
+    if name == "geo-update":                     # restarts x-ui only when a list changed
+        _slow.pop("geo", None)
+        return jrun_any("xui-geo", "update", "--restart", "--json", timeout=300) or {"ok": False, "msg": "انجام نشد"}
+    if name == "security":                       # restarts x-ui: the page asks first
+        _slow.pop("geo", None)
+        return jrun_any("xui-geo", "security", "on" if body.get("on") else "off", "--json", timeout=150) \
+            or {"ok": False, "msg": "انجام نشد"}
     if name == "split-fix":
         _split_cache[0] = 0
         return jrun_any("xui-split", "fix", "--json", "--no-tg-backup", timeout=180) or {"ok": False, "msg": "انجام نشد"}
@@ -1132,7 +1221,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "xo-dash"
     GETS = {"api/status": status, "api/live": lambda: METRICS.snapshot(), "api/users": users_view,
             "api/lint": lint, "api/confguard": confguard, "api/units": units, "api/paths": paths_view,
-            "api/tunnels": tunnels_view}
+            "api/tunnels": tunnels_view, "api/reach": reach_view}
 
     def log_message(self, *a):
         pass

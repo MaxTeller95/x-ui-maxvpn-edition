@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly update of the Iran routing lists, at night (x-ui restarts only if they changed)
+
+[Timer]
+OnCalendar=Fri *-*-* 00:40:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -298,7 +298,9 @@ xui-path remove TR2
 ```
 
 It parses vless, trojan, vmess and shadowsocks links (tcp/ws/xhttp/grpc/httpupgrade with
-none/tls/reality), writes the outbound in the same shape the panel itself uses, picks the
+none/tls/reality), `hysteria2://` (native in Xray, built the way 3x-ui builds it: salamander
+obfs and `mport` hopping become finalmask masks) and `tuic://` (Xray has no TUIC: a local
+SOCKS port in sing-box's config carries it, which needs sing-box and restarts it), writes the outbound in the same shape the panel itself uses, picks the
 next free probe port from 10808, puts the `guard-<name>` rule next to the other probe
 rules, tests the whole config with `xray -test` **before** touching anything, backs up,
 restarts x-ui, saves the new baseline for config-guard, and then actually connects
@@ -363,6 +365,29 @@ State is kept in `/var/lib/tunnel-guard/tunnels.json`, and the lists are kept un
 `"tunnels"` in `/etc/tunnel-guard.json`. On the page this is the **Tunnels** card in
 tools. It has a find-tunnels table, and each path has its addresses, test / use / ▲ /
 remove buttons, a scan button, a field for typing an address, and the last moves.
+
+## xui-reach, xui-geo, xui-cert
+
+- **xui-reach** - every probe the hub runs goes outwards, but a user's outage is often on the
+  path from their operator to the hub. Every 10 minutes (`xui-reach.timer`) it asks
+  check-host.net's nodes inside Iran (Tehran, Isfahan, Shiraz, Qom; different networks) for a
+  real TCP connect to every public port and the subscription port, keeps 48 hours, and tells
+  Telegram when a port is unreachable from most of them twice in a row, and when it is back.
+  The nodes are hosting networks, not the mobile operators. The hub's address is sent to
+  check-host.net. Settings in `/etc/xui-reach.json` (`host`, `ports`, `nodes`, `fails_to_alert`).
+- **xui-geo** - `ir-direct` rules trust `geosite_IR.dat` / `geoip_IR.dat` (Chocolate4U/
+  Iran-v2ray-rules), which the panel only replaces on its own update. `xui-geo update` fetches
+  the newest release (direct, or through the tunnels), checks sha256, test-loads them with Xray
+  and swaps them in; `--restart` restarts x-ui only if something changed; `xui-geo.timer` runs
+  it weekly at night. `xui-geo security on|off` blocks the malware, phishing and cryptominers
+  lists for every user inbound (one tagged rule).
+- **xui-cert** - a certificate issued with plain `--dns` cannot renew itself. `xui-cert auto
+  DOMAIN --dns dns_arvan` (or `dns_cf`, ...) with the provider's token exported once re-issues it
+  through the DNS API and installs it where the panel reads it; acme.sh's cron renews from then
+  on. `--test` proves the token against Let's Encrypt staging first. `xui-cert status` lists the
+  certificates the panel, the subscription and nginx use and how each renews.
+- The page's check-up also opens a real subscription link as a browser (3x-ui 3.3+ serves a
+  page: usage ring, quota, one-tap import, RTL) and as an app, and checks its certificate.
 
 ## config-guard - the routing comes back by itself
 

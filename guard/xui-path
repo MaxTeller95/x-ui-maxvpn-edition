@@ -18,8 +18,17 @@ a local socks port so tunnel-guard can probe it on its own, and an entry in
 through the new path and says whether it answered.
 
 Supported links: vless (tcp/ws/xhttp/grpc/httpupgrade, none/tls/reality),
-trojan, vmess and shadowsocks. The primary path cannot be removed, and neither
-can the one users are on right now.
+trojan, vmess, shadowsocks, and two QUIC (UDP) protocols for a fast backup on a lossy link:
+
+  hysteria2:// (hy2://)  native in Xray: built the way the 3x-ui panel builds it from the same
+                         link (salamander obfs and mport port hopping become finalmask masks)
+  tuic://                Xray has no TUIC. The standard answer is sing-box as a sidecar: a local
+                         SOCKS port in /etc/sing-box/config.json that sing-box sends on as TUIC,
+                         and the path's outbound is that port. Needs sing-box installed; adding
+                         or removing such a path restarts sing-box (its own tuns blink too).
+
+Both ride UDP: where UDP abroad is throttled they fail, and the guard simply skips them.
+The primary path cannot be removed, and neither can the one users are on right now.
 """
 import base64, glob, json, os, re, shutil, sqlite3, subprocess, sys, time, urllib.parse
 
@@ -53,11 +62,122 @@ def unpad(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+def parse_hysteria2(link):
+    """hysteria2:// / hy2:// -> Xray's hysteria outbound, as 3x-ui's own link importer writes it."""
+    u = urllib.parse.urlsplit(link)
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+    if not u.hostname:
+        raise ValueError("آدرس در لینک hysteria2 پیدا نشد")
+    tls = {"serverName": q.get("sni", ""), "alpn": (q.get("alpn") or "h3").split(",")}
+    for key, field in (("fp", "fingerprint"), ("pinSHA256", "pinnedPeerCertSha256"), ("ech", "echConfigList")):
+        if q.get(key):
+            tls[field] = q[key]
+    stream = {"network": "hysteria", "security": "tls",
+              "hysteriaSettings": {"version": 2, "auth": urllib.parse.unquote(u.username or ""), "udpIdleTimeout": 60},
+              "tlsSettings": tls}
+    masks = []
+    obfs = (q.get("obfs") or "").lower()
+    password = q.get("obfs-password") or q.get("obfs_password") or q.get("obfsPassword")
+    if obfs in ("salamander", "gecko") and password:
+        masks.append({"type": "salamander", "settings": {"password": password}})
+    if q.get("mport"):                                  # port hopping: xray 26.9.9's udphop mask
+        masks.append({"type": "udphop", "settings": {"mode": "intervalremote", "interval": "5-10",
+                                                     "remotePorts": q["mport"]}})
+    if masks:
+        stream["finalmask"] = {"udp": masks}
+    return {"protocol": "hysteria", "settings": {"address": u.hostname, "port": u.port or 443, "version": 2},
+            "streamSettings": stream}
+
+
+def parse_tuic(link):
+    """tuic://uuid:password@host:port?... -> what the sing-box sidecar needs."""
+    u = urllib.parse.urlsplit(link)
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+    if not u.hostname or not u.username:
+        raise ValueError("لینک tuic باید uuid:password@host:port باشد")
+    return {"_tuic": {
+        "server": u.hostname, "server_port": u.port or 443,
+        "uuid": urllib.parse.unquote(u.username), "password": urllib.parse.unquote(u.password or ""),
+        "congestion_control": q.get("congestion_control") or q.get("congestion") or "bbr",
+        "udp_relay_mode": q.get("udp_relay_mode") or "native",
+        "tls": {"enabled": True, "server_name": q.get("sni") or u.hostname,
+                "alpn": (q.get("alpn") or "h3").split(","),
+                "insecure": (q.get("allow_insecure") or q.get("insecure") or "0") in ("1", "true")}}}
+
+
+SB_CONF = "/etc/sing-box/config.json"
+
+
+def sidecar_tag(name):
+    return "xp-" + name.lower()
+
+
+def sidecar_write(c, as_json):
+    """Check with sing-box itself, keep a copy, swap it in and restart sing-box."""
+    sb = shutil.which("sing-box")
+    tmp = SB_CONF + ".candidate"
+    with open(tmp, "w") as f:
+        json.dump(c, f, indent=2)
+    r = subprocess.run([sb, "check", "-c", tmp], capture_output=True, text=True)
+    if r.returncode:
+        os.remove(tmp)
+        die("sing-box این کانفیگ را رد کرد: " + ((r.stdout + r.stderr).strip().splitlines() or [""])[-1], as_json)
+    if os.path.exists(SB_CONF):
+        shutil.copy2(SB_CONF, SB_CONF + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+    os.replace(tmp, SB_CONF)
+    subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+    time.sleep(2)
+
+
+def sidecar_add(name, tuic, as_json):
+    """A local SOCKS port that sing-box sends on as TUIC. Returns the port."""
+    if not shutil.which("sing-box"):
+        die("برای TUIC، sing-box لازم است (Xray پروتکل TUIC ندارد): bash <(curl -fsSL https://sing-box.app/deb-install.sh)",
+            as_json)
+    try:
+        c = json.load(open(SB_CONF))
+    except (OSError, ValueError):
+        c = {"log": {"level": "warn"}, "inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}],
+             "route": {"rules": []}}
+    tag = sidecar_tag(name)
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    c["inbounds"] = [i for i in c.get("inbounds", []) if i.get("tag") != tag + "-in"] + [
+        {"type": "socks", "tag": tag + "-in", "listen": "127.0.0.1", "listen_port": port}]
+    c["outbounds"] = [o for o in c.get("outbounds", []) if o.get("tag") != tag] + [dict(tuic, type="tuic", tag=tag)]
+    route = c.setdefault("route", {})
+    route["rules"] = [{"inbound": [tag + "-in"], "outbound": tag}] + [
+        r for r in route.get("rules", []) if r.get("outbound") != tag]
+    sidecar_write(c, as_json)
+    return port
+
+
+def sidecar_remove(name, as_json):
+    tag = sidecar_tag(name)
+    try:
+        c = json.load(open(SB_CONF))
+    except (OSError, ValueError):
+        return
+    if not any(o.get("tag") == tag for o in c.get("outbounds", [])):
+        return
+    c["inbounds"] = [i for i in c.get("inbounds", []) if i.get("tag") != tag + "-in"]
+    c["outbounds"] = [o for o in c.get("outbounds", []) if o.get("tag") != tag]
+    c.setdefault("route", {})["rules"] = [r for r in c["route"].get("rules", []) if r.get("outbound") != tag]
+    sidecar_write(c, as_json)
+
+
 def parse_link(link):
     """Turn a share link into an outbound, in the shape this panel writes them."""
     link = link.strip()
     scheme, _, rest = link.partition("://")
     scheme = scheme.lower()
+    if scheme in ("hysteria2", "hy2"):
+        return parse_hysteria2(link)
+    if scheme == "tuic":
+        return parse_tuic(link)
     if scheme == "vmess":                      # base64 of a json blob
         try:
             v = json.loads(unpad(rest.split("#")[0]))
@@ -225,6 +345,12 @@ def add(name, link, peer, as_json, iface="", addrs=()):
         ob = parse_link(link)
     except ValueError as e:
         die(str(e), as_json)
+    if "_tuic" in ob:                                   # through the sing-box sidecar
+        tuic = ob.pop("_tuic")
+        peer = peer or tuic["server"]
+        sp = sidecar_add(name, tuic, as_json)
+        ob = {"protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": sp}]},
+              "streamSettings": {"network": "tcp", "security": "none"}}
     ob["tag"] = name
     tag = "guard-" + name.lower()
     port = probe_port(t)
@@ -237,6 +363,8 @@ def add(name, link, peer, as_json, iface="", addrs=()):
 
     ok, detail = test_config(t)
     if not ok:
+        if ob.get("protocol") == "socks":               # a TUIC sidecar was made for it: take it back out
+            sidecar_remove(name, as_json)
         die("Xray این کانفیگ را رد کرد: " + detail, as_json)
     backup = apply(t, "add " + name)
     addr, entry = ob["settings"].get("address", ""), {}
@@ -303,6 +431,7 @@ def remove(name, as_json):
     if not ok:
         die("Xray کانفیگ بدون این مسیر را رد کرد: " + detail, as_json)
     backup = apply(t, "remove " + name)
+    sidecar_remove(name, as_json)                       # a TUIC path's part in sing-box, if it had one
     c["backups"] = [b for b in c.get("backups", []) if b != name]
     c.get("paths", {}).pop(name, None)
     c.get("paths", {}).pop(name + "-mux", None)

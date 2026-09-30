@@ -1,0 +1,10 @@
+[Unit]
+Description=Test the hub's public ports from inside Iran every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

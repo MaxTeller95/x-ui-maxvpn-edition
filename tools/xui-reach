@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""xui-reach - can people inside Iran reach this hub? Every public port, from networks in Iran.
+
+    xui-reach                 one round: each public inbound port (and the subscription port)
+                              tested with a real TCP connect from check-host.net's nodes in Iran
+    xui-reach --json          the same, machine readable (the Optimizer page)
+    xui-reach history [--json]   the last 48 hours
+    xui-reach nodes           the nodes in Iran and the network (AS) each one sits in
+
+Every probe the hub runs by itself goes from the hub outwards. A user's outage is often
+on the other side: the path from their operator to the hub. This asks check-host.net's
+nodes inside Iran (Tehran, Isfahan, Shiraz, Qom - each in a different network) to open a
+TCP connection to every public port of the hub, and keeps the answers for 48 hours.
+
+Those nodes are hosting networks, not the mobile operators themselves; they still show a
+port that is filtered or a route that is broken inside the country, which the hub cannot
+see from where it stands. Note that the hub's address and ports are sent to check-host.net.
+
+Settings (optional) in /etc/xui-reach.json:
+    {"host": "hub.example.com",      # what to test; default: the hub's public IPv4
+     "ports": [443, 2053],          # default: every enabled inbound + the subscription port
+     "nodes": ["ir1", "ir5"],       # default: every node in Iran
+     "fails_to_alert": 2}           # rounds in a row before Telegram hears about it
+A timer (xui-reach.timer) runs one round every 10 minutes.
+"""
+import json, os, sqlite3, subprocess, sys, time, urllib.parse, urllib.request
+
+DB = "/etc/x-ui/x-ui.db"
+CONF, STATE_DIR = "/etc/xui-reach.json", "/var/lib/xui-reach"
+HIST = STATE_DIR + "/history.json"
+API = "https://check-host.net"
+KEEP = 48 * 3600
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+
+
+def get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "xui-reach"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def public_ip():
+    r = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True)
+    parts = r.stdout.split()
+    return parts[parts.index("src") + 1] if "src" in parts else ""
+
+
+def targets(conf):
+    """[(port, what it is)] - enabled inbounds that listen on every address, and the subscription."""
+    if conf.get("ports"):
+        return [(int(p), str(p)) for p in conf["ports"]]
+    db = sqlite3.connect(DB)
+    out = []
+    for tag, remark, port, listen in db.execute("select tag, remark, port, listen from inbounds where enable=1"):
+        if (listen or "") in ("", "0.0.0.0", "::"):
+            out.append((int(port), remark or tag))
+    get_set = lambda k: (db.execute("select value from settings where key=?", (k,)).fetchone() or [""])[0]
+    if get_set("subEnable") == "true" and get_set("subPort") and (get_set("subListen") or "") in ("", "0.0.0.0"):
+        out.append((int(get_set("subPort")), "subscription"))
+    return sorted(set(out))
+
+
+def iran_nodes(conf):
+    nodes = get(API + "/nodes/hosts").get("nodes", {})
+    ir = {k: {"city": v["location"][2] if len(v["location"]) > 2 else "", "asn": v.get("asn", ""),
+              "ip": v.get("ip", "")}
+          for k, v in nodes.items() if v.get("location", [""])[0].lower() == "ir"}
+    want = conf.get("nodes")
+    if want:
+        ir = {k: v for k, v in ir.items() if k.split(".")[0] in want or k in want}
+    return ir
+
+
+def round_(conf):
+    host = conf.get("host") or public_ip()
+    nodes = iran_nodes(conf)
+    if not host or not nodes:
+        raise RuntimeError("no public address, or check-host has no node in Iran right now")
+    ports = targets(conf)
+    started = {}
+    for port, _ in ports:
+        q = urllib.parse.urlencode([("host", "%s:%d" % (host, port))] + [("node", n) for n in nodes])
+        started[port] = get(API + "/check-tcp?" + q)["request_id"]
+        time.sleep(1)                                   # be polite to a free service
+    res = {}
+    deadline = time.time() + 40
+    pending = dict(started)
+    while pending and time.time() < deadline:
+        time.sleep(4)
+        for port, rid in list(pending.items()):
+            got = get(API + "/check-result/" + rid)
+            if all(v is not None for v in got.values()) or time.time() > deadline - 4:
+                res[port] = {}
+                for node, v in got.items():
+                    if not v:
+                        res[port][node] = None                          # no answer from the node itself
+                    elif isinstance(v[0], dict) and "time" in v[0]:
+                        res[port][node] = round(v[0]["time"] * 1000)    # ms
+                    else:
+                        res[port][node] = "x"                           # timed out / refused
+                pending.pop(port)
+    return {"t": int(time.time()), "host_is_ip": not conf.get("host"),
+            "ports": [{"port": p, "what": w} for p, w in ports], "nodes": nodes, "res": res}
+
+
+def verdicts(r):
+    """Per port: how many nodes reached it. A port no node reaches is down from inside Iran."""
+    out = {}
+    for p in r["ports"]:
+        got = r["res"].get(p["port"]) or r["res"].get(str(p["port"])) or {}   # str once saved as JSON
+        answered = [v for v in got.values() if v is not None]
+        ok = [v for v in answered if v != "x"]
+        out[p["port"]] = {"ok": len(ok), "of": len(answered), "what": p["what"]}
+    return out
+
+
+def say(text):
+    subprocess.run(["tunnel-guard", "--say", text], capture_output=True, timeout=40)
+
+
+def alert(hist, r, conf):
+    """Telegram when a port stops being reachable from inside Iran, and when it comes back."""
+    need = int(conf.get("fails_to_alert", 2))
+    down = hist.setdefault("down", {})
+    v = verdicts(r)
+    for port, x in v.items():
+        key = str(port)
+        bad = x["of"] and x["ok"] * 2 < x["of"]        # fewer than half the nodes got through
+        streak = hist.setdefault("streak", {})
+        streak[key] = streak.get(key, 0) + 1 if bad else 0
+        if bad and streak[key] >= need and key not in down:
+            down[key] = r["t"]
+            say("🌐 پورت %s (%s) از داخل ایران در دسترس نیست: فقط %d از %d نقطه‌ی داخل وصل شدند."
+                % (port, x["what"], x["ok"], x["of"]))
+        elif not bad and key in down:
+            mins = round((r["t"] - down.pop(key)) / 60)
+            say("✅ پورت %s (%s) دوباره از داخل ایران در دسترس است (%d دقیقه)." % (port, x["what"], mins))
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    conf = load(CONF, {})
+    hist = load(HIST, {"rounds": []})
+    if "nodes" in args:
+        n = iran_nodes(conf)
+        return print(json.dumps(n, ensure_ascii=False) if as_json else
+                     "\n".join("%-26s %-8s %s" % (k, v["city"], v["asn"]) for k, v in sorted(n.items())))
+    if "history" in args:
+        return print(json.dumps(hist, ensure_ascii=False) if as_json else
+                     "\n".join("%s  %s" % (time.strftime("%F %H:%M", time.localtime(r["t"])),
+                                           "  ".join("%s:%d/%d" % (p, x["ok"], x["of"]) for p, x in verdicts(r).items()))
+                               for r in hist["rounds"][-20:]))
+    try:
+        r = round_(conf)
+    except Exception as e:                              # the service can be down or rate-limit us
+        msg = "check-host.net: %s" % e
+        print(json.dumps({"ok": False, "msg": msg}, ensure_ascii=False) if as_json else msg)
+        sys.exit(1)
+    hist["rounds"] = [x for x in hist["rounds"] if x["t"] > time.time() - KEEP] + [r]
+    if "--no-alert" not in args:
+        alert(hist, r, conf)
+    save(HIST, hist)
+    if as_json:
+        return print(json.dumps(dict(r, ok=True, verdicts=verdicts(r)), ensure_ascii=False))
+    names = sorted(r["nodes"])
+    print("%-7s %-16s " % ("port", "") + " ".join("%-9s" % r["nodes"][n]["city"][:9] for n in names))
+    for p in r["ports"]:
+        row = r["res"].get(p["port"], {})
+        cell = lambda v: "-" if v is None else "BLOCKED" if v == "x" else "%dms" % v
+        print("%-7s %-16s " % (p["port"], p["what"][:16]) + " ".join("%-9s" % cell(row.get(n)) for n in names))
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()

@@ -1,0 +1,8 @@
+[Unit]
+Description=Is the hub reachable from inside Iran? (check-host.net nodes)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-reach
+TimeoutStartSec=180

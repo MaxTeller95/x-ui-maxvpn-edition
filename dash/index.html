@@ -291,10 +291,21 @@
         <div class="muted">از vnstat روی خود هاب؛ برای کنترل سقف ترافیک سرور خارج.</div>
       </div>
 
+      <div class="card wide">
+        <h2>دسترسی از داخل ایران <span class="muted" id="reach-when"></span>
+          <button id="reach-run">همین حالا بسنج</button></h2>
+        <div id="reach" class="muted">...</div>
+        <div class="muted sm" style="margin-top:6px">هر ۱۰ دقیقه، هر پورت عمومی هاب از نقطه‌های داخل ایران
+          (check-host.net؛ شبکه‌های مختلف در تهران، اصفهان، شیراز و قم) با اتصال TCP واقعی سنجیده می‌شود. اگر
+          پورتی از بیشتر نقطه‌ها دو بار پشت سر هم وصل نشود، تلگرام خبر می‌دهد. این نقطه‌ها شبکه‌ی دیتاسنتر هستند، نه
+          خود اپراتورهای موبایل.</div>
+      </div>
+
       <div class="card">
         <h2>گواهی TLS</h2>
         <div class="v" id="cert-days" style="font-size:28px;font-weight:700">—</div>
         <div class="muted" id="cert-note"></div>
+        <div id="cert-mode" class="sm" style="margin-top:6px"></div>
       </div>
 
       <div class="card">
@@ -330,6 +341,14 @@
           <div>بستن تبلیغات<div class="muted">تبلیغ و ردیاب‌ها روی هاب بسته می‌شوند و از تانل رد نمی‌شوند</div></div>
           <label class="switch"><input type="checkbox" id="ads"><span></span></label>
         </div>
+        <div class="row">
+          <div>بستن بدافزار، فیشینگ و استخراج رمزارز<div class="muted">از فهرست امنیتی Iran-v2ray-rules</div></div>
+          <label class="switch"><input type="checkbox" id="sec"><span></span></label>
+        </div>
+        <div class="row">
+          <div>فهرست‌های ایران (ir-direct)<div class="muted" id="geo-age"></div></div>
+          <button id="geo-update">به‌روزرسانی</button>
+        </div>
       </div>
 
       <div class="card wide">
@@ -337,7 +356,7 @@
         <table id="paths-tbl"><tbody></tbody></table>
         <div class="find" style="margin-top:12px">
           <input id="np-name" placeholder="نام مسیر، مثل TR2" style="min-width:120px;flex:0 0 140px">
-          <input id="np-link" placeholder="لینک کانفیگ سرور خارج: vless:// یا trojan:// یا vmess:// یا ss://">
+          <input id="np-link" placeholder="لینک کانفیگ سرور خارج: vless:// trojan:// vmess:// ss:// hysteria2:// tuic://">
           <button id="np-add" class="primary">اضافه کن</button>
         </div>
         <div class="find" style="margin-top:6px">
@@ -589,6 +608,15 @@ function renderStatus(s) {
     }).join("")
     + ((sc.problems || []).some((p) => p.group && p.hot)
       ? '<button data-fix="split-fix" style="margin-top:4px">تعمیر خودکار</button>' : "");
+  const geo = s.geo || {}, gf = (geo.files || {})["geosite_IR.dat"] || {};
+  $("#geo-age").textContent = gf.age_days == null ? "xui-geo نصب نیست"
+    : `${Math.round(gf.age_days)} روز پیش به‌روز شده` + (geo.installed_tag ? ` (${geo.installed_tag})` : "")
+      + (gf.age_days > 14 ? " — قدیمی است" : "");
+  if (!$("#sec").disabled) $("#sec").checked = !!geo.security;
+  const auto = ((s.certs || {}).certs || []).find((c) => c.used_by.includes("panel")) || ((s.certs || {}).certs || [])[0];
+  $("#cert-mode").innerHTML = !auto ? "" : auto.auto
+    ? `<span class="chip ok">تمدید خودکار</span> <span class="muted">${esc((auto.acme || {}).mode || "")}${(auto.acme || {}).next ? " · بعدی " + esc(auto.acme.next.slice(0, 10)) : ""}</span>`
+    : `<span class="chip warn">تمدید دستی</span><div class="muted" dir="ltr" style="margin-top:4px;word-break:break-all">${esc(auto.hint || "")}</div>`;
   const d = s.cert.days;
   $("#cert-days").innerHTML = d == null ? "—" : `<span style="color:var(--${d < 20 ? "bad" : d < 35 ? "warn" : "ok"})">${d} روز</span>`;
   $("#cert-note").textContent = d == null ? "" : (d < 20 ? "وقت تمدیده: رکورد TXT جدید لازمه." : "تا انقضا مونده. ۲۰ روز قبلش روی تلگرام هشدار می‌گیرید.");
@@ -789,6 +817,23 @@ async function tnAdd(name, addr) {
   loadTunnels();
   return r.ok;
 }
+function renderReach(v) {
+  if (!v || !v.last) {
+    $("#reach").innerHTML = v && v.installed === false ? "xui-reach نصب نیست." : "هنوز سنجیده نشده. «همین حالا بسنج» را بزنید.";
+    return;
+  }
+  const L = v.last, nodes = Object.keys(L.nodes).sort();
+  $("#reach-when").textContent = ago(L.t);
+  const cell = (x) => x == null ? '<span class="muted">—</span>'
+    : x === "x" ? '<span class="chip bad">بسته</span>' : `<span class="chip ok">${x}</span>`;
+  $("#reach").classList.remove("muted");
+  $("#reach").innerHTML = `<div style="overflow-x:auto"><table><tbody><tr><th>پورت</th>${nodes.map((n) =>
+      `<th class="n" title="${esc(L.nodes[n].asn)}">${esc(L.nodes[n].city)}<div class="muted sm">${esc(L.nodes[n].asn)}</div></th>`).join("")}</tr>
+    ${L.ports.map((p) => { const row = L.res[p.port] || L.res[String(p.port)] || {};
+      return `<tr><td><b>${p.port}</b><div class="muted sm">${esc(p.what)}</div></td>${nodes.map((n) => `<td class="n">${cell(row[n])}</td>`).join("")}</tr>`;
+    }).join("")}</tbody></table></div>`;
+}
+async function loadReach() { const v = await get("reach"); renderReach(v); }
 async function loadTunnels() { const t = await get("tunnels"); if (t) renderTunnels(t); }
 function renderFound(list) {
   const el = $("#tn-found");
@@ -855,6 +900,7 @@ document.querySelectorAll("nav.tabs button").forEach((b) => {
     document.querySelectorAll("[data-panel]").forEach((p) => p.classList.toggle("on", p.dataset.panel === TAB));
     if (TAB === "users" && !U) loadUsers();
     if (TAB === "health" && !L) { loadLint(); loadCG(); }
+    if (TAB === "health") loadReach();
     if (TAB === "tools") { loadUnits(); loadPaths(); loadTunnels(); }
   };
 });
@@ -1059,6 +1105,36 @@ $("#tn-det").ontoggle = async (e) => {
   $("#tn-found").textContent = "در حال جستجو...";
   const r = await post("tunnel-discover");
   if (r.ok) renderFound(r.result); else $("#tn-found").textContent = "خطا: " + (r.msg || "");
+};
+$("#reach-run").onclick = async (e) => {
+  e.target.disabled = true;
+  const r = await post("reach-run");
+  if (!r.ok) { e.target.disabled = false; toast("خطا: " + (r.msg || "شروع نشد")); return; }
+  $("#reach").textContent = "در حال سنجش هر پورت از نقطه‌های داخل ایران... (یک تا سه دقیقه)";
+  for (let i = 0; i < 40; i++) {                     // the round runs as a service; wait for its result
+    await new Promise((ok) => setTimeout(ok, 6000));
+    const v = await get("reach");
+    if (v && v.last && v.last.t >= r.since) { renderReach(v); break; }
+  }
+  e.target.disabled = false;
+};
+$("#geo-update").onclick = async (e) => {
+  if (!confirm("آخرین فهرست‌های ایران دانلود و بررسی می‌شوند. اگر فرق داشته باشند x-ui ری‌استارت می‌شود (چند ثانیه قطعی). ادامه؟")) return;
+  e.target.disabled = true; toast("در حال دانلود و بررسی...");
+  const r = await post("geo-update");
+  e.target.disabled = false;
+  toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+  loadStatus();
+};
+$("#sec").onchange = async (e) => {
+  const on = e.target.checked;
+  if (!confirm((on ? "بستن بدافزار، فیشینگ و استخراج رمزارز روشن بشه؟" : "خاموش بشه؟")
+      + " فقط همین یک قانون عوض می‌شه، قبلش بکاپ گرفته می‌شه و x-ui ری‌استارت می‌شه.")) { e.target.checked = !on; return; }
+  e.target.disabled = true; toast("در حال اعمال...");
+  const r = await post("security", { on });
+  e.target.disabled = false;
+  toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+  loadStatus();
 };
 $("#tn-scanall").onclick = async (e) => {
   e.target.disabled = true;

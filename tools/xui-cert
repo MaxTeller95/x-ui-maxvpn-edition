@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""xui-cert - TLS certificates of the hub, and renewing them without anyone at the keyboard.
+
+    xui-cert status [--json]                 the certificates the panel, the subscription and nginx
+                                             use: days left, and how acme.sh renews each one
+    xui-cert auto DOMAIN --dns PROVIDER [--test]
+                                             switch DOMAIN to renewal through the DNS provider's API.
+                                             Export the provider's token first, for example
+                                               Arvan_Token="apikey ..."   (ArvanCloud, dns_arvan)
+                                               CF_Token="..."             (Cloudflare, dns_cf)
+                                             acme.sh keeps it in its account.conf for the renewals.
+                                             --test only proves the token works (Let's Encrypt
+                                             staging, in a scratch folder); nothing is replaced.
+
+A certificate issued with `--dns` alone (manual mode) cannot renew itself: acme.sh's cron
+job runs, finds it needs a new TXT record, and stops. The guard then warns 20 days ahead
+and someone has to add the record by hand. With a DNS API the same cron job adds and removes
+the record itself, installs the new files where the panel reads them and restarts x-ui.
+"""
+import glob, json, os, re, sqlite3, subprocess, sys, time
+
+DB = "/etc/x-ui/x-ui.db"
+ACME_HOME = "/root/.acme.sh"
+ACME = ACME_HOME + "/acme.sh"
+TOKENS = {"dns_arvan": ["Arvan_Token"], "dns_cf": ["CF_Token"], "dns_ali": ["Ali_Key", "Ali_Secret"],
+          "dns_dgon": ["DO_API_KEY"], "dns_hetzner": ["HETZNER_Token"], "dns_gd": ["GD_Key", "GD_Secret"]}
+RELOAD = "systemctl reload nginx 2>/dev/null; systemctl restart x-ui"
+
+
+def run(*cmd, timeout=300, env=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def setting(key):
+    try:
+        row = sqlite3.connect(DB).execute("select value from settings where key=?", (key,)).fetchone()
+        return row[0] if row else ""
+    except sqlite3.Error:
+        return ""
+
+
+def cert_info(path):
+    rc, out = run("openssl", "x509", "-in", path, "-noout", "-enddate", "-subject", "-ext", "subjectAltName")
+    if rc:
+        return None
+    end = re.search(r"notAfter=(.+)", out)
+    days = None
+    if end:
+        days = int((time.mktime(time.strptime(end.group(1).strip(), "%b %d %H:%M:%S %Y %Z")) - time.time()) // 86400)
+    names = re.findall(r"DNS:([^,\s]+)", out) or re.findall(r"CN\s*=\s*([^,\s/]+)", out)
+    return {"days": days, "names": names}
+
+
+def acme_conf(domain):
+    """What acme.sh knows about a domain: how it validates, when it renews next."""
+    for d in (f"{ACME_HOME}/{domain}_ecc", f"{ACME_HOME}/{domain}"):
+        f = f"{d}/{domain}.conf"
+        if os.path.exists(f):
+            kv = dict(re.findall(r"^(\w+)='?(.*?)'?$", open(f).read(), re.M))
+            how = kv.get("Le_Webroot", "")
+            mode = ("manual-dns" if how == "dns" else "dns-api:" + how if how.startswith("dns_")
+                    else "standalone" if how == "no" else "webroot" if how else "?")
+            return {"mode": mode, "next": kv.get("Le_NextRenewTimeStr", ""), "ecc": d.endswith("_ecc")}
+    return None
+
+
+def used_certs():
+    """{path: [who uses it]} - the panel, the subscription and nginx."""
+    out = {}
+    for key, who in (("webCertFile", "panel"), ("subCertFile", "subscription")):
+        p = setting(key)
+        if p:
+            out.setdefault(p, []).append(who)
+    for conf in glob.glob("/etc/nginx/conf.d/*.conf") + glob.glob("/etc/nginx/sites-enabled/*"):
+        try:
+            for p in re.findall(r"ssl_certificate\s+([^;]+);", open(conf).read()):
+                out.setdefault(p.strip(), []).append("nginx " + os.path.basename(conf))
+        except OSError:
+            pass
+    return out
+
+
+def status():
+    rows = []
+    for path, who in used_certs().items():
+        info = cert_info(path) or {"days": None, "names": []}
+        domain = next((n for n in info["names"] if not n.startswith("*")), "")
+        a = acme_conf(domain) if domain else None
+        auto = bool(a and a["mode"].startswith(("dns-api", "standalone", "webroot")))
+        rows.append({"path": path, "used_by": who, "domain": domain, "days": info["days"],
+                     "acme": a, "auto": auto,
+                     "hint": "" if auto or not domain else
+                     "تمدید دستی است؛ با توکن DNS خودکارش کنید: Arvan_Token=\"apikey …\" xui-cert auto %s --dns dns_arvan"
+                     % domain})
+    return {"certs": rows, "acme_installed": os.path.exists(ACME)}
+
+
+def auto(domain, provider, test):
+    if not os.path.exists(ACME):
+        return {"ok": False, "msg": "acme.sh نصب نیست: curl https://get.acme.sh | sh"}
+    if not re.match(r"^dns_[a-z0-9_]+$", provider or ""):
+        return {"ok": False, "msg": "--dns باید نام افزونه‌ی acme.sh باشد، مثل dns_arvan یا dns_cf"}
+    saved = open(f"{ACME_HOME}/account.conf").read() if os.path.exists(f"{ACME_HOME}/account.conf") else ""
+    missing = [k for k in TOKENS.get(provider, []) if not os.environ.get(k) and f"SAVED_{k}=" not in saved]
+    if missing:
+        return {"ok": False, "msg": "توکن نیست: اول %s را export کنید (فقط یک بار؛ acme.sh نگهش می‌دارد)"
+                                   % " و ".join(missing)}
+    target = next((p for p, who in used_certs().items()
+                   if domain in ((cert_info(p) or {}).get("names") or [])), None)
+    if test:
+        scratch = "/tmp/xui-cert-test"
+        rc, out = run(ACME, "--issue", "--staging", "--dns", provider, "-d", domain, "--keylength", "ec-256",
+                      "--cert-home", scratch, "--force", env=os.environ, timeout=600)
+        run("rm", "-rf", scratch)
+        return {"ok": rc == 0, "msg": "توکن کار می‌کند؛ رکورد TXT خودکار ساخته و پاک شد (staging)" if rc == 0
+                else "آزمایش نشد: " + (out.splitlines() or [""])[-1]}
+    rc, out = run(ACME, "--issue", "--dns", provider, "-d", domain, "--keylength", "ec-256", "--force",
+                  env=os.environ, timeout=600)
+    if rc not in (0, 2):                                # 2 = "not due for renewal", still switched
+        return {"ok": False, "msg": "صادر نشد، چیزی عوض نشد: " + (out.splitlines() or [""])[-1]}
+    if target:
+        key = setting("webKeyFile") if setting("webCertFile") == target else setting("subKeyFile")
+        key = key or os.path.join(os.path.dirname(target), "privkey.pem")
+        rc, out = run(ACME, "--install-cert", "-d", domain, "--ecc", "--fullchain-file", target,
+                      "--key-file", key, "--reloadcmd", RELOAD)
+        if rc:
+            return {"ok": False, "msg": "صادر شد ولی نصب نشد: " + (out.splitlines() or [""])[-1]}
+    a = acme_conf(domain) or {}
+    return {"ok": True, "msg": "%s از این به بعد خودکار تمدید می‌شود (%s)؛ تمدید بعدی: %s"
+                              % (domain, a.get("mode", provider), a.get("next", "?"))}
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    out = lambda d: print(json.dumps(d, ensure_ascii=False) if as_json else d.get("msg") or json.dumps(d, ensure_ascii=False, indent=1))
+    mode = args[0] if args and not args[0].startswith("--") else "status"
+    if mode == "status":
+        s = status()
+        if as_json:
+            return print(json.dumps(s, ensure_ascii=False))
+        for c in s["certs"]:
+            print("%-40s %4s days  %-22s %s" % (c["domain"] or c["path"], c["days"], (c["acme"] or {}).get("mode", "-"),
+                                                ", ".join(c["used_by"])))
+            if c["hint"]:
+                print("   " + c["hint"])
+    elif mode == "auto" and len(args) > 1:
+        provider = args[args.index("--dns") + 1] if "--dns" in args and len(args) > args.index("--dns") + 1 else ""
+        r = auto(args[1], provider, "--test" in args)
+        out(r)
+        sys.exit(0 if r["ok"] else 1)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()

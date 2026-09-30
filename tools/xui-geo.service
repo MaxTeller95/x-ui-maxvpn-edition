@@ -1,0 +1,8 @@
+[Unit]
+Description=Update the Iran routing lists (geosite_IR.dat / geoip_IR.dat)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-geo update --restart
+TimeoutStartSec=600
