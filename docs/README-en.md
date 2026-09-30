@@ -525,6 +525,10 @@ to automatic.
 week, who is above 85 % of their quota, who is connected from several addresses at once
 (the panel's own `limit IP` is the switch for that), and who has not shown up for a
 month. Enough to do the renewals without opening the client list.
+It also shows the real speed users reach per inbound: each user's fastest 5-second upload
+and download in the last 24 hours (from Xray's stats; samples under 256 KB do not count),
+as median, 90th percentile and maximum per inbound - so two transports (WebSocket on 80,
+TLS on 443, ...) can be compared on the users' own networks.
 
 **سلامت** - the **چکاپ** button runs thirteen checks in about ten seconds: the system
 clock (TLS and Reality fail on a wrong clock), `xray -test`, each path through its own
