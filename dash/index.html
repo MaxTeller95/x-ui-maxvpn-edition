@@ -775,7 +775,8 @@ function renderCheckup(c) {
     + c.checks.filter((x) => x.level === "bad").length + " ایراد";
   $("#checks").innerHTML = c.checks.map((x) => `<div class="check"><span class="dot ${x.level}"></span><div>
     <b>${esc(x.title)}</b> — ${esc(x.detail)}
-    ${x.hint ? `<div class="muted">${esc(x.hint)}</div>` : ""}</div></div>`).join("");
+    ${x.hint ? `<div class="muted">${esc(x.hint)}</div>` : ""}
+    ${x.fix ? `<button data-fix="${esc(x.fix)}" style="margin-top:6px">${x.fix === "kernel-fix" ? "اعمال و ثبت دائم" : "تعمیر کن"}</button>` : ""}</div></div>`).join("");
   try { localStorage.setItem("xo-checkup", JSON.stringify(c)); } catch (e) {}
 }
 
@@ -1154,12 +1155,14 @@ document.addEventListener("click", async (e) => {
   if (f) {
     const cg = f.dataset.fix === "confguard-fix";
     if (!confirm(cg ? "قانون‌های گم‌شده برمی‌گردند و x-ui ری‌استارت می‌شود (چند ثانیه قطعی). ادامه؟"
+                    : f.dataset.fix === "kernel-fix" ? "تنظیم‌های TCP کرنل همین حالا اعمال و در /etc/sysctl.d ذخیره می‌شوند تا بعد از ریبوت هم بمانند. ری‌استارت لازم نیست و کاربرها قطع نمی‌شوند. ادامه؟"
                     : f.dataset.fix === "split-fix" ? "اوت‌باند mux و قانون‌های تقسیم بررسی و تعمیر می‌شوند. اگر فقط اوت‌باند خراب باشد بدون ری‌استارت، وگرنه با ری‌استارت x-ui. قبلش بکاپ گرفته می‌شود. ادامه؟"
                     : "قبل از تعمیر بکاپ گرفته می‌شود. ادامه؟")) return;
     f.disabled = true; toast("در حال تعمیر...");
     const r = await post(f.dataset.fix);
     toast(r.ok ? (r.msg || "تعمیر شد") : "خطا: " + (r.msg || ""));
     if (cg || f.dataset.fix === "split-fix") { loadCG(); loadStatus(); }
+    if (f.dataset.fix === "kernel-fix" && r.ok) $("#run-checkup") && $("#run-checkup").click();
     loadLint();
     return;
   }

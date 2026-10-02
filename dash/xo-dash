@@ -684,6 +684,63 @@ def paths_view():
     return jrun("xui-path", "list", "--json", timeout=20) or []
 
 
+# TCP for proxied connections. tcp_notsent_lowat counts as set at any small value: the point is
+# not the Linux default (unlimited); a tunnel like Backhaul sets 32768 itself when it starts.
+KERNEL = {"net.ipv4.tcp_slow_start_after_idle": ("0", None), "net.ipv4.tcp_notsent_lowat": ("16384", (1, 65536)),
+          "net.ipv4.tcp_mtu_probing": ("1", None)}
+KERNEL_FILE = "/etc/sysctl.d/99-proxy-tcp.conf"
+
+
+def kernel_off():
+    off = []
+    for k, (want, rng) in KERNEL.items():
+        got = run("sysctl", "-n", k, timeout=5)[1].strip()
+        ok = got == want if not rng else got.isdigit() and rng[0] <= int(got) <= rng[1]
+        if not ok:
+            off.append(k)
+    return off
+
+
+def kernel_fix():
+    """Apply the three now and keep them for the next boot."""
+    lines = ["# xui-optimizer: TCP for proxied connections (users <-> x-ui <-> tunnel <-> abroad)"]
+    lines += ["%s = %s" % (k, v[0]) for k, v in KERNEL.items()]
+    with open(KERNEL_FILE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    rc, out = run("sysctl", "-p", KERNEL_FILE, timeout=15)
+    off = kernel_off()
+    return {"ok": rc == 0 and not off, "msg": "اعمال و در %s ذخیره شد" % KERNEL_FILE if not off
+            else "اعمال نشد: " + "، ".join(off) + " " + out[-200:]}
+
+
+def live_tunnel(path):
+    """(interface, kind) the path's traffic leaves by right now: for a mixed path, its first copy."""
+    try:
+        outs = {o.get("tag"): o for o in xray_cfg().get("outbounds", [])}
+        o = outs.get(xuimix.copy_tag(path, 1)) or outs.get(path) or {}
+        st = o.get("settings") or {}
+        addr = st.get("address") or ((st.get("vnext") or [{}])[0]).get("address")
+        if o.get("sendThrough"):
+            dev = next((i for i, a in iface_addrs().items() if a == o["sendThrough"]), "")
+            return dev, "sing-box"
+        rc, out = run("ip", "-j", "route", "get", addr, timeout=5)
+        r = (json.loads(out) or [{}])[0]
+        if r.get("gateway") or not r.get("dev"):
+            return "", ""
+        rc, out = run("ip", "-j", "-d", "link", "show", "dev", r["dev"], timeout=5)
+        return r["dev"], ((json.loads(out) or [{}])[0].get("linkinfo") or {}).get("info_kind", "")
+    except Exception:
+        return "", ""
+
+
+def iface_addrs():
+    rc, out = run("ip", "-j", "-4", "addr", "show", timeout=5)
+    try:
+        return {l["ifname"]: a["local"] for l in json.loads(out) for a in l.get("addr_info", [])[:1]}
+    except ValueError:
+        return {}
+
+
 def mix_share(hours=1):
     """{path: {tunnel index: bytes}} over the last hour, from the per-tunnel copies of mixed
     paths (NAME~2 and NAME~2b are the same tunnel; NAME-mux~2 too)."""
@@ -967,8 +1024,8 @@ def checkup():
     c, cfg, res = conf(), xray_cfg(), []
     ports = path_ports()
 
-    def add(level, title, detail, hint=""):
-        res.append({"level": level, "title": title, "detail": detail, "hint": hint})
+    def add(level, title, detail, hint="", fix=None):
+        res.append({"level": level, "title": title, "detail": detail, "hint": hint, "fix": fix})
 
     def clock():
         synced = run("timedatectl", "show", "-p", "NTPSynchronized", "--value", timeout=5)[1].strip()
@@ -1011,9 +1068,11 @@ def checkup():
             mbit = float(out) * 8 / 1e6
         except ValueError:
             return add("warn", "سرعت مسیر اصلی", "اندازه‌گیری نشد")
+        dev, kind = live_tunnel(name)
         add("ok" if mbit > 100 else "warn" if mbit > 25 else "bad", "سرعت مسیر اصلی (%s)" % name,
-            "%.0f مگابیت بر ثانیه در دانلود ۲۵ مگابایتی" % mbit,
-            "این عدد از خود هاب گرفته شده و سقف چیزی است که کاربر می‌گیرد.")
+            "%.0f مگابیت بر ثانیه در دانلود ۲۵ مگابایتی، یک اتصال%s" % (mbit, "، روی تانل %s (%s)" % (dev, kind) if dev else ""),
+            "از خود هاب، با یک اتصال، روی تانلی که مسیر همین حالا دارد. تانلی که روی TCP سوار است (wstunnel، backhaul) "
+            "ذاتاً کندتر از GRE/Geneve/AWG روی UDP است؛ سرعت هر تانل را در ابزارها ← تانل‌ها ببینید.")
 
     def dns():
         if not any(o.get("protocol") == "dns" for o in cfg.get("outbounds", [])):
@@ -1138,12 +1197,11 @@ def checkup():
             "" if g.get("ok") else "کارت «نگهبان پیکربندی» در همین تب، دکمه‌ی برگرداندن را دارد.")
 
     def kernel():
-        want = {"net.ipv4.tcp_slow_start_after_idle": "0", "net.ipv4.tcp_notsent_lowat": "16384",
-                "net.ipv4.tcp_mtu_probing": "1"}
-        off = [k for k, v in want.items() if run("sysctl", "-n", k, timeout=5)[1].strip() != v]
+        off = kernel_off()
         add("ok" if not off else "warn", "تنظیم‌های کرنل",
             "هر سه اعمال شده" if not off else "اعمال نشده: " + "، ".join(off),
-            "" if not off else "فایل sysctl/99-proxy-tcp.conf را در /etc/sysctl.d بگذارید و sysctl -p بزنید.")
+            "" if not off else "با دکمه همین حالا اعمال و در %s ذخیره می‌شوند تا بعد از ریبوت هم بمانند." % KERNEL_FILE,
+            "kernel-fix" if off else None)
 
     for fn in (clock, xray_test, paths, speed, dns, mtu, machine, cert, subscription, geo, reach, panel,
                config_guard, backup, kernel):
@@ -1196,6 +1254,8 @@ def action(name, body):
     if name == "report":
         rc, out = run("tunnel-guard", "--report", timeout=90)
         return {"ok": rc == 0, "msg": "report sent" if rc == 0 else out}
+    if name == "kernel-fix":
+        return kernel_fix()
     if name == "dns-fast":  # restarts x-ui: the page asks first
         rc, out = run("xui-optimizer", "--dns-fast", "on" if body.get("on") else "off", timeout=150)
         lines = [l for l in out.splitlines() if l.strip()]
