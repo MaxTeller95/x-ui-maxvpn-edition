@@ -1,0 +1,8 @@
+[Unit]
+Description=Smart mux: measure each exit's mux concurrency and switch to the best one live
+After=x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-split tune --apply
+TimeoutStartSec=600

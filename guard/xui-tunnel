@@ -39,6 +39,14 @@ keeps every healthy tunnel in the mix and drops one that loses pings or turns sl
 and "roundrobin" share by weight. Xray's observatory skips a dead tunnel by itself; the timer
 only tests each tunnel every few minutes for the page and tells Telegram when one drops out or
 comes back. Turning it on or off restarts x-ui once (balancers and the observatory are not hot).
+
+Packet loss: every minute each tunnel of a mix is pinged (25 pings, 0.1 s apart, all tunnels
+at once) and the last 6 minutes are kept. A tunnel losing 3% or more, and at least 2 points
+more than the cleanest one, while a clean tunnel is left, is taken out of the mix in the
+running Xray (its copies are removed through the API; no restart, the panel's template is
+untouched) and Telegram is told. It comes back after 3 clean minutes. When every tunnel loses
+alike nothing is taken out: the trouble is past the tunnels. After an x-ui restart the live
+copies are compared with what should run and the exclusion is put back.
 """
 import glob, ipaddress, json, os, re, shutil, socket, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
@@ -59,6 +67,12 @@ RETURN_OKS = 3          # healthy checks of a better tunnel before going back to
 RETURN_GAP = 600        # stay at least this long on a tunnel before going back
 SCAN_EVERY = 3600       # the timer rescans every path this often
 MIX_CHECK = 300         # a mixed path's tunnels are tested this often (Xray reacts by itself)
+LOSS_PINGS, LOSS_GAP = 25, "0.1"    # one loss round per tunnel: 2.5 seconds
+LOSS_WINDOW = 6         # rounds (minutes) a tunnel's loss is judged over
+LOSS_MIN_ROUNDS = 3     # no verdict on less than this
+LOSS_BAD = 3.0          # % lost: leaves the mix ...
+LOSS_MARGIN = 2.0       # ... when also this many points worse than the cleanest tunnel
+LOSS_BACK_ROUNDS = 3    # clean rounds (at most one ping lost in all) before it comes back
 ADDR_OK = re.compile(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$")   # ADDR or ADDR@tun
 
 
@@ -328,6 +342,9 @@ def listing():
                "live": tpl_mix["on"], "copies": tpl_mix["copies"], "drift": xuimix.drift(cfg, name),
                "pinned": pinned(name, cfg) if tpl_mix["on"] else None}
         mix["pending"] = bool(xuimix.spec_of(c, name)) != tpl_mix["on"]     # asked for, not in the config
+        mix["loss"] = (st.get(name) or {}).get("loss_pct") or {}
+        mix["out"] = (st.get(name) or {}).get("mix_out") or []
+        mix["rtt"] = (st.get(name) or {}).get("rtt") or {}
         rows.append({
             "name": name, "current": addr, "port": port, "auto": bool(spec.get("auto")), "mix": mix,
             "managed": bool(addrs),
@@ -601,6 +618,10 @@ def auto():
     for name, spec in (c.get("tunnels") or {}).items():
         mx = xuimix.spec_of(c, name)
         if mx:
+            try:
+                watch_loss(name, mx, st)
+            except Exception as e:                       # never let a measurement stop the timer
+                log("%s: loss check failed: %s" % (name, e))
             watch_mix(name, mx, st, now)
             continue
         addrs = spec.get("addrs") or []
@@ -732,7 +753,8 @@ def mix_set(name, spec):
     s.setdefault("events", []).append({"t": int(time.time()), "from": "", "why": "mix",
                                        "to": ("ترکیب: " + " + ".join(spec["addrs"])) if spec else "تک‌تانل"})
     s["events"] = s["events"][-20:]
-    s.pop("mix_down", None)
+    for k in ("mix_down", "mix_out", "live_mix", "loss", "loss_pct"):
+        s.pop(k, None)
     save(STATE, st)
     log("%s: mix %s" % (name, ("on " + ",".join(spec["addrs"]) + " " + spec["how"]) if spec else "off"))
     how = {"smart": "هوشمند", "random": "تصادفی", "roundrobin": "نوبتی"}
@@ -800,6 +822,142 @@ def watch_mix(name, spec, st, now):
     s["mix_down"] = sorted(down)
     if len(down) == len(spec["addrs"]):
         log("%s: no tunnel of the mix answers" % name)
+
+
+# ---------------------------------------------------------------- packet loss inside a mix
+
+def ping_loss(entry):
+    """(sent, received, avg ms) for one tunnel: its far address, through its tun for ADDR@IFACE."""
+    addr, via = split(entry)
+    cmd = ["ping", "-n", "-q", "-c", str(LOSS_PINGS), "-i", LOSS_GAP, "-W", "1"] + (["-I", via] if via else []) + [addr]
+    rc, out = run(*cmd, timeout=LOSS_PINGS * 0.1 + 6)
+    m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", out)
+    rtt = re.search(r"= [\d.]+/([\d.]+)/", out)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), float(rtt.group(1)) if rtt else None
+
+
+def loss_pct(rounds):
+    sent = sum(r[0] for r in rounds)
+    return round(100.0 * sum(r[0] - r[1] for r in rounds) / sent, 1) if sent else None
+
+
+def live_tags(cfg):
+    rc, out = run(XRAY, "api", "lso", "--server=" + api_addr(cfg), timeout=15)
+    try:
+        return {o.get("tag") for o in json.loads(out).get("outbounds", [])}
+    except ValueError:
+        return None
+
+
+def xray_pid():
+    rc, out = run("pgrep", "-o", "-f", "xray-linux", timeout=5)
+    return out.split()[0] if rc == 0 and out else ""
+
+
+def live_mix(name, spec, out, s, cfg=None):
+    """Make the running Xray carry NAME's mix without the tunnels in `out`: their copies go, and
+    when the first tunnel (the balancer's fallback) is out its copy stays but is aimed at the
+    best tunnel left, so the fallback always exists. Only what differs is touched; what was done
+    is remembered per Xray process, so a restart (which brings the template back) is redone."""
+    cfg = cfg or load(CFG, {})
+    api = "--server=" + api_addr(cfg)
+    live = live_tags(cfg)
+    if live is None:
+        return False
+    pid = xray_pid()
+    if s.get("live_pid") != pid:
+        s["live_pid"], s["live_mix"] = pid, {}
+    done = s.setdefault("live_mix", {})
+    keep = [a for a in spec["addrs"] if a not in out]
+    changed = False
+    for f in (name, name + "-mux"):
+        copies = [o for o in cfg.get("outbounds", []) if xuimix.is_clone(o.get("tag")) and xuimix.base_of(o["tag"]) == f]
+        for o in copies:
+            i = int(re.sub(r"\D", "", o["tag"].split(xuimix.SEP)[-1]) or 1) - 1
+            addr = spec["addrs"][i] if i < len(spec["addrs"]) else None
+            fallback = o["tag"] == "%s%s1" % (f, xuimix.SEP)
+            gone = addr in out and not fallback
+            aim = keep[0] if (addr in out and fallback) else addr
+            live_now = o["tag"] in live
+            if gone:
+                if live_now:
+                    run(XRAY, "api", "rmo", api, o["tag"], timeout=10)
+                    changed = True
+                done.pop(o["tag"], None)
+                continue
+            # as the template has it (and as a restart brings it) unless we aimed it elsewhere
+            if live_now and done.get(o["tag"], addr) == aim:
+                continue
+            want = json.loads(json.dumps(o))
+            set_addr(want, aim)
+            fd, path = tempfile.mkstemp(suffix=".json")
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"outbounds": [want]}, fh)
+            if live_now:
+                run(XRAY, "api", "rmo", api, o["tag"], timeout=10)
+            rc, _ = run(XRAY, "api", "ado", api, path, timeout=10)
+            os.remove(path)
+            if rc:
+                return changed
+            done[o["tag"]] = aim
+            changed = True
+    return changed
+
+
+def watch_loss(name, spec, st):
+    s = st.setdefault(name, {})
+    with ThreadPoolExecutor(max_workers=len(spec["addrs"])) as ex:
+        got = dict(zip(spec["addrs"], ex.map(ping_loss, spec["addrs"])))
+    hist = s.setdefault("loss", {})
+    for a in list(hist):
+        if a not in spec["addrs"]:
+            hist.pop(a)
+    for a, r in got.items():
+        if r:
+            hist.setdefault(a, []).append([r[0], r[1]])
+            hist[a] = hist[a][-LOSS_WINDOW:]
+            s.setdefault("rtt", {})[a] = r[2]
+    out = [a for a in s.get("mix_out") or [] if a in spec["addrs"]]
+    pct = {a: loss_pct(hist.get(a) or []) for a in spec["addrs"]}
+    enough = {a: len(hist.get(a) or []) >= LOSS_MIN_ROUNDS for a in spec["addrs"]}
+    known = [pct[a] for a in spec["addrs"] if pct[a] is not None and enough[a]]
+    best = min(known) if known else None
+    note = lambda a: "%s٪" % pct[a] if pct[a] is not None else "?"
+    # back in: clean for the last few rounds
+    for a in list(out):
+        last = (hist.get(a) or [])[-LOSS_BACK_ROUNDS:]
+        if len(last) == LOSS_BACK_ROUNDS and sum(x[0] - x[1] for x in last) <= 1:
+            out.remove(a)
+            hist[a] = last                           # judged afresh from its clean minutes, or it would bounce
+            telegram("✅ %s: پکت لاست تانل %s برطرف شد؛ دوباره در ترکیب است." % (name, a))
+            log("%s: %s back in the mix (clean)" % (name, a))
+    pct = {a: loss_pct(hist.get(a) or []) for a in spec["addrs"]}              # after any return
+    enough = {a: len(hist.get(a) or []) >= LOSS_MIN_ROUNDS for a in spec["addrs"]}
+    known = [pct[a] for a in spec["addrs"] if pct[a] is not None and enough[a]]
+    best = min(known) if known else None
+    # out: clearly worse than its siblings, and a clean one stays
+    for a in spec["addrs"]:
+        if a in out or best is None or not enough[a] or pct[a] is None:
+            continue
+        clean_left = [b for b in spec["addrs"] if b != a and b not in out and enough[b]
+                      and pct[b] is not None and pct[b] < LOSS_BAD]
+        if pct[a] >= LOSS_BAD and pct[a] >= best + LOSS_MARGIN and clean_left:
+            out.append(a)
+            telegram("⚠️ %s: تانل %s در %d دقیقه‌ی اخیر %s پکت لاست داشت (بهترین: %s)؛ موقتاً از ترکیب بیرون رفت و "
+                     "اتصال‌های تازه روی %s است." % (name, a, len(hist[a]), note(a), note(clean_left[0]),
+                                                    " و ".join(b for b in spec["addrs"] if b not in out)))
+            log("%s: %s out of the mix, loss %s%% (best %s%%)" % (name, a, pct[a], best))
+    if known and len(known) == len(spec["addrs"]) and min(known) >= LOSS_BAD:
+        if time.time() - s.get("loss_all_told", 0) > 3600:
+            s["loss_all_told"] = int(time.time())
+            telegram("⚠️ %s: همه‌ی تانل‌ها پکت لاست دارند (%s)؛ مشکل از بعد از تانل‌هاست و چیزی کنار گذاشته نشد."
+                     % (name, "، ".join("%s %s" % (a, note(a)) for a in spec["addrs"])))
+    s["mix_out"] = out
+    s["loss_pct"] = pct
+    live_mix(name, spec, out, s)
+    return out
 
 
 def set_addrs(name, addrs, auto_flag):

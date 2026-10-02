@@ -12,13 +12,20 @@ to a proxy outbound (another server, usually through a tunnel):
     xui-optimizer --quic block|allow  refuse QUIC (UDP 443) for users: YouTube, Instagram and
                                 browsers fall back to HTTPS over TCP within a second, which inside
                                 a TCP tunnel is usually faster and steadier than UDP carried in it
+    xui-optimizer --dns-fast on|off  only the DNS cache's behaviour: answer from an expired entry
+                                at once and refresh it behind the scenes (serveStale, up to an
+                                hour), and ask both DoH servers together, taking the faster
 
 What it changes, in the panel's own database so the panel keeps it:
 
   * ad block   - geosite:category-ads-all goes to the blackhole outbound, for every
                  inbound routed to a proxy outbound
   * DNS cache  - DNS from users (port 53) is answered by Xray on this server; misses are
-                 fetched over DoH through the proxy outbound, never from local resolvers
+                 fetched over DoH through the proxy outbound, never from local resolvers.
+                 A miss costs a DoH round trip through the tunnel (about 100 ms, up to 400);
+                 popular domains expire every 1-5 minutes, so "fast" mode answers an expired
+                 entry instantly and refreshes it in the background, and asks both DoH
+                 servers at once so one slow resolver does not set the pace
   * sniffing   - turned on with routeOnly, so the ad block also sees domains when a
                  client sends bare IPs; the connection target is left untouched
 
@@ -35,6 +42,10 @@ BIN = "/usr/local/x-ui/bin"
 TAG = "xui-optimizer"
 DNS_TAG = "dns-internal"
 DOH = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+# serveStale: an expired answer is given at once and refreshed behind the scenes; kept at most
+# this long past its TTL. CDNs hand out short TTLs but keep addresses valid far longer.
+DNS_FAST = {"serveStale": True, "serveExpiredTTL": 3600, "enableParallelQuery": True}
+DNS_SLOW = {"serveStale": False, "serveExpiredTTL": 0, "enableParallelQuery": False}
 SNIFF = {"enabled": True, "destOverride": ["http", "tls", "quic"],
          "metadataOnly": False, "routeOnly": True}
 NOT_PROXY = {"freedom", "blackhole", "dns"}
@@ -99,7 +110,7 @@ def patch(tpl, abroad, dns_via, blackhole, adblock, dns):
     if dns:
         if "dns" in tpl:
             die("the template already has its own 'dns' section; run with --no-dns or remove it")
-        tpl["dns"] = {"tag": DNS_TAG, "queryStrategy": "UseIP", "servers": DOH}
+        tpl["dns"] = dict({"tag": DNS_TAG, "queryStrategy": "UseIP", "servers": DOH}, **DNS_FAST)
         tpl["outbounds"].append({"tag": "dns-out", "protocol": "dns",
                                  "settings": {"nonIPQuery": "reject"}})
         via = sorted(ib for ib, ob in abroad.items() if ob == dns_via)
@@ -206,6 +217,41 @@ def adblock_only(db_path, on, restart=True, dry=False):
     return toggle("adblock", db_path, on, restart, dry)
 
 
+def dns_fast(db_path, on, restart=True, dry=False):
+    """Switch only how the DNS cache answers: nothing else in the template moves."""
+    db = xuidb.connect(db_path)
+    tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    if (tpl.get("dns") or {}).get("tag") != DNS_TAG:
+        die("this server has no DNS cache from xui-optimizer; run xui-optimizer first")
+    want = DNS_FAST if on else DNS_SLOW
+    if all(tpl["dns"].get(k) == v for k, v in want.items()):
+        print("DNS fast mode is already %s" % ("on" if on else "off"))
+        return
+    tpl["dns"].update(want)
+    with open(f"{BIN}/config.json") as f:
+        cfg = json.load(f)
+    cfg["dns"] = tpl["dns"]
+    xray_test(cfg)
+    if dry:
+        print("dry run - xray: Configuration OK; would turn DNS fast mode %s" % ("on" if on else "off"))
+        return
+    backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    os.makedirs(backup)
+    db.close()
+    backup_db(db_path, backup)
+    shutil.copy2(f"{BIN}/config.json", backup)
+    db = xuidb.connect(db_path)
+    db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
+    db.commit()
+    db.close()
+    accept_in_config_guard()
+    if restart:                                          # the dns section is not hot in Xray
+        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+        time.sleep(5)
+    print("DNS fast mode %s" % ("on" if on else "off"))
+    print(f"backup in {backup}")
+
+
 def accept_in_config_guard():
     """This tool removed or renamed tagged rules on purpose: make that config-guard's new
     baseline, or it would put them straight back (it watches config.json)."""
@@ -239,6 +285,7 @@ def main():
     ap.add_argument("--no-restart", action="store_true")
     ap.add_argument("--adblock", choices=("on", "off"), help="only switch the ad block")
     ap.add_argument("--quic", choices=("block", "allow"), help="only switch the QUIC (UDP 443) block")
+    ap.add_argument("--dns-fast", choices=("on", "off"), help="only switch the DNS cache's fast mode")
     a = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -250,6 +297,8 @@ def main():
         return adblock_only(a.db, a.adblock == "on", not a.no_restart, a.dry_run)
     if a.quic:
         return toggle("quic", a.db, a.quic == "block", not a.no_restart, a.dry_run)
+    if a.dns_fast:
+        return dns_fast(a.db, a.dns_fast == "on", not a.no_restart, a.dry_run)
 
     db = xuidb.connect(a.db)
     row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()

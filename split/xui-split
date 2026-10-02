@@ -7,7 +7,11 @@ separately for every exit the hub sends users to.
     xui-split remove                  undo every group (keeps probe ports + RoutingService)
     xui-split groups [--json]         the groups, their inbounds, settings and state
     xui-split set GROUP [--on|--off] [--concurrency N] [--xudp N] [--label TEXT] [--heavy d1,d2]
-                                      one group's own settings (then apply, or fix for mux-only)
+                      [--auto]        one group's own settings (then apply, or fix for mux-only);
+                                      --concurrency locks it there, --auto lets tune choose again
+    xui-split tune [GROUP] [--apply] [--json]
+                                      measure which mux concurrency serves each exit best and,
+                                      with --apply, switch to it live (xui-split-tune.timer)
     xui-split check [--json]          is every group really working? outbound, mux, rules, probe, live Xray
     xui-split fix [--auto] [--json]   repair what check found: through Xray's API when only a mux
                                       outbound is wrong (no restart), else a full rebuild (restart);
@@ -30,11 +34,23 @@ Light traffic (web pages, messengers, APIs) rides an existing tunnel connection 
 paying a TCP handshake across the link. Heavy traffic (video, downloads, updates), UDP and
 Telegram stay without mux, so one big download never shares a connection with anyone's chat.
 
+Smart mux (tune): how many streams should share one mux connection is not a constant. More
+streams per connection save TCP+TLS handshakes across the tunnel (each costs a round trip of
+80-100 ms or more); but one lost packet stalls every stream on that connection, so on a lossy
+tunnel fewer are better. tune measures it on the exit's own light-traffic outbound in a
+throwaway Xray (users are not touched): for concurrency 2, 4, 8, 16 and the current value it
+opens 16 small HTTPS requests at once, like a page does, over several shuffled rounds after a
+warm-up, and scores the median time with failures as a heavy penalty. Settings within 5% of the
+best count as equal, and then the current one (or else the lowest) wins; with 2% or more packet
+loss on the tunnel nothing above 4 is chosen. It switches only for a 25% gain, or a 10% gain
+seen twice in a row, and applies through Xray's API (the mixed tunnels' copies too) with no
+restart. An exit whose concurrency was set by hand is locked and left alone.
+
 Also, for tunnel-guard: Xray's RoutingService is enabled so routes can be switched without a
 restart, and every proxy outbound gets a local-only probe port (socks, 127.0.0.1:10808, ...).
 The DNS cache's upstream rule is tagged "dns-upstream".
 """
-import glob, json, os, shutil, sqlite3, subprocess, sys, time
+import glob, json, os, random, re, shutil, sqlite3, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  paths mixed over several tunnels: rules aim at a balancer
@@ -46,7 +62,16 @@ PROBE_BASE = 10808
 NOT_PROXY = {"freedom", "blackhole", "dns"}
 LEGACY = ("split-udp", "split-heavy", "split-telegram", "split-light")   # one-group versions
 KINDS = ("udp", "heavy", "telegram")
-DEFAULT = {"enabled": True, "concurrency": 4, "xudp": 8, "label": "", "heavy": []}
+DEFAULT = {"enabled": True, "concurrency": 4, "xudp": 8, "label": "", "heavy": [], "lock": False}
+TUNNEL_STATE = "/var/lib/tunnel-guard/tunnels.json"
+TUNE_STATE = "/var/lib/xui-split/tune.json"
+TUNE_CANDIDATES = (2, 4, 8, 16)
+TUNE_ROUNDS = 4
+TUNE_URLS = """www.google.com/generate_204 www.gstatic.com/generate_204 cp.cloudflare.com/generate_204
+connectivitycheck.gstatic.com/generate_204 detectportal.firefox.com/success.txt www.microsoft.com/favicon.ico
+captive.apple.com/hotspot-detect.html www.cloudflare.com/cdn-cgi/trace 1.1.1.1/cdn-cgi/trace github.com/favicon.ico
+www.wikipedia.org/static/favicon/wikipedia.ico www.youtube.com/favicon.ico www.instagram.com/favicon.ico
+web.telegram.org/favicon.ico www.apple.com/favicon.ico www.bing.com/favicon.ico""".split()
 HEAVY = [f"domain:{d}" for d in """
 googlevideo.com cdninstagram.com fbcdn.net tiktokcdn.com tiktokv.com nflxvideo.net
 ttvnw.net akamaized.net cloudfront.net scdn.co spotifycdn.com cdn-telegram.org
@@ -56,7 +81,7 @@ githubusercontent.com dropboxusercontent.com mega.nz mega.co.nz mediafire.com
 docker.io docker.com speedtest.net ooklaserver.net hetzner.com""".split()]
 
 args = sys.argv[1:]
-mode = next((a for a in args if a in ("test", "apply", "remove", "check", "fix", "groups", "set")), "test")
+mode = next((a for a in args if a in ("test", "apply", "remove", "check", "fix", "groups", "set", "tune")), "test")
 as_json = "--json" in args
 tg_backup = "--no-tg-backup" not in args
 xray = (glob.glob(f"{BIN}/xray-linux-*") or [None])[0] or sys.exit(f"no xray in {BIN}")
@@ -294,7 +319,8 @@ def check(t, live=True):
         tg, conf = tags_of(ob), group_conf(s, ob)
         g = {"out": ob, "label": conf["label"], "enabled": conf["enabled"], "mux": tg["mux"],
              "inbounds": main["inboundTag"], "concurrency": conf["concurrency"], "xudp": conf["xudp"],
-             "built": tg["light"] in by_tag, "light": lights.get(tg["mux"], "mux"), "problems": []}
+             "built": tg["light"] in by_tag, "light": lights.get(tg["mux"], "mux"), "problems": [],
+             "auto": not conf.get("lock"), "tune": (load_json(TUNE_STATE, {}) or {}).get(ob)}
         report["groups"].append(g)
         bad = lambda code, msg, hot=False: g["problems"].append({"group": ob, "code": code, "msg": msg, "hot": hot})
         base, mux = outs.get(ob), outs.get(tg["mux"])
@@ -339,10 +365,8 @@ def check(t, live=True):
                 bad("live-missing", f"{ob}: Xray در حال اجرا {tg['mux']} را ندارد", hot=True)
             elif "multiplexSettings" not in json.dumps(lo[tg["mux"]]):
                 bad("live-mux-off", f"{ob}: Xray در حال اجرا {tg['mux']} را بدون mux اجرا می‌کند", hot=True)
-        if ob in xuimix.mixed(t):    # traffic rides per-tunnel copies: repairing means rebuilding them
+        if ob in xuimix.mixed(t):    # traffic rides per-tunnel copies; fix replaces those too
             g["mixed"] = True
-            for p in g["problems"]:
-                p["hot"] = False
         if g["light"] == "direct":
             g["note"] = "نگهبان ترافیک سبک این خروجی را موقتاً از mux برداشته (mux گیر کرده بود)"
     report["problems"] += [p for g in report["groups"] for p in g["problems"]]
@@ -359,8 +383,19 @@ def hot_replace(tpl, tags, drop_rules=()):
     if drop_rules:
         cfg["routing"]["rules"] = [r for r in cfg["routing"]["rules"] if r.get("ruleTag") not in drop_rules]
         subprocess.run([xray, "api", "rmrules", "--server=" + api, *drop_rules], capture_output=True)
+    live = set((live_outbounds()[0] or {}).keys())
+    paths = set()
+    for f in list(tags):                 # a mixed mux: its per-tunnel copies carry the traffic
+        tags += [o["tag"] for o in tpl["outbounds"] if xuimix.is_clone(o.get("tag")) and xuimix.base_of(o["tag"]) == f]
     for tag in tags:
         ob = next(o for o in tpl["outbounds"] if o.get("tag") == tag)
+        if xuimix.is_clone(tag):
+            paths.add(xuimix.base_of(tag)[:-4] if xuimix.base_of(tag).endswith("-mux") else xuimix.base_of(tag))
+            if tag not in live:          # xui-tunnel took that tunnel out for packet loss: keep it out
+                idx = next((i for i, o in enumerate(outs) if o.get("tag") == tag), None)
+                if idx is not None:
+                    outs[idx] = ob
+                continue
         idx = next((i for i, o in enumerate(outs) if o.get("tag") == tag), None)
         if idx is None:
             base = next((i for i, o in enumerate(outs) if o.get("tag") == tag[:-4]), len(outs) - 1)
@@ -377,7 +412,183 @@ def hot_replace(tpl, tags, drop_rules=()):
     with open(f"{BIN}/config.json.tmp", "w") as f:
         json.dump(cfg, f, indent=2)
     os.replace(f"{BIN}/config.json.tmp", f"{BIN}/config.json")
+    if paths:                            # xui-tunnel aims a lossy fallback elsewhere: let it look again
+        st = load_json(TUNNEL_STATE, None)
+        if st is not None:
+            for p in paths:
+                if p in st:
+                    st[p]["live_pid"] = ""
+            save_json(TUNNEL_STATE, st)
     return ok
+
+
+# ---------------------------------------------------------------- smart mux
+
+def tune_source(out, cfg):
+    """(outbound, tunnel) light traffic of OUT really rides: its mux copy, or for a mixed exit
+    the copy on a tunnel that is in the mix and not out for packet loss."""
+    mux = f"{out}-mux"
+    copies = [o for o in cfg.get("outbounds", []) if xuimix.is_clone(o.get("tag")) and xuimix.base_of(o["tag"]) == mux]
+    if copies:
+        st = (load_json(TUNNEL_STATE, {}) or {}).get(out) or {}
+        addrs = ((((load_json(GUARD_CONF, {}) or {}).get("tunnels") or {}).get(out) or {}).get("mix") or {}).get("addrs") or []
+        gone = set(st.get("mix_out") or [])
+        for o in copies:
+            i = int(re.sub(r"\D", "", o["tag"].split(xuimix.SEP)[-1]) or 1) - 1
+            a = addrs[i] if i < len(addrs) else None
+            if a not in gone:
+                return o, a
+        return copies[0], None
+    return next((o for o in cfg.get("outbounds", []) if o.get("tag") == mux), None), None
+
+
+def tunnel_loss(out, addr):
+    """Packet loss on the tunnel the measurement used: xui-tunnel's 6-minute figure for a mixed
+    tunnel, else 25 quick pings to the path's peer."""
+    st = (load_json(TUNNEL_STATE, {}) or {}).get(out) or {}
+    if addr and (st.get("loss_pct") or {}).get(addr) is not None:
+        return st["loss_pct"][addr]
+    peer = (((load_json(GUARD_CONF, {}) or {}).get("paths") or {}).get(out) or {}).get("peer")
+    if not peer:
+        return None
+    r = subprocess.run(["ping", "-n", "-q", "-c", "25", "-i", "0.1", "-W", "1", peer], capture_output=True, text=True, timeout=15)
+    m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", r.stdout)
+    return round(100.0 * (int(m.group(1)) - int(m.group(2))) / int(m.group(1)), 1) if m and int(m.group(1)) else None
+
+
+def bench(ob, cands, xudp):
+    """{concurrency: {"ms", "fails", "score"}} - 16 small requests at once, per round."""
+    base = 21800 + random.randint(0, 150)
+    ports = {c: base + i for i, c in enumerate(cands)}
+    outs = []
+    for c in cands:
+        o = json.loads(json.dumps(ob))
+        o["tag"] = "c%d" % c
+        o["mux"] = {"enabled": True, "concurrency": c, "xudpConcurrency": xudp, "xudpProxyUDP443": "skip"}
+        (o.get("streamSettings") or {}).get("sockopt", {}).pop("dialerProxy", None)
+        outs.append(o)
+    cfg = {"log": {"loglevel": "none"},
+           "inbounds": [{"tag": "c%d" % c, "listen": "127.0.0.1", "port": p, "protocol": "socks",
+                         "settings": {"udp": False}} for c, p in ports.items()],
+           "outbounds": outs,
+           "routing": {"rules": [{"type": "field", "inboundTag": ["c%d" % c], "outboundTag": "c%d" % c} for c in cands]}}
+    path = "/tmp/xui-split-tune.json"
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+    p = subprocess.Popen([xray, "run", "-c", path], cwd=BIN, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def round_(port):
+        t = time.time()
+        ps = [subprocess.Popen(["curl", "-s", "-o", "/dev/null", "-m", "10", "-w", "%{http_code}",
+                                "--socks5-hostname", "127.0.0.1:%d" % port, "https://" + u],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) for u in TUNE_URLS]
+        fails = sum(1 for x in ps if (x.communicate()[0] or "000").strip() in ("000", ""))
+        return (time.time() - t) * 1000, fails
+
+    res = {c: [] for c in cands}
+    try:
+        time.sleep(1.5)
+        for c in cands:                  # warm-up: DNS, first connections
+            round_(ports[c])
+        for _ in range(TUNE_ROUNDS):
+            order = list(cands)
+            random.shuffle(order)
+            for c in order:
+                res[c].append(round_(ports[c]))
+                time.sleep(0.3)
+    finally:
+        p.kill()
+        p.wait()
+        os.remove(path)
+    out = {}
+    for c, rows in res.items():
+        ms = sorted(r[0] for r in rows)[len(rows) // 2]
+        out[c] = {"ms": int(ms), "fails": round(sum(r[1] for r in rows) / float(len(rows)), 2)}
+    shared = min(v["fails"] for v in out.values())    # what fails for every setting is the site, not mux
+    for v in out.values():
+        v["score"] = int(v["ms"] + 1500 * (v["fails"] - shared))
+    return out
+
+
+def tune(only=None, apply=False):
+    s, t, cfg = settings(), template(), json.load(open(f"{BIN}/config.json"))
+    state = load_json(TUNE_STATE, {}) or {}
+    report = []
+    for g in check(t, live=False)["groups"]:
+        out = g["out"]
+        if only and out != only or not g["enabled"] or not g["built"]:
+            continue
+        conf = group_conf(s, out)
+        cur = int(conf["concurrency"])
+        row = {"out": out, "current": cur, "locked": bool(conf.get("lock")), "changed": False}
+        if row["locked"] and not only:
+            row["note"] = "قفل است (دستی)"
+            report.append(row)
+            continue
+        ob, tunnel = tune_source(out, cfg)
+        if not ob:
+            row["note"] = "اوت‌باند mux پیدا نشد"
+            report.append(row)
+            continue
+        loss = tunnel_loss(out, tunnel)
+        cands = sorted(set(TUNE_CANDIDATES) | {cur})
+        res = bench(ob, cands, int(conf["xudp"]))
+        allowed = [c for c in cands if loss is None or loss < 2 or c <= 4]
+        score = lambda c: res[c]["score"]
+        best = min(allowed, key=score)
+        near = [c for c in allowed if score(c) <= score(best) * 1.05]
+        pick = cur if cur in near else min(near)
+        gain = (score(cur) - score(pick)) / float(score(cur)) if score(cur) else 0.0
+        prev = (state.get(out) or {}).get("pick")
+        forced = cur not in allowed                       # a lossy tunnel and a high setting
+        go = pick != cur and (forced or gain >= 0.25 or (gain >= 0.10 and prev == pick))
+        row.update(tunnel=tunnel, loss=loss, results={str(c): res[c] for c in cands}, pick=pick,
+                   gain=round(gain * 100), at=int(time.time()))
+        row["note"] = ("%d بهتر است (%d٪ سریع‌تر%s)" % (pick, round(gain * 100), "، به خاطر پکت لاست" if forced else "")
+                       if pick != cur else "همین %d بهترین است" % cur)
+        state[out] = {k: row[k] for k in ("pick", "gain", "loss", "results", "at", "tunnel", "current")}
+        state[out]["note"] = row["note"]
+        if go and apply and not row["locked"]:
+            row["changed"] = set_concurrency_live(out, pick)
+            if row["changed"]:
+                state[out]["current"] = pick
+                state[out]["changed_at"] = int(time.time())
+                tell("⚙️ mux %s: concurrency از %d به %d رفت؛ %s (پکت لاست تانل: %s)." % (
+                    g["label"] or out, cur, pick, "برای پکت لاست" if forced else "%d٪ سریع‌تر در اندازه‌گیری" % round(gain * 100),
+                    "%s٪" % loss if loss is not None else "نامعلوم"))
+        elif go:
+            row["note"] += " - با --apply اعمال می‌شود"
+        report.append(row)
+    os.makedirs(os.path.dirname(TUNE_STATE), exist_ok=True)
+    save_json(TUNE_STATE, state)
+    return report
+
+
+def set_concurrency_live(out, c):
+    """New concurrency for one exit's mux: settings, template (and its mixed copies), then the
+    running Xray through its API. No restart."""
+    s = settings()
+    g = s["groups"].setdefault(out, {})
+    g["concurrency"] = int(c)
+    t = template()
+    mux = f"{out}-mux"
+    for o in t["outbounds"]:
+        if o.get("tag") == mux:
+            o["mux"] = mux_block(group_conf(s, out))
+    xuimix.reapply(t)
+    ok, detail = test_candidate(t)
+    if not ok:
+        return False
+    save_json(SETTINGS, s)
+    write_template(t)
+    accept_in_config_guard()             # before config.json changes
+    return hot_replace(t, [mux])
+
+
+def tell(text):
+    if shutil.which("tunnel-guard"):
+        subprocess.run(["tunnel-guard", "--say", text], capture_output=True, timeout=40)
 
 
 def say(d):
@@ -458,6 +669,10 @@ def set_group(name):
             if not 1 <= v <= 128:
                 sys.exit(f"{flag} must be 1..128")
             g[key] = v
+            if key == "concurrency":
+                g["lock"] = True          # chosen by hand: tune leaves it alone
+    if "--auto" in args:
+        g["lock"] = False
     if opt("--label") is not None:
         g["label"] = opt("--label")[:40]
     if opt("--heavy") is not None:
@@ -501,6 +716,17 @@ def main():
                                                      "  (" + g["note"] + ")" if g.get("note") else ""))
             for p in g["problems"]:
                 print("   %s%s" % (p["msg"], "  [fixable live]" if p["hot"] else ""))
+        return
+    if mode == "tune":
+        grp = next((a for a in args[args.index("tune") + 1:] if not a.startswith("--")), None)
+        rows = tune(grp, apply="--apply" in args)
+        if as_json:
+            return print(json.dumps(rows, ensure_ascii=False))
+        for r in rows:
+            res = " ".join("c%s=%sms%s" % (c, v["ms"], "(%s fail)" % v["fails"] if v["fails"] else "")
+                           for c, v in (r.get("results") or {}).items())
+            print("%-10s now %-3s %s  loss %s  %s%s" % (r["out"], r["current"], res, r.get("loss", "-"), r.get("note", ""),
+                                                   "  -> applied" if r["changed"] else ""))
         return
     if mode == "fix":
         if fix(auto="--auto" in args) is not None:

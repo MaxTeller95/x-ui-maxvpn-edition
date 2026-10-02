@@ -363,6 +363,11 @@
           <label class="switch"><input type="checkbox" id="ads"><span></span></label>
         </div>
         <div class="row">
+          <div>DNS سریع<div class="muted">جواب تکراری از کش، حتی اگر مهلتش گذشته باشد، فوری داده می‌شود و پشت صحنه تازه می‌شود؛
+            هر دو سرور DoH همزمان پرسیده می‌شوند. هر بار که یک دامنه‌ی پرکاربرد منقضی می‌شود ۱۰۰ تا ۴۰۰ میلی‌ثانیه صرفه‌جویی</div></div>
+          <label class="switch"><input type="checkbox" id="dnsfast"><span></span></label>
+        </div>
+        <div class="row">
           <div>بستن QUIC (UDP 443)<div class="muted">یوتیوب، اینستاگرام و مرورگرها بی‌درنگ به HTTPS روی TCP برمی‌گردند؛
             داخل تانل معمولاً سریع‌تر و پایدارتر است</div><div class="muted sm" id="quic-share"></div></div>
           <label class="switch"><input type="checkbox" id="quic"><span></span></label>
@@ -627,10 +632,14 @@ function renderStatus(s) {
           <input class="sg-label" data-sglabel="${esc(g.out)}" value="${esc(g.label)}" placeholder="برچسب، مثل کشور یک">
           ${st}
           <label class="mini"><input type="checkbox" data-sgon="${esc(g.out)}" ${g.enabled ? "checked" : ""}>فعال</label>
-          <select data-sgconc="${esc(g.out)}" title="concurrency: چند اتصال روی یک اتصال تانل">${[2, 4, 8, 16].map((n) =>
-            `<option value="${n}" ${+g.concurrency === n ? "selected" : ""}>mux ${n}</option>`).join("")}</select></div>
+          <select data-sgconc="${esc(g.out)}" title="concurrency: چند اتصال روی یک اتصال تانل. خودکار: هر ۳۰ دقیقه اندازه‌گیری می‌شود؛ عدد = قفل دستی">
+            <option value="auto" ${g.auto ? "selected" : ""}>خودکار · mux ${g.concurrency}</option>
+            ${[2, 4, 8, 16].map((n) => `<option value="${n}" ${!g.auto && +g.concurrency === n ? "selected" : ""}>🔒 mux ${n}</option>`).join("")}</select>
+          <button class="ic" data-sgtune="${esc(g.out)}" title="همین حالا اندازه بگیر (حدود یک دقیقه)">⟳</button></div>
         <div class="muted sm"><span dir="ltr">${esc(g.mux)}</span> · ${esc(g.inbounds.join("، "))}
-          ${g.problems.length ? " · " + esc(g.problems[0].msg) : g.note ? " · " + esc(g.note) : ""}</div></div>`;
+          ${g.problems.length ? " · " + esc(g.problems[0].msg) : g.note ? " · " + esc(g.note) : ""}</div>
+        ${g.tune && g.tune.results ? `<div class="muted sm" title="${esc(Object.entries(g.tune.results).map(([c, v]) => "mux " + c + ": " + v.ms + "ms" + (v.fails ? " (" + v.fails + " خطا)" : "")).join(" · "))}">
+          اندازه‌گیری ${ago(g.tune.at)}: ${esc(g.tune.note || "")}${g.tune.loss != null ? " · پکت لاست تانل " + g.tune.loss + "٪" : ""}</div>` : ""}</div>`;
     }).join("")
     + ((sc.problems || []).some((p) => p.group && p.hot)
       ? '<button data-fix="split-fix" style="margin-top:4px">تعمیر خودکار</button>' : "");
@@ -640,6 +649,7 @@ function renderStatus(s) {
       + (gf.age_days > 14 ? " — قدیمی است" : "");
   if (!$("#sec").disabled) $("#sec").checked = !!geo.security;
   if (!$("#quic").disabled) $("#quic").checked = !!s.features.quic_block;
+  if (!$("#dnsfast").disabled) { $("#dnsfast").checked = !!s.features.dns_fast; $("#dnsfast").closest(".row").hidden = !s.features.dns_cache; }
   const q = s.features.quic || {};
   $("#quic-share").textContent = !q.total ? "" : s.features.quic_block
     ? `از ${q.total} اتصال اخیر، ${q.quic} تلاش QUIC بود و ${q.refused} تای آن‌ها به TCP برگردانده شد`
@@ -824,9 +834,10 @@ function tnTest(t) {
 function tnChip(r, a, i) {
   const t = a.test, n = esc(r.name), ad = esc(a.addr), [pa, via] = a.addr.split("@");
   const m = r.mix || {}, member = m.on && (m.addrs || []).includes(a.addr);
+  const loss = member ? (m.loss || {})[a.addr] : null, out = member && (m.out || []).includes(a.addr);
   const share = member && m.share ? m.share[a.addr] : null, w = member ? (m.weights || [])[m.addrs.indexOf(a.addr)] || 1 : 0;
-  const cls = [m.on ? (member ? "mix" : "spare") : a.live ? "live" : "", t ? (t.ok ? "ok" : "bad") : ""].join(" ");
-  const tip = (member ? `در ترکیب${w > 1 ? " (وزن " + w + ")" : ""} · ` : m.on ? "رزرو · " : a.live ? "فعال · " : "")
+  const cls = [m.on ? (member ? (out ? "spare" : "mix") : "spare") : a.live ? "live" : "", out ? "bad" : t ? (t.ok ? "ok" : "bad") : ""].join(" ");
+  const tip = (out ? `موقتاً بیرون از ترکیب: پکت لاست ${loss}٪ · ` : member ? `در ترکیب${w > 1 ? " (وزن " + w + ")" : ""}${loss != null ? " · پکت لاست ۶ دقیقه: " + loss + "٪" : ""} · ` : m.on ? "رزرو · " : a.live ? "فعال · " : "")
     + (t ? (t.ok ? "جواب داد " : "بی‌پاسخ ") + ago(t.at) : "تست نشده") + " — کلیک: تست";
   const swap = m.on ? (member ? `<button class="pin ${m.pinned === a.addr ? "on" : ""}" data-tpin="${n}" data-addr="${ad}"
         title="${m.pinned === a.addr ? "برداشتن سنجاق: دوباره بین همه پخش شود" : "موقتاً فقط همین تانل (بدون ری‌استارت)"}">📌</button>` : "")
@@ -834,6 +845,7 @@ function tnChip(r, a, i) {
   return `<span class="tc ${cls}" title="${tip}"><i></i>
     <b dir="ltr" data-ttest="${n}" data-addr="${ad}">${esc(pa)}</b><small>${esc(via ? via + " · sing-box" : a.iface || a.kind || "")}${t && t.ok && t.ms ? " · " + t.ms + "ms" : ""}${w > 1 ? " · " + w + "×" : ""}</small>
     ${share != null ? `<span class="pct">${share}%</span>` : ""}
+    ${loss ? `<span class="chip ${out ? "bad" : "warn"}" style="padding:0 6px">لاست ${loss}٪</span>` : ""}
     ${swap}
     ${i > 0 ? `<button data-tup="${n}" data-i="${i}" title="ترجیح بالاتر">▲</button>` : ""}
     ${a.live || member || i < 0 ? "" : `<button data-tdel="${n}" data-i="${i}" title="حذف از فهرست">×</button>`}</span>`;
@@ -1024,6 +1036,15 @@ document.addEventListener("click", async (e) => {
     loadPaths(); loadStatus();
     return;
   }
+  const tu = e.target.closest("[data-sgtune]");
+  if (tu) {
+    tu.disabled = true; toast("اندازه‌گیری mux " + tu.dataset.sgtune + " ... (حدود یک دقیقه)");
+    const r = await post("split-tune", { group: tu.dataset.sgtune });
+    tu.disabled = false;
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadStatus();
+    return;
+  }
   const mx = e.target.closest("[data-tmixedit],[data-mapply],[data-moff],[data-mcancel],[data-tpin]");
   if (mx) {
     const d = mx.dataset;
@@ -1207,7 +1228,9 @@ document.addEventListener("change", async (e) => {
         sg.checked = !sg.checked; return;
       }
       body.on = sg.checked;
-    } else if (sg.dataset.sgconc) body.concurrency = +sg.value;     // only the mux copy: applied live
+    } else if (sg.dataset.sgconc) {                                   // only the mux copy: applied live
+      if (sg.value === "auto") body.auto = true; else body.concurrency = +sg.value;   // a number locks it
+    }
     else body.label = sg.value.trim();
     sg.disabled = true; toast("در حال اعمال...");
     const r = await post("split-set", body);
@@ -1255,6 +1278,17 @@ $("#geo-update").onclick = async (e) => {
   const r = await post("geo-update");
   e.target.disabled = false;
   toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+  loadStatus();
+};
+$("#dnsfast").onchange = async (e) => {
+  const on = e.target.checked;
+  if (!confirm((on ? "DNS سریع روشن بشه؟" : "DNS سریع خاموش بشه؟") + " فقط رفتار کش DNS عوض می‌شه، قبلش بکاپ گرفته می‌شه و x-ui ری‌استارت می‌شه.")) {
+    e.target.checked = !on; return;
+  }
+  e.target.disabled = true; toast("در حال اعمال...");
+  const r = await post("dns-fast", { on });
+  e.target.disabled = false;
+  toast(r.ok ? (r.msg || "انجام شد") : "خطا: " + (r.msg || ""));
   loadStatus();
 };
 $("#quic").onchange = async (e) => {

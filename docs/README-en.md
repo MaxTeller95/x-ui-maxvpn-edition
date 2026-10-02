@@ -115,6 +115,15 @@ cache; the ad block still applies.
 including their Iranian DNS") belong *above* the DNS cache rule, and must not also be
 limited to the `api` inbound - rules match only when every condition holds.
 
+### DNS fast mode
+
+Measured on a hub: a lookup that is not cached (DoH through the tunnel) takes a median of 94 ms
+and up to 379 ms; a cached one 0.1 ms. Popular domains carry 1-5 minute TTLs, so users pay the
+miss over and over. Fast mode answers an expired entry at once for up to an hour while Xray
+refreshes it in the background (`serveStale`, `serveExpiredTTL: 3600`), and asks both DoH servers
+together, taking the faster (`enableParallelQuery`). `xui-optimizer --dns-fast on|off` switches
+only the dns block (backup, one restart); a new DNS cache starts in fast mode.
+
 ## xui-split - mux only where it helps
 
 A new user connection costs a TCP handshake across the tunnel (~84 ms on an
@@ -164,6 +173,20 @@ repair button.
 It also prepares the guard: Xray's `RoutingService` (switch routes without a restart),
 a local-only socks probe port per proxy outbound (`guard-<outbound>`, 127.0.0.1:10808+,
 stable across re-runs), and rule tags `main-<outbound>` / `dns-upstream`.
+
+### Smart mux
+
+How many streams should share one mux connection is not a constant: more saves handshakes
+across the tunnel (a round trip of 80-100 ms each), but on a lossy tunnel one lost packet stalls
+every stream on that connection. `xui-split tune` measures it on each exit's own light-traffic
+outbound (for a mixed path, a copy on a tunnel that is in the mix and clean) in a throwaway
+Xray: concurrency 2, 4, 8, 16 and the current value, 16 small HTTPS requests at once per round,
+shuffled rounds after a warm-up; a failure every setting shares is the site's, not mux's.
+Within 5% of the best counts as equal (then the current, else the lowest, wins); with 2%+ packet
+loss nothing above 4 is chosen; it switches only for a 25% gain or 10% seen twice in a row,
+live through the API (mixed copies too, never re-adding one out for loss), and says so on
+Telegram. `xui-split-tune.timer` runs it every 30 minutes; a concurrency set by hand
+(`xui-split set G --concurrency N`, or a number on the page) is locked, `--auto` unlocks.
 
 ## tunnel-guard - failover without observatory
 
@@ -411,6 +434,14 @@ xui-tunnel mix MAIN on 10.0.1.2,10.0.10.1,10.0.1.2@sb0 --how random --weights 2,
 xui-tunnel mix MAIN pin 10.0.10.1     # pin none to let go
 xui-tunnel mix MAIN off
 ```
+
+Packet loss: every minute each tunnel of a mix gets 25 pings (0.1 s apart, all tunnels at once)
+and the last 6 minutes are kept. A tunnel losing 3% or more and at least 2 points more than the
+cleanest, while a clean one is left, is taken out of the running Xray (its copies removed
+through the API; no restart, the template is untouched) and Telegram is told; it returns after
+3 clean minutes. If every tunnel loses alike nothing is taken out. When the first tunnel (the
+fallback) is out, its copy is aimed at the best tunnel left, so the fallback always exists; after
+an x-ui restart the state is applied again.
 
 Turning it on, changing it or off restarts x-ui once, after an Xray test and a backup; the path
 is then checked through its own probe port and everything is put back if it does not answer.

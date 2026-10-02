@@ -580,6 +580,7 @@ def status():
             "ad_block": any(r.get("domain") == ["geosite:category-ads-all"] for r in rules),
             "tg_backup": setting("tgBotBackup") == "true",
             "quic_block": any(r.get("ruleTag") == "xui-optimizer-noquic" for r in rules),
+            "dns_fast": bool((cfg.get("dns") or {}).get("serveStale")),
             "quic": cached("quic", 120, quic_share),
 
         },
@@ -598,7 +599,8 @@ def units():
     got = [("x-ui", "پنل و Xray"), ("nginx", "جلوی پنل و صفحه‌ی Optimizer"), ("xo-dash", "همین صفحه"),
            ("tunnel-guard.timer", "بررسی مسیرها هر دقیقه"), ("config-guard.path", "نگهبان پیکربندی"),
            ("config-guard.timer", "تور ایمنی نگهبان پیکربندی"),
-           ("xui-tunnel.timer", "جابجایی خودکار بین تانل‌ها")]
+           ("xui-tunnel.timer", "جابجایی خودکار بین تانل‌ها و پکت لاست ترکیب"),
+           ("xui-split-tune.timer", "mux هوشمند هر ۳۰ دقیقه")]
     for name, p in (conf().get("paths") or {}).items():
         if p.get("iface"):
             got.append(("awg-quick@%s.service" % p["iface"], "تانل " + name))
@@ -620,7 +622,7 @@ def units():
 
 
 RESTARTABLE = {"x-ui", "nginx", "xo-dash", "tunnel-guard.timer", "config-guard.path", "config-guard.timer",
-               "xui-tunnel.timer"}
+               "xui-tunnel.timer", "xui-split-tune.timer"}
 LOGS = {"tunnel-guard": ("journalctl", "-t", "tunnel-guard", "-n", "60", "--no-pager", "-o", "short-iso"),
         "config-guard": ("journalctl", "-u", "config-guard.service", "-n", "60", "--no-pager", "-o", "short-iso"),
         "x-ui": ("journalctl", "-u", "x-ui", "-n", "80", "--no-pager", "-o", "short-iso"),
@@ -1192,6 +1194,19 @@ def action(name, body):
     if name == "report":
         rc, out = run("tunnel-guard", "--report", timeout=90)
         return {"ok": rc == 0, "msg": "report sent" if rc == 0 else out}
+    if name == "dns-fast":  # restarts x-ui: the page asks first
+        rc, out = run("xui-optimizer", "--dns-fast", "on" if body.get("on") else "off", timeout=150)
+        lines = [l for l in out.splitlines() if l.strip()]
+        return {"ok": rc == 0, "msg": (lines[-2] if rc == 0 and len(lines) > 1 else lines[-1]) if lines else ""}
+    if name == "split-tune":  # measures for about a minute, then switches live if it pays
+        grp = str(body.get("group") or "")
+        if grp not in {g["out"] for g in (jrun("xui-split", "groups", "--json", timeout=30) or [])}:
+            return {"ok": False, "msg": "این خروجی پیدا نشد"}
+        rows = jrun("xui-split", "tune", grp, "--apply", "--json", timeout=400) or []
+        _split_cache[0] = 0
+        r = rows[0] if rows else {}
+        return {"ok": bool(rows), "msg": ("%s: %s%s" % (grp, r.get("note", ""), " - اعمال شد" if r.get("changed") else ""))
+                if rows else "اندازه‌گیری انجام نشد", "result": r}
     if name == "quic":  # restarts x-ui: the page asks first
         _slow.pop("quic", None)
         rc, out = run("xui-optimizer", "--quic", "block" if body.get("on") else "allow", timeout=150)
@@ -1285,6 +1300,8 @@ def action(name, body):
                 cmd += [flag, str(int(body[key]))]
         if body.get("label") is not None:
             cmd += ["--label", str(body["label"])[:40]]
+        if body.get("auto"):                     # smart mux decides again; a number locks it
+            cmd.append("--auto")
         r = jrun_any(*cmd, timeout=30)
         if not r or not r.get("ok"):
             return r or {"ok": False, "msg": "ذخیره نشد"}
@@ -1292,6 +1309,9 @@ def action(name, body):
             rc, out = run("xui-split", "apply", "--no-tg-backup", timeout=180)
             _split_cache[0] = 0
             return {"ok": rc == 0, "msg": out.splitlines()[-2] if rc == 0 and len(out.splitlines()) > 1 else out[-200:]}
+        if body.get("auto"):
+            run("systemctl", "start", "--no-block", "xui-split-tune.service", timeout=15)
+            return {"ok": True, "msg": "mux %s روی خودکار است؛ اندازه‌گیری شروع شد (حدود یک دقیقه)" % grp}
         return jrun_any("xui-split", "fix", "--json", "--no-tg-backup", timeout=180) or r   # mux settings: live
     if name == "reach-run":                      # a round takes a minute or two: started, then polled
         rc, out = run("systemctl", "start", "--no-block", "xui-reach.service", timeout=15)
