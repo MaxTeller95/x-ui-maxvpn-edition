@@ -28,6 +28,7 @@ Safe to re-run: earlier changes are replaced, not duplicated.
 import argparse, collections, glob, json, os, shutil, sqlite3, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuimix  # noqa: E402  a path mixed over several tunnels is named by its balancer
 
 DB = "/etc/x-ui/x-ui.db"
 BIN = "/usr/local/x-ui/bin"
@@ -58,12 +59,12 @@ def plan(tpl, dns_via):
     route = {}  # inbound -> outbound, from rules that match on inbound alone
     for r in tpl["routing"]["rules"]:
         # 3.x panels write "enabled" on every rule they save; a disabled rule routes nothing
-        if ours(r) or r.get("enabled") is False or set(r) - {"type", "inboundTag", "outboundTag", "ruleTag", "enabled"}:
+        if ours(r) or r.get("enabled") is False or                 set(r) - {"type", "inboundTag", "outboundTag", "balancerTag", "ruleTag", "enabled"}:
             continue
         for ib in r.get("inboundTag", []):
             if ib.startswith("guard-") or ib in ("api", DNS_TAG):   # probe ports and internals carry no users
                 continue
-            ob = r.get("outboundTag")
+            ob = xuimix.target(r)
             # xui-split's "-mux" copy is the same path: an inbound whose first rule is
             # split-light still belongs to the base outbound
             if ob and ob.endswith("-mux") and ob[:-4] in kinds:
@@ -76,7 +77,7 @@ def plan(tpl, dns_via):
     if dns_via is None:
         # the outbound of xui-split's catch-all if there is one, else the busiest - never a
         # "-mux" copy: DoH is one long connection and gains nothing from mux
-        main = next((r.get("outboundTag") for r in tpl["routing"]["rules"]
+        main = next((xuimix.target(r) for r in tpl["routing"]["rules"]
                      if (r.get("ruleTag") or "").startswith("main-")), None)
         busiest = [ob for ob, _ in collections.Counter(abroad.values()).most_common() if not ob.endswith("-mux")]
         dns_via = main or (busiest or list(abroad.values()))[0]
@@ -117,7 +118,7 @@ def patch(tpl, abroad, dns_via, blackhole, adblock, dns):
                     "domain": ["geosite:category-ads-all"], "outboundTag": blackhole})
     rules = tpl["routing"]["rules"]
     at = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
-    rules[at:at] = new
+    rules[at:at] = xuimix.point(new, tpl)             # DoH through a mixed path: its balancer
 
 
 def is_ad(rule):

@@ -18,6 +18,7 @@ Decisions are logged to the journal: journalctl -t tunnel-guard
 import json, os, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuimix  # noqa: E402  a backup mixed over several tunnels is reached through its balancer
 
 CONF = os.environ.get("TUNNEL_GUARD_CONF", "/etc/tunnel-guard.json")
 DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
@@ -205,9 +206,10 @@ def failover(target):
         log(f"failover: no main-{PRIMARY.lower()} rule in config.json - nothing to move")
         return False
     rm_rules(RESTORE + ["fo-dns", "fo-main"])
+    to = xuimix.route(json.load(open(CFG)), target)      # {"outboundTag": X} or its mix balancer
     ok = add_rules([
-        {"type": "field", "ruleTag": "fo-dns", "inboundTag": ["dns-internal"], "outboundTag": target},
-        {"type": "field", "ruleTag": "fo-main", "inboundTag": main[0]["inboundTag"], "outboundTag": target},
+        dict({"type": "field", "ruleTag": "fo-dns", "inboundTag": ["dns-internal"]}, **to),
+        dict({"type": "field", "ruleTag": "fo-main", "inboundTag": main[0]["inboundTag"]}, **to),
     ])
     log(f"failover to {target}: {'ok' if ok else 'FAILED'}")
     return ok

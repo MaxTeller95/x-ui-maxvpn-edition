@@ -33,6 +33,7 @@ The primary path cannot be removed, and neither can the one users are on right n
 import base64, glob, json, os, re, shutil, sqlite3, subprocess, sys, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuimix  # noqa: E402  a path mixed over several tunnels has copies and a balancer
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 CFG, GUARD_CONF = BIN + "/config.json", "/etc/tunnel-guard.json"
@@ -425,10 +426,11 @@ def remove(name, as_json):
     except OSError:
         pass
     tag = "guard-" + name.lower()
+    xuimix.remove(t, name)                              # its per-tunnel copies and balancer go too
     t["outbounds"] = [o for o in t.get("outbounds", []) if o.get("tag") not in (name, name + "-mux")]
     t["inbounds"] = [i for i in t.get("inbounds", []) if i.get("tag") != tag]
     t["routing"]["rules"] = [r for r in t["routing"]["rules"]
-                             if r.get("ruleTag") != tag and r.get("outboundTag") != name]
+                             if r.get("ruleTag") != tag and xuimix.target(r) != name]
     ok, detail = test_config(t)
     if not ok:
         die("Xray کانفیگ بدون این مسیر را رد کرد: " + detail, as_json)

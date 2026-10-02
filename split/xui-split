@@ -37,6 +37,7 @@ The DNS cache's upstream rule is tagged "dns-upstream".
 import glob, json, os, shutil, sqlite3, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuimix  # noqa: E402  paths mixed over several tunnels: rules aim at a balancer
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 SETTINGS, GUARD_CONF = "/etc/xui-split.json", "/etc/tunnel-guard.json"
@@ -112,12 +113,13 @@ def template(db=None):
 
 def catch_all(r, kinds):
     """An inbound-only rule that sends users to a proxy outbound."""
-    return (r.get("inboundTag") and kinds.get(r.get("outboundTag")) not in (None, *NOT_PROXY)
+    ob = xuimix.target(r)                                       # a mixed path's rules name its balancer
+    return (r.get("inboundTag") and kinds.get(ob) not in (None, *NOT_PROXY)
             and "dns-internal" not in r["inboundTag"]
             and not (r.get("ruleTag") or "").startswith(("guard-", "split-", "fo-"))
-            and not r["outboundTag"].endswith("-mux")
+            and not ob.endswith("-mux")
             and r.get("enabled") is not False                        # 3.x panels write "enabled"
-            and set(r) <= {"type", "inboundTag", "outboundTag", "ruleTag", "enabled"})
+            and set(r) <= {"type", "inboundTag", "outboundTag", "balancerTag", "ruleTag", "enabled"})
 
 
 def groups(t):
@@ -126,7 +128,7 @@ def groups(t):
     out = {}
     for r in t["routing"]["rules"]:
         if catch_all(r, kinds):
-            ob = r["outboundTag"]
+            ob = xuimix.target(r)
             if ob not in out or len(r["inboundTag"]) > len(out[ob]["inboundTag"]):
                 out[ob] = r
     return out
@@ -168,7 +170,8 @@ def patch(t, remove=False):
     # local-only probe ports: one per proxy outbound and one per mux copy
     ports = {i["tag"]: i["port"] for i in t["inbounds"] if i.get("tag", "").startswith("guard-")}
     t["inbounds"] = [i for i in t["inbounds"] if not i.get("tag", "").startswith("guard-")]
-    targets = [o["tag"] for o in t["outbounds"] if o.get("protocol") not in NOT_PROXY and o.get("tag")]
+    targets = [o["tag"] for o in t["outbounds"] if o.get("protocol") not in NOT_PROXY and o.get("tag")
+               and not xuimix.is_clone(o["tag"])]                   # a mix's per-tunnel copies: no probe
     for ob in want:
         base = next(o for o in t["outbounds"] if o.get("tag") == ob)
         mux = json.loads(json.dumps(base))
@@ -198,6 +201,7 @@ def patch(t, remove=False):
         i = rules.index(main)
         rules[i:i] = new
     t["routing"]["rules"] = rules
+    xuimix.reapply(t)            # mixed paths: copies rebuilt from the new mux copies, rules to the balancers
     return t, want
 
 
@@ -316,13 +320,13 @@ def check(t, live=True):
             if strip(base) != strip(mux):
                 bad("mux-drift", f"{ob}: {tg['mux']} با {ob} یکی نیست (آدرس، مسیر یا مشخصات جدا عوض شده)", hot=True)
         li = by_tag.get(tg["light"])
-        if li and li[1].get("outboundTag") != tg["mux"]:
-            bad("light-target", f"{ob}: {tg['light']} به {li[1].get('outboundTag')} می‌رود، نه {tg['mux']}")
+        if li and xuimix.target(li[1]) != tg["mux"]:
+            bad("light-target", f"{ob}: {tg['light']} به {xuimix.target(li[1])} می‌رود، نه {tg['mux']}")
         for k in KINDS:
             got = by_tag.get(tg[k])
             if not got:
                 bad("rule-missing", f"{ob}: قانون {tg[k]} نیست")
-            elif got[1].get("outboundTag") != ob:
+            elif xuimix.target(got[1]) != ob:
                 bad("rule-target", f"{ob}: {tg[k]} باید به {ob} برود")
             elif li and got[0] > li[0]:
                 bad("rule-order", f"{ob}: {tg[k]} بعد از {tg['light']} است، پس اعمال نمی‌شود")
@@ -335,6 +339,10 @@ def check(t, live=True):
                 bad("live-missing", f"{ob}: Xray در حال اجرا {tg['mux']} را ندارد", hot=True)
             elif "multiplexSettings" not in json.dumps(lo[tg["mux"]]):
                 bad("live-mux-off", f"{ob}: Xray در حال اجرا {tg['mux']} را بدون mux اجرا می‌کند", hot=True)
+        if ob in xuimix.mixed(t):    # traffic rides per-tunnel copies: repairing means rebuilding them
+            g["mixed"] = True
+            for p in g["problems"]:
+                p["hot"] = False
         if g["light"] == "direct":
             g["note"] = "نگهبان ترافیک سبک این خروجی را موقتاً از mux برداشته (mux گیر کرده بود)"
     report["problems"] += [p for g in report["groups"] for p in g["problems"]]
@@ -409,6 +417,7 @@ def fix(auto=False):
             copy["tag"], copy["mux"] = m, mux_block(group_conf(s, m[:-4]))
             new["outbounds"] = [o for o in new["outbounds"] if o.get("tag") != m]
             new["outbounds"].insert(new["outbounds"].index(base) + 1, copy)
+        xuimix.reapply(new)
     else:
         new, want = patch(json.loads(json.dumps(tpl)))
     ok, detail = test_candidate(new)

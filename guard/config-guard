@@ -70,6 +70,10 @@ def snapshot(t):
         "outbounds": [o.get("tag") for o in t.get("outbounds", []) if o.get("tag")],
         "inbounds": [i.get("tag") for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")],
         "dns": t.get("dns"),
+        # a path mixed over several tunnels: rules name these balancers, and a rule whose
+        # balancer is gone stops Xray from starting at all
+        "balancers": [b.get("tag") for b in t.get("routing", {}).get("balancers") or [] if b.get("tag")],
+        "observatory": bool(t.get("burstObservatory") or t.get("observatory")),
     }
 
 
@@ -79,11 +83,13 @@ def missing(base, now):
         "outbounds": [t for t in base["outbounds"] if t not in now["outbounds"]],
         "inbounds": [t for t in base["inbounds"] if t not in now["inbounds"]],
         "dns": bool(base.get("dns")) and not now.get("dns"),
+        "balancers": [t for t in base.get("balancers") or [] if t not in now.get("balancers") or []],
+        "observatory": bool(base.get("observatory")) and not now.get("observatory"),
     }
 
 
 def any_missing(m):
-    return bool(m["rules"] or m["outbounds"] or m["inbounds"] or m["dns"])
+    return bool(m["rules"] or m["outbounds"] or m["inbounds"] or m["dns"] or m.get("balancers") or m.get("observatory"))
 
 
 def describe(m):
@@ -96,6 +102,10 @@ def describe(m):
         parts.append("پورت‌های probe " + "، ".join(m["inbounds"]))
     if m["dns"]:
         parts.append("بخش dns (کش DNS)")
+    if m.get("balancers"):
+        parts.append("بالانسرهای " + "، ".join(m["balancers"]))
+    if m.get("observatory"):
+        parts.append("observatory (سلامت تانل‌های ترکیبی)")
     return " و ".join(parts)
 
 
@@ -118,6 +128,12 @@ def repair(t, base, m):
             t.setdefault("inbounds", []).append(by_tag[tag])
     if m["dns"]:
         t["dns"] = base["dns"]
+    by_tag = {b.get("tag"): b for b in base.get("full_balancers", [])}
+    for tag in m.get("balancers") or []:
+        if tag in by_tag:
+            t["routing"].setdefault("balancers", []).append(by_tag[tag])
+    if m.get("observatory") and base.get("full_observatory"):
+        t.update(base["full_observatory"])
     return t
 
 
@@ -128,7 +144,7 @@ def test(t):
     cfg = live()
     if not cfg:
         return False, "no live config"
-    for k in ("api", "outbounds", "routing", "dns"):
+    for k in ("api", "outbounds", "routing", "dns", "burstObservatory", "observatory"):
         if k in t:
             cfg[k] = t[k]
     cfg["inbounds"] = [i for i in cfg.get("inbounds", []) if not (i.get("tag") or "").startswith("guard-")] + \
@@ -157,6 +173,8 @@ def save_baseline(t):
     s = snapshot(t)
     s["full_outbounds"] = t.get("outbounds", [])
     s["full_inbounds"] = [i for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")]
+    s["full_balancers"] = t.get("routing", {}).get("balancers") or []
+    s["full_observatory"] = {k: t[k] for k in ("burstObservatory", "observatory") if t.get(k)}
     write(BASE, s)
     return s
 

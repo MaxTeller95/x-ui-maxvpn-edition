@@ -389,6 +389,40 @@ State is kept in `/var/lib/tunnel-guard/tunnels.json`, and the lists are kept un
 tools. It has a find-tunnels table, and each path has its addresses, test / use / ▲ /
 remove buttons, a scan button, a field for typing an address, and the last moves.
 
+
+### Several tunnels at once
+
+Instead of one tunnel at a time, a path's new connections are shared between two or more of
+its tunnels, so the traffic is never all on one of them. All tunnels of a path reach the same
+server, so the user's exit IP does not change.
+
+- **smart** (default): every healthy tunnel takes connections; one that loses over a third of
+  its pings or answers slower than 1.5 s leaves the mix until it recovers (Xray `leastLoad`).
+- **random** / **roundrobin**: by weight (1x-3x; a 2x tunnel gets twice the new connections).
+- Priority is the path's tunnel order; the first is the fallback when none answers. Xray's
+  `burstObservatory` skips a dead tunnel in every mode; the timer tests each tunnel every 5
+  minutes and tells Telegram when one drops out or comes back.
+- **Pin** (runtime, no restart): all of the path on one tunnel until unpinned or x-ui restarts.
+- The page shows each tunnel's share of the last hour's traffic.
+
+```bash
+xui-tunnel mix MAIN on 10.0.1.2,10.0.10.1 --how smart
+xui-tunnel mix MAIN on 10.0.1.2,10.0.10.1,10.0.1.2@sb0 --how random --weights 2,1,1
+xui-tunnel mix MAIN pin 10.0.10.1     # pin none to let go
+xui-tunnel mix MAIN off
+```
+
+Turning it on, changing it or off restarts x-ui once, after an Xray test and a backup; the path
+is then checked through its own probe port and everything is put back if it does not answer.
+How: one copy of the path's outbound per tunnel (`MAIN~1`, `MAIN~2`, `MAIN~1b` for a
+2x weight), a balancer `mix-MAIN` over them, and every rule that went to `MAIN` (users,
+DNS, the guard's probe) now names the balancer. `MAIN` itself stays, unused, as the model of
+the copies, so tunnel-guard failover, xui-split (which re-applies the mix after every rebuild),
+xui-optimizer and config-guard (which now also keeps balancers and the observatory) keep
+working. `MAIN-mux` is mixed the same way. A loopback outbound in front of the balancer would
+have left the rules alone, but Xray counts loopback traffic against the same user a second time
+and quotas would run out twice as fast. Shared code: `lib/xuimix.py`.
+
 ## xui-reach, xui-geo, xui-cert
 
 - **xui-reach** - every probe the hub runs goes outwards, but a user's outage is often on the

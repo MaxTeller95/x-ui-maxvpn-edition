@@ -102,6 +102,19 @@
   .tc button:hover { color: var(--accent); }
   .tc.add { border-style: dashed; padding: 2px 10px; color: var(--muted); cursor: pointer; }
   .tc.add:hover { border-color: var(--accent); color: var(--accent); }
+  .tc.mix { border-color: var(--accent); background: var(--accent-soft); }
+  .tc.mix i { background: var(--accent); }
+  .tc.spare { opacity: .55; }
+  .tc .pct { font-weight: 700; color: var(--accent); }
+  .tc button.pin.on { color: var(--accent); }
+  .mixed { margin-top: 8px; padding: 10px; border: 1px dashed var(--line); border-radius: 10px; display: grid; gap: 8px; }
+  .mixed .mr { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+  .mixed .mr select { padding: 1px 6px; font-size: 12px; }
+  .mixed .mh { display: flex; gap: 6px; flex-wrap: wrap; }
+  .mixed .mh label { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 12px; cursor: pointer; }
+  .mixed .mh label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  .mixed .mh input { display: none; }
+  .mixed .btns { display: flex; gap: 6px; flex-wrap: wrap; }
   .sg { padding: 6px 0; border-top: 1px solid var(--line); }
   .sg .th { margin-bottom: 2px; }
   .sg-label { width: 110px; padding: 2px 8px; font-size: 12px; }
@@ -810,13 +823,45 @@ function tnTest(t) {
 }
 function tnChip(r, a, i) {
   const t = a.test, n = esc(r.name), ad = esc(a.addr), [pa, via] = a.addr.split("@");
-  const cls = [a.live ? "live" : "", t ? (t.ok ? "ok" : "bad") : ""].join(" ");
-  const tip = (a.live ? "فعال · " : "") + (t ? (t.ok ? "جواب داد " : "بی‌پاسخ ") + ago(t.at) : "تست نشده") + " — کلیک: تست";
+  const m = r.mix || {}, member = m.on && (m.addrs || []).includes(a.addr);
+  const share = member && m.share ? m.share[a.addr] : null, w = member ? (m.weights || [])[m.addrs.indexOf(a.addr)] || 1 : 0;
+  const cls = [m.on ? (member ? "mix" : "spare") : a.live ? "live" : "", t ? (t.ok ? "ok" : "bad") : ""].join(" ");
+  const tip = (member ? `در ترکیب${w > 1 ? " (وزن " + w + ")" : ""} · ` : m.on ? "رزرو · " : a.live ? "فعال · " : "")
+    + (t ? (t.ok ? "جواب داد " : "بی‌پاسخ ") + ago(t.at) : "تست نشده") + " — کلیک: تست";
+  const swap = m.on ? (member ? `<button class="pin ${m.pinned === a.addr ? "on" : ""}" data-tpin="${n}" data-addr="${ad}"
+        title="${m.pinned === a.addr ? "برداشتن سنجاق: دوباره بین همه پخش شود" : "موقتاً فقط همین تانل (بدون ری‌استارت)"}">📌</button>` : "")
+    : a.live ? "" : `<button data-tuse="${n}" data-addr="${ad}" title="برو روی این">⇄</button>`;
   return `<span class="tc ${cls}" title="${tip}"><i></i>
-    <b dir="ltr" data-ttest="${n}" data-addr="${ad}">${esc(pa)}</b><small>${esc(via ? via + " · sing-box" : a.iface || a.kind || "")}${t && t.ok && t.ms ? " · " + t.ms + "ms" : ""}</small>
-    ${a.live ? "" : `<button data-tuse="${n}" data-addr="${ad}" title="برو روی این">⇄</button>`}
+    <b dir="ltr" data-ttest="${n}" data-addr="${ad}">${esc(pa)}</b><small>${esc(via ? via + " · sing-box" : a.iface || a.kind || "")}${t && t.ok && t.ms ? " · " + t.ms + "ms" : ""}${w > 1 ? " · " + w + "×" : ""}</small>
+    ${share != null ? `<span class="pct">${share}%</span>` : ""}
+    ${swap}
     ${i > 0 ? `<button data-tup="${n}" data-i="${i}" title="ترجیح بالاتر">▲</button>` : ""}
-    ${a.live || i < 0 ? "" : `<button data-tdel="${n}" data-i="${i}" title="حذف از فهرست">×</button>`}</span>`;
+    ${a.live || member || i < 0 ? "" : `<button data-tdel="${n}" data-i="${i}" title="حذف از فهرست">×</button>`}</span>`;
+}
+const HOW = { smart: "هوشمند", random: "تصادفی", roundrobin: "نوبتی" };
+const HOW_TIP = {
+  smart: "همه‌ی تانل‌های سالم با هم کار می‌کنند؛ تانلی که پینگ از دست بدهد یا کُند شود خودکار کنار می‌رود و بعد از بهبود برمی‌گردد (پیشنهادی)",
+  random: "هر اتصال تازه به یک تانل تصادفی می‌رود، به نسبت وزن‌ها",
+  roundrobin: "اتصال‌های تازه به نوبت بین تانل‌ها پخش می‌شوند، به نسبت وزن‌ها",
+};
+let MIXEDIT = null;
+function mixEditor(r) {
+  const n = esc(r.name), m = r.mix || {}, picked = (m.addrs || []).length ? m.addrs : r.addrs.slice(0, 2).map((a) => a.addr);
+  const how = m.how || "smart";
+  return `<div class="mixed" data-mixfor="${n}">
+    <div class="muted sm">کدام تانل‌ها همزمان کار کنند؟ ترتیب همان اولویت بالاست (با ▲ عوض کنید)؛ اولی پشتیبان است وقتی هیچ تانلی جواب ندهد.
+      وزن ۲× یعنی آن تانل دو برابر اتصال تازه می‌گیرد.</div>
+    ${r.addrs.map((a) => { const on = picked.includes(a.addr), w = on ? (m.weights || [])[(m.addrs || []).indexOf(a.addr)] || 1 : 1;
+      return `<label class="mr"><input type="checkbox" data-mpick value="${esc(a.addr)}" ${on ? "checked" : ""}>
+        <b dir="ltr">${esc(a.addr.split("@")[0])}</b><small class="muted">${esc(a.addr.includes("@") ? a.addr.split("@")[1] + " · sing-box" : a.iface || a.kind || "")}</small>
+        <select data-mw>${[1, 2, 3].map((x) => `<option value="${x}" ${x === w ? "selected" : ""}>وزن ${x}×</option>`).join("")}</select></label>`;
+    }).join("")}
+    <div class="mh">${Object.keys(HOW).map((k) => `<label title="${HOW_TIP[k]}"><input type="radio" name="mhow-${n}" value="${k}" ${k === how ? "checked" : ""}>${HOW[k]}</label>`).join("")}</div>
+    <div class="muted sm" data-mtip>${HOW_TIP[how]}</div>
+    <div class="btns"><button class="primary" data-mapply="${n}">${m.on ? "اعمال تغییرات" : "روشن کردن استفاده‌ی همزمان"}</button>
+      ${m.on ? `<button data-moff="${n}">برگشت به یک تانل</button>` : ""}<button data-mcancel>انصراف</button></div>
+    <div class="muted sm">اعمال، x-ui را یک بار ری‌استارت می‌کند (چند ثانیه). بعدش مسیر تست می‌شود و اگر جواب ندهد همه‌چیز خودکار برمی‌گردد.
+      تانل‌ها باید به یک سرور برسند تا IP خروجی کاربر عوض نشود.</div></div>`;
 }
 function renderTunnels(list) {
   TN = list || [];
@@ -826,15 +871,24 @@ function renderTunnels(list) {
     let addrs = r.addrs.slice();
     if (!addrs.some((a) => a.live)) addrs = [{ addr: r.current, live: true, stray: true, iface: "" }].concat(addrs);
     const last = (r.last || []).slice(-1)[0];
+    const m = r.mix || {};
+    const mixHead = r.addrs.length > 1 ? (m.on
+        ? `<button class="ic" data-tmixedit="${n}" title="تنظیم استفاده‌ی همزمان"><span class="chip accent">همزمان · ${HOW[m.how] || ""}</span></button>
+           ${m.pinned ? `<span class="chip warn" title="تا برداشتن سنجاق یا ری‌استارت x-ui">📌 فقط ${esc(m.pinned)}</span>` : ""}
+           ${(m.drift || []).length ? '<span class="chip warn" title="کپی‌های تانل‌ها با اوت‌باند اصلی فرق دارند؛ «اعمال تغییرات» آن‌ها را از نو می‌سازد">نیاز به اعمال دوباره</span>' : ""}`
+        : `<button class="ic" data-tmixedit="${n}" title="ترافیک کاربران همزمان از چند تانل این مسیر رد شود">⧉ همزمان</button>`) : "";
     return `<div class="tr"><div class="th"><b dir="ltr">${n}</b>
-      ${r.addrs.length > 1 ? `<label class="mini"><input type="checkbox" data-tauto="${n}" ${r.auto ? "checked" : ""}>خودکار</label>` : ""}
+      ${r.addrs.length > 1 && !m.on ? `<label class="mini"><input type="checkbox" data-tauto="${n}" ${r.auto ? "checked" : ""}>خودکار</label>` : ""}
+      ${mixHead}
+      ${m.pending ? '<span class="chip warn">تنظیم شده ولی هنوز در کانفیگ نیست</span>' : ""}
       <button class="ic" data-tscan="${n}" title="اسکن تانل‌ها برای ${n}">⟳</button>
       ${last ? `<span class="muted sm">آخرین جابجایی ${ago(last.t)} ← <span dir="ltr">${esc(last.to)}</span></span>` : ""}</div>
       <div class="tcs">${addrs.map((a) => tnChip(r, a, r.addrs.findIndex((x) => x.addr === a.addr))).join("")}
       ${r.offer.map((o) => `<button class="tc add" data-tadd="${n}" data-addr="${esc(o.addr)}"
           title="${o.test && o.test.ok ? "اسکن: این مسیر اینجا هم جواب داد" : "تانل دیگری به همین سرور"} — کلیک: اضافه کن">+
           <b dir="ltr">${esc(o.addr.split("@")[0])}</b><small>${esc(o.addr.includes("@") ? o.iface + " · sing-box" : o.iface || "")}${o.test && o.test.ok && o.test.ms ? " · " + o.test.ms + "ms" : ""}</small></button>`).join("")}
-      </div></div>`;
+      </div>${m.on && m.share_bytes ? `<div class="muted sm" style="margin-top:4px">سهم هر تانل از ترافیک یک ساعت اخیر: ${bytes(m.share_bytes)}</div>` : ""}
+      ${MIXEDIT === r.name ? mixEditor(r) : ""}</div>`;
   }).join("") || '<div class="muted">هیچ مسیری آدرس جایگزین ندارد؛ «اسکن همه» را بزنید یا آدرس دستی اضافه کنید.</div>';
   const single = TN.filter((r) => !many(r));
   if (single.length) $("#tn-list").insertAdjacentHTML("beforeend", `<div class="muted sm" style="margin-top:6px">تک‌آدرس:
@@ -941,6 +995,12 @@ document.querySelectorAll("nav.tabs button").forEach((b) => {
 $("#r-3h").onclick = () => { RANGE = "3h"; $("#r-3h").classList.add("primary"); $("#r-24h").classList.remove("primary"); loadLive(); };
 $("#r-24h").onclick = () => { RANGE = "24h"; $("#r-24h").classList.add("primary"); $("#r-3h").classList.remove("primary"); loadLive(); };
 
+document.addEventListener("change", (e) => {
+  if (e.target.name && e.target.name.startsWith("mhow-")) {
+    const tip = e.target.closest(".mixed").querySelector("[data-mtip]");
+    if (tip) tip.textContent = HOW_TIP[e.target.value] || "";
+  }
+});
 document.addEventListener("click", async (e) => {
   const h = e.target.closest("[data-hold]");
   if (h) {
@@ -963,6 +1023,43 @@ document.addEventListener("click", async (e) => {
     toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
     loadPaths(); loadStatus();
     return;
+  }
+  const mx = e.target.closest("[data-tmixedit],[data-mapply],[data-moff],[data-mcancel],[data-tpin]");
+  if (mx) {
+    const d = mx.dataset;
+    if (d.tmixedit != null) { MIXEDIT = MIXEDIT === d.tmixedit ? null : d.tmixedit; renderTunnels(TN); return; }
+    if (d.mcancel != null) { MIXEDIT = null; renderTunnels(TN); return; }
+    if (d.tpin) {
+      const r0 = TN.find((x) => x.name === d.tpin), unpin = r0 && r0.mix && r0.mix.pinned === d.addr;
+      const r = await post("tunnel-pin", { name: d.tpin, addr: unpin ? "" : d.addr });
+      toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+      loadTunnels();
+      return;
+    }
+    if (d.moff) {
+      if (!confirm(`${d.moff} برگردد روی یک تانل (اولین تانل ترکیب)؟ x-ui یک بار ری‌استارت می‌شود.`)) return;
+      mx.disabled = true; toast("در حال برگرداندن... (تا یک دقیقه)");
+      const r = await post("tunnel-mix", { name: d.moff, on: false });
+      toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+      MIXEDIT = null; loadTunnels(); loadPaths(); loadStatus();
+      return;
+    }
+    if (d.mapply) {
+      const box = mx.closest(".mixed");
+      const picks = [...box.querySelectorAll("[data-mpick]")];
+      const addrs = picks.filter((c) => c.checked).map((c) => c.value);
+      const weights = picks.filter((c) => c.checked).map((c) => +c.closest(".mr").querySelector("[data-mw]").value);
+      const how = (box.querySelector(`input[name="mhow-${d.mapply}"]:checked`) || {}).value || "smart";
+      if (addrs.length < 2) { toast("دست‌کم دو تانل را انتخاب کنید"); return; }
+      if (!confirm(`${d.mapply} همزمان روی ${addrs.join(" + ")} (${HOW[how]})؟ x-ui یک بار ری‌استارت می‌شود و بعد مسیر تست می‌شود.`)) return;
+      mx.disabled = true; toast("در حال اعمال و تست... (تا یک دقیقه)");
+      const r = await post("tunnel-mix", { name: d.mapply, on: true, addrs, weights, how });
+      mx.disabled = false;
+      toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+      if (r.ok) MIXEDIT = null;
+      loadTunnels(); loadPaths(); loadStatus();
+      return;
+    }
   }
   const tn = e.target.closest("[data-ttest],[data-tuse],[data-tup],[data-tdel],[data-tadd],[data-tscan]");
   if (tn) {

@@ -126,8 +126,9 @@ case "$DBINFO" in
 esac
 
 # --------------------------------------------------------------------- ۲. ابزارها و سرویس‌ها
-install -d /usr/local/lib/xui-optimizer                      # ماژول مشترک دیتابیس (SQLite یا PostgreSQL)
-install -m 755 "$SRC/lib/xuidb.py" /usr/local/lib/xui-optimizer/xuidb.py
+install -d /usr/local/lib/xui-optimizer                      # ماژول‌های مشترک: دیتابیس (SQLite/PostgreSQL) و ترکیب تانل‌ها
+install -m 644 "$SRC"/lib/*.py /usr/local/lib/xui-optimizer/
+chmod 755 /usr/local/lib/xui-optimizer/xuidb.py
 ln -sf /usr/local/lib/xui-optimizer/xuidb.py "$DEST/xui-db"
 for f in $TOOLS; do install -m 755 "$SRC/$f" "$DEST/$(basename "$f")"; done
 for u in $UNITS; do install -m 644 "$SRC/$u" "/etc/systemd/system/$(basename "$u")"; done

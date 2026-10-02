@@ -11,6 +11,11 @@
     xui-tunnel test NAME ADDR [--json]      would NAME work on ADDR? (a throwaway Xray, not the live one)
     xui-tunnel auto                         what the timer runs: leave a dead tunnel, return to the best,
                                             and rescan every path once an hour
+    xui-tunnel mix NAME [--json]            how NAME's traffic is shared between its tunnels
+    xui-tunnel mix NAME on ADDR,ADDR[,...] [--how smart|random|roundrobin] [--weights 2,1]
+                                            use those tunnels at the same time (first = fallback)
+    xui-tunnel mix NAME off                 back to one tunnel at a time (the first of the mix)
+    xui-tunnel mix NAME pin ADDR|none       only ADDR for now, without a restart (until x-ui restarts)
 
 A GRE tunnel and an AWG tunnel to the same server reach the same Xray listener, only at a
 different address (10.0.1.2 vs 10.0.10.1). So instead of one path per tunnel, a path keeps
@@ -27,10 +32,18 @@ A scan does not trust the guess of where a tunnel lands: it starts NAME's own ou
 tunnel's far address and keeps the ones that fetch a page, so it finds tunnels whose far end is
 unknown too. xui-path runs a scan right after it adds a path.
 Settings live under "tunnels" in /etc/tunnel-guard.json, state in /var/lib/tunnel-guard/tunnels.json.
+
+Mixing: instead of one tunnel at a time, NAME's new connections are shared between two or more
+of its tunnels (an Xray balancer over one copy of NAME per tunnel; see lib/xuimix.py). "smart"
+keeps every healthy tunnel in the mix and drops one that loses pings or turns slow, "random"
+and "roundrobin" share by weight. Xray's observatory skips a dead tunnel by itself; the timer
+only tests each tunnel every few minutes for the page and tells Telegram when one drops out or
+comes back. Turning it on or off restarts x-ui once (balancers and the observatory are not hot).
 """
-import glob, ipaddress, json, os, re, socket, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
+import glob, ipaddress, json, os, re, shutil, socket, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuimix  # noqa: E402  one path over several tunnels at once
 from concurrent.futures import ThreadPoolExecutor
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
@@ -45,6 +58,7 @@ SWITCH_GAP = 120        # seconds between two moves of the same path
 RETURN_OKS = 3          # healthy checks of a better tunnel before going back to it
 RETURN_GAP = 600        # stay at least this long on a tunnel before going back
 SCAN_EVERY = 3600       # the timer rescans every path this often
+MIX_CHECK = 300         # a mixed path's tunnels are tested this often (Xray reacts by itself)
 ADDR_OK = re.compile(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$")   # ADDR or ADDR@tun
 
 
@@ -307,8 +321,15 @@ def listing():
                 x["new"] = True
                 x["test"] = tests.get(x["addr"])
         known = {x["addr"]: x for x in cand}
+        mx = spec.get("mix") or {}
+        tpl_mix = xuimix.describe(cfg, name)
+        mix = {"on": bool(xuimix.spec_of(c, name)) and tpl_mix["on"], "how": mx.get("how", "smart"),
+               "addrs": mx.get("addrs") or [], "weights": mx.get("weights") or [],
+               "live": tpl_mix["on"], "copies": tpl_mix["copies"], "drift": xuimix.drift(cfg, name),
+               "pinned": pinned(name, cfg) if tpl_mix["on"] else None}
+        mix["pending"] = bool(xuimix.spec_of(c, name)) != tpl_mix["on"]     # asked for, not in the config
         rows.append({
-            "name": name, "current": addr, "port": port, "auto": bool(spec.get("auto")),
+            "name": name, "current": addr, "port": port, "auto": bool(spec.get("auto")), "mix": mix,
             "managed": bool(addrs),
             "addrs": [dict(addr=a, iface=info(a).get("iface", ""), kind=info(a).get("kind", ""),
                            carrier=info(a).get("carrier", ""), live=a == addr, test=tests.get(a)) for a in addrs],
@@ -462,6 +483,8 @@ def probe_live(name, cfg):
 # ---------------------------------------------------------------- moving an outbound
 
 def use(name, addr, why="by hand"):
+    if xuimix.spec_of(conf(), name):
+        raise ValueError("%s روی چند تانل همزمان است؛ برای عوض کردن، تانل‌های ترکیب را عوض کنید یا ترکیب را خاموش کنید" % name)
     cfg = load(CFG, {})
     tags = [t for t in family(name) if any(o.get("tag") == t for o in cfg.get("outbounds", []))]
     if not tags:
@@ -576,6 +599,10 @@ def auto():
     c, st = conf(), load(STATE, {})
     now = int(time.time())
     for name, spec in (c.get("tunnels") or {}).items():
+        mx = xuimix.spec_of(c, name)
+        if mx:
+            watch_mix(name, mx, st, now)
+            continue
         addrs = spec.get("addrs") or []
         if not spec.get("auto") or len(addrs) < 2:
             continue
@@ -620,6 +647,159 @@ def auto():
             telegram("✅ %s: تانل ترجیحی %s سالم است؛ اوت‌باند به آن برگشت." % (name, better[0]))
     save(STATE, st)
     rescan_all()
+
+
+# ---------------------------------------------------------------- several tunnels at once
+
+def xray_ok(t):
+    """Would Xray start from this template? The same merge x-ui does, over the live inbounds."""
+    cfg = load(CFG, {})
+    for k in ("outbounds", "routing", "api", "dns", "policy", "burstObservatory", "observatory"):
+        if k in t:
+            cfg[k] = t[k]
+        else:
+            cfg.pop(k, None) if k in ("burstObservatory", "observatory") else None
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="xui-tunnel-mix-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    try:
+        r = subprocess.run([XRAY, "run", "-test", "-c", path], cwd=BIN, capture_output=True, text=True, timeout=60)
+        out = (r.stdout + r.stderr).strip().splitlines()
+        return r.returncode == 0, (out[-1] if out else "")
+    finally:
+        os.remove(path)
+
+
+def write_template(t):
+    db = xuidb.connect()
+    db.execute("update settings set value=? where key=?", (json.dumps(t, indent=2), KEY))
+    db.commit()
+    db.close()
+
+
+def mix_set(name, spec):
+    """Turn NAME's mix on (spec) or off (None): test, back up, write the template, restart x-ui
+    once and check the path still answers through its probe port - or put everything back."""
+    c = conf()
+    order = [n for n in [c.get("primary")] + (c.get("backups") or []) if n]
+    if name not in order:
+        raise ValueError("%s در فهرست مسیرها نیست" % name)
+    if spec:
+        bad = [a for a in spec["addrs"] if not ADDR_OK.match(a)]
+        if bad:
+            raise ValueError("آدرس نامعتبر: " + "، ".join(bad))
+    old = template()
+    new = json.loads(json.dumps(old))
+    if spec:
+        xuimix.build(new, name, spec)
+    else:
+        xuimix.remove(new, name)
+    ok, detail = xray_ok(new)
+    if not ok:
+        raise ValueError("Xray این کانفیگ را قبول نکرد: " + detail)
+    backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
+    xuidb.backup_to(backup)
+    shutil.copy2(CFG, backup)
+    old_spec = json.loads(json.dumps(((c.get("tunnels") or {}).get(name) or {}).get("mix") or {}))
+    entry = c.setdefault("tunnels", {}).setdefault(name, {})
+    if spec:
+        entry["mix"] = spec
+        entry["addrs"] = list(dict.fromkeys((entry.get("addrs") or []) + spec["addrs"]))
+    else:
+        entry["mix"] = dict(old_spec, on=False)
+    if not spec:                        # one tunnel again: the first of the mix, and the guard watches it
+        first = (old_spec.get("addrs") or [None])[0]
+        if first:
+            for o in new["outbounds"]:
+                if o.get("tag") in family(name):
+                    set_addr(o, first)
+    write_template(new)
+    save(GUARD_CONF, c)
+    run("config-guard", "--save", timeout=30)        # before x-ui rewrites config.json
+    run("systemctl", "restart", "x-ui", timeout=60)
+    time.sleep(8)
+    answers = probe_live(name, load(CFG, {}))
+    if answers is False:
+        write_template(old)
+        c = conf()
+        c.setdefault("tunnels", {}).setdefault(name, {})["mix"] = old_spec
+        save(GUARD_CONF, c)
+        run("config-guard", "--save", timeout=30)
+        run("systemctl", "restart", "x-ui", timeout=60)
+        raise ValueError("بعد از اعمال، %s از پورت probe جواب نداد؛ همه‌چیز برگردانده شد (بکاپ: %s)" % (name, backup))
+    st = load(STATE, {})
+    s = st.setdefault(name, {})
+    s.setdefault("events", []).append({"t": int(time.time()), "from": "", "why": "mix",
+                                       "to": ("ترکیب: " + " + ".join(spec["addrs"])) if spec else "تک‌تانل"})
+    s["events"] = s["events"][-20:]
+    s.pop("mix_down", None)
+    save(STATE, st)
+    log("%s: mix %s" % (name, ("on " + ",".join(spec["addrs"]) + " " + spec["how"]) if spec else "off"))
+    how = {"smart": "هوشمند", "random": "تصادفی", "roundrobin": "نوبتی"}
+    if spec:
+        return {"ok": True, "backup": backup, "msg": "%s حالا همزمان روی %s است (%s)؛ x-ui یک بار ری‌استارت شد" % (
+            name, " و ".join(spec["addrs"]), how[spec["how"]])}
+    return {"ok": True, "backup": backup, "msg": "%s دوباره روی یک تانل است (%s)" % (name, (old_spec.get("addrs") or ["?"])[0])}
+
+
+def pinned(name, cfg=None):
+    """The tunnel NAME's balancer is held on for now (xray api bo), or None."""
+    cfg = cfg or load(CFG, {})
+    rc, out = run(XRAY, "api", "bi", "--server=" + api_addr(cfg), "--json", xuimix.MIX + name, timeout=8)
+    try:
+        tag = ((json.loads(out).get("balancer") or {}).get("override") or {}).get("target") or ""
+    except ValueError:
+        return None
+    if not tag:
+        return None
+    spec = (((conf().get("tunnels") or {}).get(name) or {}).get("mix") or {}).get("addrs") or []
+    i = int(re.sub(r"\D", "", tag.split(xuimix.SEP)[-1]) or 0) - 1
+    return spec[i] if 0 <= i < len(spec) else tag
+
+
+def mix_pin(name, addr):
+    """Hold NAME (and NAME-mux) on one tunnel of its mix, or let go (addr empty). Runtime only."""
+    spec = xuimix.spec_of(conf(), name)
+    if not spec:
+        raise ValueError("%s ترکیبی نیست" % name)
+    cfg = load(CFG, {})
+    api = "--server=" + api_addr(cfg)
+    fams = [f for f in (name, name + "-mux") if f in xuimix.mixed(cfg)]
+    if not addr:
+        for f in fams:
+            run(XRAY, "api", "bo", api, "-b", xuimix.MIX + f, "-r", timeout=8)
+        return {"ok": True, "msg": "%s دوباره بین همه‌ی تانل‌های ترکیب پخش می‌شود" % name}
+    if addr not in spec["addrs"]:
+        raise ValueError("%s جزو تانل‌های ترکیب %s نیست" % (addr, name))
+    i = spec["addrs"].index(addr) + 1
+    for f in fams:
+        rc, out = run(XRAY, "api", "bo", api, "-b", xuimix.MIX + f, "%s%s%d" % (f, xuimix.SEP, i), timeout=8)
+        if rc:
+            raise ValueError("Xray قبول نکرد: " + out[-200:])
+    return {"ok": True, "msg": "%s فعلاً فقط روی %s است (تا برداشتن سنجاق یا ری‌استارت x-ui)" % (name, addr)}
+
+
+def watch_mix(name, spec, st, now):
+    """A mix needs no moving - Xray skips a dead tunnel - but the page shows each tunnel's state
+    and Telegram hears when one drops out of the mix or comes back."""
+    s = st.setdefault(name, {})
+    if now - s.get("mix_checked", 0) < MIX_CHECK:
+        return
+    s["mix_checked"] = now
+    cfg = load(CFG, {})
+    tests = s.setdefault("tests", {})
+    down = set(s.get("mix_down") or [])
+    for a in spec["addrs"]:
+        r = tests[a] = test(name, a, cfg)
+        if not r["ok"] and a not in down:
+            down.add(a)
+            telegram("⚠️ %s: تانل %s از ترکیب افتاد؛ Xray اتصال‌های تازه را به بقیه‌ی تانل‌ها می‌دهد." % (name, a))
+        elif r["ok"] and a in down:
+            down.discard(a)
+            telegram("✅ %s: تانل %s دوباره جواب می‌دهد و به ترکیب برگشت." % (name, a))
+    s["mix_down"] = sorted(down)
+    if len(down) == len(spec["addrs"]):
+        log("%s: no tunnel of the mix answers" % name)
 
 
 def set_addrs(name, addrs, auto_flag):
@@ -690,6 +870,28 @@ def main():
             out(dict(d, ok=True, reachable=d["ok"]), "ok %s ms" % d["ms"] if d["ok"] else "no answer")
         elif mode == "auto":
             auto()
+        elif mode == "mix" and len(args) >= 2:
+            name, sub = args[1], (args[2] if len(args) > 2 else "")
+            opt = lambda k, d=None: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else d
+            if sub == "on":
+                spec = xuimix.clean_spec([a for a in (args[3] if len(args) > 3 else "").split(",") if a],
+                                         opt("--how", "smart"), [w for w in (opt("--weights", "") or "").split(",") if w])
+                d = mix_set(name, spec)
+            elif sub == "off":
+                d = mix_set(name, None)
+            elif sub == "pin":
+                a = args[3] if len(args) > 3 else ""
+                d = mix_pin(name, "" if a in ("", "none", "off") else a)
+            else:
+                row = next((r for r in listing() if r["name"] == name), None)
+                if not row:
+                    raise ValueError("%s در فهرست مسیرها نیست" % name)
+                d, m = row["mix"], row["mix"]
+                out(d, "%s: %s%s" % (name, ("mixed (%s) over %s" % (m["how"], ", ".join(
+                    "%s x%d" % (a, w) for a, w in zip(m["addrs"], m["weights"] or [1] * len(m["addrs"]))))) if m["on"]
+                    else "one tunnel at a time", ("  pinned to " + m["pinned"]) if m.get("pinned") else ""))
+                return
+            out(d, d["msg"])
         else:
             print(__doc__)
             sys.exit(2)

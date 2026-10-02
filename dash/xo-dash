@@ -13,6 +13,7 @@ live throughput per path, per inbound and per user without touching the panel's 
 import collections, http.server, json, os, re, shutil, sqlite3, ssl, subprocess, threading, time, urllib.parse, urllib.request, sys
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuimix  # noqa: E402  paths mixed over several tunnels
 from concurrent.futures import ThreadPoolExecutor
 
 DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
@@ -196,6 +197,7 @@ class Metrics(threading.Thread):
         super().__init__(daemon=True)
         self.lock = threading.Lock()
         self.fine = collections.deque(maxlen=self.FINE)   # {"t", "o"/"i": {tag: [up, down]}, "u": {email: bytes}}
+        self.copies = collections.deque(maxlen=720)       # (t, {per-tunnel copy of a mixed path: bytes}), 1 hour
         self.minutes = collections.deque(self._load(), maxlen=self.DAY)
         self.peaks = self._load("peaks") or {}   # {hour: {email: [max up bps, max down bps]}}
         self.prev, self.cur, self.online, self.saved, self.n = {}, None, [], 0.0, 0
@@ -223,7 +225,7 @@ class Metrics(threading.Thread):
     def sample(self):
         stats = xapi("statsquery", timeout=8) or {}
         now = time.time()
-        o, i, u, ud = {}, {}, {}, {}
+        o, i, u, ud, cp = {}, {}, {}, {}, {}
         for s in stats.get("stat", []):
             parts = (s.get("name", "").split(">>>") + ["", "", "", ""])[:4]
             kind, name, dirn = parts[0], parts[1], parts[3]
@@ -236,6 +238,9 @@ class Metrics(threading.Thread):
                 continue
             slot = 0 if dirn == "uplink" else 1
             if kind == "outbound":
+                if xuimix.is_clone(name):        # a mixed path's per-tunnel copy: counted as the path
+                    cp[name] = cp.get(name, 0) + d
+                    name = xuimix.base_of(name)
                 o.setdefault(name, [0, 0])[slot] += d
             elif kind == "inbound" and not name.startswith("guard-") and name != "api":
                 i.setdefault(name, [0, 0])[slot] += d
@@ -250,6 +255,8 @@ class Metrics(threading.Thread):
         with self.lock:
             self.online = online
             self.fine.append({"t": now, "o": o, "i": i, "u": u})
+            if cp:
+                self.copies.append((now, cp))
             self._roll(now, o, i, len(online))
             self._peak(now, ud)
 
@@ -675,8 +682,32 @@ def paths_view():
     return jrun("xui-path", "list", "--json", timeout=20) or []
 
 
+def mix_share(hours=1):
+    """{path: {tunnel index: bytes}} over the last hour, from the per-tunnel copies of mixed
+    paths (NAME~2 and NAME~2b are the same tunnel; NAME-mux~2 too)."""
+    cut, out = time.time() - hours * 3600, {}
+    with METRICS.lock:
+        rows = [c for t, c in METRICS.copies if t > cut]
+    for c in rows:
+        for tag, b in c.items():
+            base, idx = xuimix.base_of(tag), re.sub(r"\D", "", tag.split(xuimix.SEP)[-1])
+            path = base[:-4] if base.endswith("-mux") else base
+            if idx:
+                out.setdefault(path, {})[int(idx)] = out.setdefault(path, {}).get(int(idx), 0) + b
+    return out
+
+
 def tunnels_view():
-    return jrun("xui-tunnel", "list", "--json", timeout=40) or []
+    rows = jrun("xui-tunnel", "list", "--json", timeout=40) or []
+    share = mix_share()
+    for r in rows:
+        m = r.get("mix") or {}
+        got = share.get(r.get("name")) or {}
+        total = sum(got.values())
+        m["share"] = {a: round(100.0 * got.get(i, 0) / total) if total else None
+                      for i, a in enumerate(m.get("addrs") or [], 1)}
+        m["share_bytes"] = total
+    return rows
 
 
 def confguard():
@@ -1280,6 +1311,28 @@ def action(name, body):
         return r or {"ok": False, "msg": "انجام نشد"}
     if name == "tunnel-discover":
         return {"ok": True, "result": jrun("xui-tunnel", "discover", "--json", timeout=60) or []}
+    if name in ("tunnel-mix", "tunnel-pin"):           # several tunnels at once (mix: restarts x-ui; the page asks)
+        path = str(body.get("name") or "").strip()
+        if path not in path_order():
+            return {"ok": False, "msg": "این مسیر در فهرست نیست"}
+        ok_addr = lambda a: re.match(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$", a)
+        if name == "tunnel-pin":
+            addr = str(body.get("addr") or "").strip()
+            if addr and not ok_addr(addr):
+                return {"ok": False, "msg": "آدرس نامعتبر"}
+            return jrun_any("xui-tunnel", "mix", path, "pin", addr or "none", "--json", timeout=30) or                 {"ok": False, "msg": "انجام نشد"}
+        if not body.get("on"):
+            return jrun_any("xui-tunnel", "mix", path, "off", "--json", timeout=150) or {"ok": False, "msg": "انجام نشد"}
+        addrs = [str(a).strip() for a in (body.get("addrs") or []) if str(a).strip()][:6]
+        if len(addrs) < 2 or not all(ok_addr(a) for a in addrs):
+            return {"ok": False, "msg": "دست‌کم دو تانل معتبر انتخاب کنید"}
+        how = str(body.get("how") or "smart")
+        weights = [str(max(1, min(3, int(w)))) for w in (body.get("weights") or [])[:len(addrs)]
+                   if str(w).isdigit()]
+        cmd = ["xui-tunnel", "mix", path, "on", ",".join(addrs), "--how", how, "--json"]
+        if weights:
+            cmd[-1:-1] = ["--weights", ",".join(weights)]
+        return jrun_any(*cmd, timeout=150) or {"ok": False, "msg": "انجام نشد"}
     if name in ("tunnel-set", "tunnel-use", "tunnel-test", "tunnel-add", "tunnel-scan"):
         path = str(body.get("name") or "").strip()
         if path not in path_order():
