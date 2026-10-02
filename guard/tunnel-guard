@@ -15,14 +15,28 @@
 Settings: /etc/tunnel-guard.json (see tunnel-guard.example.json)
 Decisions are logged to the journal: journalctl -t tunnel-guard
 """
-import json, os, subprocess, sys, syslog, tempfile, time, urllib.parse
+import glob, json, os, subprocess, sys, syslog, tempfile, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  a backup mixed over several tunnels is reached through its balancer
 
 CONF = os.environ.get("TUNNEL_GUARD_CONF", "/etc/tunnel-guard.json")
 DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
-XRAY, API = "/usr/local/x-ui/bin/xray-linux-amd64", "127.0.0.1:62789"
+XRAY = (glob.glob("/usr/local/x-ui/bin/xray-linux-*") or ["/usr/local/x-ui/bin/xray-linux-amd64"])[0]
+
+
+def _api_addr():
+    """The panel's Xray API, from its own config (the "api" inbound), not a guessed port."""
+    try:
+        cfg = json.load(open(CFG))
+        tag = (cfg.get("api") or {}).get("tag", "api")
+        i = next(i for i in cfg.get("inbounds", []) if i.get("tag") == tag)
+        return "%s:%s" % (i.get("listen") or "127.0.0.1", i["port"])
+    except (OSError, ValueError, StopIteration, KeyError):
+        return "127.0.0.1:62789"                    # 3x-ui's default
+
+
+API = _api_addr()
 STATE = "/var/lib/tunnel-guard/state.json"
 HOLD = "/var/lib/tunnel-guard/hold"     # a path name in here pins users to that path (dashboard)
 SITES = ["https://www.google.com/generate_204"]

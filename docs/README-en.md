@@ -542,8 +542,8 @@ UUID, same transport, same address - runs it against its own public port and mea
 
 ```bash
 xui-probe-client alice
-  in-80-tcp    hub.example.com:80   ws/none     ->  HTTP 204 in 231 ms (connect 1 ms), 161.4 Mbit/s
-  in-443-tcp   hub.example.com:443  xhttp/tls   ->  HTTP 204 in 299 ms (connect 9 ms), 140.8 Mbit/s
+  inbound-80   hub.example.com:80   ws/none     ->  HTTP 204 in 231 ms (connect 1 ms), 161.4 Mbit/s
+  inbound-443  hub.example.com:443  xhttp/tls   ->  HTTP 204 in 299 ms (connect 9 ms), 140.8 Mbit/s
 ```
 
 Nothing is created or changed in the panel and the UUID is never printed. On the
