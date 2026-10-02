@@ -308,6 +308,34 @@ def candidates(name, cfg, tuns):
     return out
 
 
+def route_of(entry, cache={}):
+    """(interface, kind) the kernel sends ADDR through - every kind of tunnel (GRE, Geneve, AWG,
+    a routed tun), named the way `ip` names it; ("", "direct") when it leaves by the uplink."""
+    addr, via = split(entry)
+    if via:
+        return via, "sing-box"
+    if addr in cache:
+        return cache[addr]
+    rc, out = run("ip", "-j", "route", "get", addr, timeout=5)
+    dev = ""
+    try:
+        r = (json.loads(out) or [{}])[0] if rc == 0 else {}
+        dev = r.get("dev", "")
+        if r.get("gateway"):                         # through a gateway: the server's own uplink
+            dev = ""
+    except (ValueError, IndexError):
+        pass
+    kind = "direct" if not dev else ""
+    if dev:
+        rc, out = run("ip", "-j", "-d", "link", "show", "dev", dev, timeout=5)
+        try:
+            kind = ((json.loads(out) or [{}])[0].get("linkinfo") or {}).get("info_kind", "") if rc == 0 else ""
+        except (ValueError, IndexError):
+            kind = ""
+    cache[addr] = (dev, kind)
+    return cache[addr]
+
+
 def listing():
     c, cfg, st = conf(), load(CFG, {}), load(STATE, {})
     tuns = tunnels()
@@ -349,7 +377,7 @@ def listing():
         rows.append({
             "name": name, "current": addr, "port": port, "auto": bool(spec.get("auto")), "mix": mix,
             "managed": bool(addrs),
-            "addrs": [dict(addr=a, iface=info(a).get("iface", ""), kind=info(a).get("kind", ""),
+            "addrs": [dict(addr=a, iface=info(a).get("iface") or route_of(a)[0], kind=info(a).get("kind") or route_of(a)[1],
                            carrier=info(a).get("carrier", ""), live=a == addr, test=tests.get(a)) for a in addrs],
             "offer": [x for x in cand if x.get("new")],
             "scanned": scan.get("at"),

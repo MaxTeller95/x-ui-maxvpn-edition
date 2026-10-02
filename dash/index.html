@@ -98,6 +98,7 @@
   .tc.bad i { background: var(--bad); }
   .tc b { font-weight: 600; cursor: pointer; }
   .tc small { color: var(--muted); }
+  .tc small.tn { font-weight: 700; color: var(--accent); opacity: .85; }
   .tc button { border: 0; background: none; padding: 0 4px; font-size: 12px; color: var(--muted); }
   .tc button:hover { color: var(--accent); }
   .tc.add { border-style: dashed; padding: 2px 10px; color: var(--muted); cursor: pointer; }
@@ -842,8 +843,9 @@ function tnChip(r, a, i) {
   const swap = m.on ? (member ? `<button class="pin ${m.pinned === a.addr ? "on" : ""}" data-tpin="${n}" data-addr="${ad}"
         title="${m.pinned === a.addr ? "برداشتن سنجاق: دوباره بین همه پخش شود" : "موقتاً فقط همین تانل (بدون ری‌استارت)"}">📌</button>` : "")
     : a.live ? "" : `<button data-tuse="${n}" data-addr="${ad}" title="برو روی این">⇄</button>`;
-  return `<span class="tc ${cls}" title="${tip}"><i></i>
-    <b dir="ltr" data-ttest="${n}" data-addr="${ad}">${esc(pa)}</b><small>${esc(via ? via + " · sing-box" : a.iface || a.kind || "")}${t && t.ok && t.ms ? " · " + t.ms + "ms" : ""}${w > 1 ? " · " + w + "×" : ""}</small>
+  const name = via || a.iface || (a.kind === "direct" ? "مستقیم" : a.kind || "");
+  return `<span class="tc ${cls}" title="${tip}${a.kind && a.kind !== "direct" ? " · " + esc(a.kind) : ""}"><i></i>
+    ${name ? `<small class="tn" dir="ltr">${esc(name)}</small>` : ""}<b dir="ltr" data-ttest="${n}" data-addr="${ad}">${esc(pa)}</b><small>${t && t.ok && t.ms ? t.ms + "ms" : ""}${w > 1 ? " · " + w + "×" : ""}</small>
     ${share != null ? `<span class="pct">${share}%</span>` : ""}
     ${loss ? `<span class="chip ${out ? "bad" : "warn"}" style="padding:0 6px">لاست ${loss}٪</span>` : ""}
     ${swap}
@@ -898,7 +900,7 @@ function renderTunnels(list) {
       <div class="tcs">${addrs.map((a) => tnChip(r, a, r.addrs.findIndex((x) => x.addr === a.addr))).join("")}
       ${r.offer.map((o) => `<button class="tc add" data-tadd="${n}" data-addr="${esc(o.addr)}"
           title="${o.test && o.test.ok ? "اسکن: این مسیر اینجا هم جواب داد" : "تانل دیگری به همین سرور"} — کلیک: اضافه کن">+
-          <b dir="ltr">${esc(o.addr.split("@")[0])}</b><small>${esc(o.addr.includes("@") ? o.iface + " · sing-box" : o.iface || "")}${o.test && o.test.ok && o.test.ms ? " · " + o.test.ms + "ms" : ""}</small></button>`).join("")}
+          ${o.iface ? `<small class="tn" dir="ltr">${esc(o.iface)}</small>` : ""}<b dir="ltr">${esc(o.addr.split("@")[0])}</b><small>${o.test && o.test.ok && o.test.ms ? o.test.ms + "ms" : ""}</small></button>`).join("")}
       </div>${m.on && m.share_bytes ? `<div class="muted sm" style="margin-top:4px">سهم هر تانل از ترافیک یک ساعت اخیر: ${bytes(m.share_bytes)}</div>` : ""}
       ${MIXEDIT === r.name ? mixEditor(r) : ""}</div>`;
   }).join("") || '<div class="muted">هیچ مسیری آدرس جایگزین ندارد؛ «اسکن همه» را بزنید یا آدرس دستی اضافه کنید.</div>';
