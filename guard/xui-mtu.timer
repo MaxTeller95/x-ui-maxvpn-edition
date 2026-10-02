@@ -3,6 +3,7 @@ Description=Measure every tunnel's MTU every 5 minutes
 
 [Timer]
 OnBootSec=180
+OnActiveSec=60
 OnUnitActiveSec=300
 AccuracySec=10
 

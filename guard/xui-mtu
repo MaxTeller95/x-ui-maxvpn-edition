@@ -292,7 +292,7 @@ def check(apply=False, quiet=False):
             if rif and rif["mtu"] > want and not rif.get("owner") else None
         if far_res:
             s["far_mtu"] = want
-        s.update(set_at=now, mtu=want, seen=want, suspect=None)
+        s.update(set_at=now, raise_at=now, mtu=want, seen=want, suspect=None)   # no raise for 6 hours
         row.update(state="fixed", mtu=want, files=res.get("files"), far_files=(far_res or {}).get("files")
                    if isinstance(far_res, dict) else None)
         row["note"] = "MTU به %d رسید (بود %d)%s" % (want, t["mtu"], " (هر دو سر)" if far_res else
@@ -314,7 +314,11 @@ def raise_back(t, s, row, used, far, rif, apply, now):
     s["raise_at"] = now
     before = t["mtu"]
     xuiagent.setmtu(t["iface"], orig)
-    if xuiagent.probe(t["iface"], t["peer"], orig) >= orig:
+    good = xuiagent.probe(t["iface"], t["peer"], orig) >= orig
+    if good:
+        time.sleep(20)                                 # and once more a little later: a path that wavers stays low
+        good = xuiagent.probe(t["iface"], t["peer"], orig) >= orig
+    if good:
         if rif and s.get("far_orig") and not rif.get("owner"):
             ssh(far, ["setmtu", rif["iface"], str(s["far_orig"])], timeout=40)
         s.pop("orig", None)
