@@ -9,9 +9,10 @@ them (one entry per link, carrying the client's own UUID and limits).
     xui-fix-inbound-lists            show what is missing
     xui-fix-inbound-lists apply      back up, rebuild, restart x-ui
 """
-import json, os, shutil, sqlite3, subprocess, sys, time
+import json, os, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuilive  # noqa: E402  Xray alone restarts, not the panel
 
 DB = "/etc/x-ui/x-ui.db"
 apply = sys.argv[1:] == ["apply"]
@@ -70,7 +71,7 @@ xuidb.backup_to(backup)
 for tag, st in plan.items():
     db.execute("update inbounds set settings=? where tag=?", (json.dumps(st, indent=2), tag))
 db.commit()
-subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+xuilive.restart_xray()                     # users' inbounds/clients changed: Xray is rebuilt from the database
 time.sleep(9)
 state = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
 print(f"\nrebuilt. backup {backup} | x-ui {state}")

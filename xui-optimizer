@@ -32,10 +32,11 @@ What it changes, in the panel's own database so the panel keeps it:
 Inbounds routed to `direct` (or anything that is not a proxy) are left alone.
 Safe to re-run: earlier changes are replaced, not duplicated.
 """
-import argparse, collections, glob, json, os, shutil, sqlite3, subprocess, sys, time
+import argparse, collections, glob, json, os, shutil, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  a path mixed over several tunnels is named by its balancer
+import xuilive  # noqa: E402  template changes into the running Xray, no restart
 
 DB = "/etc/x-ui/x-ui.db"
 BIN = "/usr/local/x-ui/bin"
@@ -161,6 +162,29 @@ def undo(db_path, folder):
     return f"cp {folder}/x-ui.db {db_path} && x-ui restart" if db_path else xuidb.undo_hint(folder)
 
 
+def sniff_changes(db, tags):
+    """Users' inbounds whose sniffing would really change. Those are rebuilt only by an Xray
+    restart; when none changes, the rest goes in live (see xuilive)."""
+    changed = []
+    for tag in tags:
+        row = db.execute("select sniffing from inbounds where tag=?", (tag,)).fetchone()
+        try:
+            cur = json.loads(row[0]) if row and row[0] else {}
+        except ValueError:
+            cur = {}
+        if cur != SNIFF:
+            changed.append(tag)
+    return changed
+
+
+def into_xray(new, old, inbounds_changed):
+    """The saved template into the running Xray: live, unless users' inbounds changed."""
+    if inbounds_changed:
+        xuilive.restart_xray()
+        return "Xray restarted (inbound sniffing changed)"
+    return "live, no restart" if xuilive.apply(new, old) == "live" else "Xray restarted"
+
+
 def toggle(key, db_path, on, restart=True, dry=False):
     """Add or remove one of TOGGLES and nothing else. A full run would rebuild the DNS rules
     too, under this tool's own tags, and a hub whose guard and config-guard know those rules by
@@ -168,6 +192,7 @@ def toggle(key, db_path, on, restart=True, dry=False):
     spec = TOGGLES[key]
     db = xuidb.connect(db_path)
     tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    old = json.loads(json.dumps(tpl))
     rules = tpl["routing"]["rules"]
     had = any(spec["match"](r) for r in rules)
     tpl["routing"]["rules"] = rules = [r for r in rules if not spec["match"](r)]
@@ -194,6 +219,7 @@ def toggle(key, db_path, on, restart=True, dry=False):
         print("dry run - xray: Configuration OK; would turn the %s %s for: %s"
               % (spec["name"], "on" if on else "off", ", ".join(sorted(abroad)) or "-"))
         return
+    changed = sniff_changes(db, sniff)
     backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
     os.makedirs(backup)
     db.close()
@@ -201,14 +227,13 @@ def toggle(key, db_path, on, restart=True, dry=False):
     shutil.copy2(f"{BIN}/config.json", backup)
     db = xuidb.connect(db_path)
     db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
-    for tag in sniff:
+    for tag in changed:
         db.execute("update inbounds set sniffing=? where tag=?", (json.dumps(SNIFF, indent=2), tag))
     db.commit()
     db.close()
-    accept_in_config_guard()                             # before x-ui rewrites config.json
-    if restart:                                          # position matters, and the API only appends
-        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
-        time.sleep(5)
+    accept_in_config_guard()                             # before config.json changes
+    if restart:
+        print("xray: " + into_xray(tpl, old, changed))
     print(("%s on for: %s" % (spec["name"], ", ".join(sorted(abroad)))) if on else "%s off" % spec["name"])
     print(f"backup in {backup}")
 
@@ -223,6 +248,7 @@ def dns_fast(db_path, on, restart=True, dry=False):
     tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
     if (tpl.get("dns") or {}).get("tag") != DNS_TAG:
         die("this server has no DNS cache from xui-optimizer; run xui-optimizer first")
+    old = json.loads(json.dumps(tpl))
     want = DNS_FAST if on else DNS_SLOW
     if all(tpl["dns"].get(k) == v for k, v in want.items()):
         print("DNS fast mode is already %s" % ("on" if on else "off"))
@@ -245,9 +271,8 @@ def dns_fast(db_path, on, restart=True, dry=False):
     db.commit()
     db.close()
     accept_in_config_guard()
-    if restart:                                          # the dns section is not hot in Xray
-        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
-        time.sleep(5)
+    if restart:                                          # the dns block is not live in Xray: Xray alone restarts
+        print("xray: " + into_xray(tpl, old, []))
     print("DNS fast mode %s" % ("on" if on else "off"))
     print(f"backup in {backup}")
 
@@ -305,6 +330,7 @@ def main():
     if not row:
         die("x-ui has no xrayTemplateConfig setting")
     tpl = json.loads(row[0])
+    old = json.loads(row[0])
 
     if a.remove:
         strip(tpl)
@@ -347,9 +373,10 @@ def main():
     shutil.copy2(f"{BIN}/config.json", backup)
     db = xuidb.connect(a.db)
 
+    changed = sniff_changes(db, abroad)
     db.execute("update settings set value=? where key='xrayTemplateConfig'",
                (json.dumps(tpl, indent=2),))
-    for tag in abroad:
+    for tag in changed:
         db.execute("update inbounds set sniffing=? where tag=?", (json.dumps(SNIFF, indent=2), tag))
     db.commit()
     db.close()
@@ -358,8 +385,7 @@ def main():
     accept_in_config_guard()
 
     if not a.no_restart:
-        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
-        time.sleep(5)
+        print("xray: " + into_xray(tpl, old, changed))
         state = subprocess.run(["systemctl", "is-active", "x-ui"],
                                capture_output=True, text=True).stdout.strip()
         print(f"x-ui: {state}")

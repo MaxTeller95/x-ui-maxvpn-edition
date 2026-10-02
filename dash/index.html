@@ -872,7 +872,7 @@ function mixEditor(r) {
     <div class="muted sm" data-mtip>${HOW_TIP[how]}</div>
     <div class="btns"><button class="primary" data-mapply="${n}">${m.on ? "اعمال تغییرات" : "روشن کردن استفاده‌ی همزمان"}</button>
       ${m.on ? `<button data-moff="${n}">برگشت به یک تانل</button>` : ""}<button data-mcancel>انصراف</button></div>
-    <div class="muted sm">اعمال، x-ui را یک بار ری‌استارت می‌کند (چند ثانیه). بعدش مسیر تست می‌شود و اگر جواب ندهد همه‌چیز خودکار برمی‌گردد.
+    <div class="muted sm">بدون ری‌استارت اعمال می‌شود (فقط اولین ترکیب روی این هاب یک بار Xray را ری‌استارت می‌کند). بعدش مسیر تست می‌شود و اگر جواب ندهد همه‌چیز خودکار برمی‌گردد.
       تانل‌ها باید به یک سرور برسند تا IP خروجی کاربر عوض نشود.</div></div>`;
 }
 function renderTunnels(list) {
@@ -1058,7 +1058,7 @@ document.addEventListener("click", async (e) => {
       return;
     }
     if (d.moff) {
-      if (!confirm(`${d.moff} برگردد روی یک تانل (اولین تانل ترکیب)؟ x-ui یک بار ری‌استارت می‌شود.`)) return;
+      if (!confirm(`${d.moff} برگردد روی یک تانل (اولین تانل ترکیب)؟ بدون ری‌استارت.`)) return;
       mx.disabled = true; toast("در حال برگرداندن... (تا یک دقیقه)");
       const r = await post("tunnel-mix", { name: d.moff, on: false });
       toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
@@ -1072,7 +1072,7 @@ document.addEventListener("click", async (e) => {
       const weights = picks.filter((c) => c.checked).map((c) => +c.closest(".mr").querySelector("[data-mw]").value);
       const how = (box.querySelector(`input[name="mhow-${d.mapply}"]:checked`) || {}).value || "smart";
       if (addrs.length < 2) { toast("دست‌کم دو تانل را انتخاب کنید"); return; }
-      if (!confirm(`${d.mapply} همزمان روی ${addrs.join(" + ")} (${HOW[how]})؟ x-ui یک بار ری‌استارت می‌شود و بعد مسیر تست می‌شود.`)) return;
+      if (!confirm(`${d.mapply} همزمان روی ${addrs.join(" + ")} (${HOW[how]})؟ بدون ری‌استارت اعمال و بعد مسیر تست می‌شود.`)) return;
       mx.disabled = true; toast("در حال اعمال و تست... (تا یک دقیقه)");
       const r = await post("tunnel-mix", { name: d.mapply, on: true, addrs, weights, how });
       mx.disabled = false;

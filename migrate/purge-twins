@@ -9,9 +9,10 @@ client on several inbounds with one quota, one expiry and one usage counter.
     xui-purge-twins            show what would happen
     xui-purge-twins apply      back up, clean both places, restart x-ui
 """
-import json, os, shutil, sqlite3, subprocess, sys, time
+import json, os, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuilive  # noqa: E402  Xray alone restarts, not the panel
 
 DB = "/etc/x-ui/x-ui.db"
 MARK = "twin-of:"
@@ -80,7 +81,7 @@ for tag, (st, bad) in legacy.items():
 db.execute("delete from client_traffics where email not in (select email from clients)")
 db.commit()
 
-subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+xuilive.restart_xray()                     # users' inbounds/clients changed: Xray is rebuilt from the database
 time.sleep(9)
 state = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
 left = db.execute("select count(*) from clients where email like '%-443' or email like '%-tls'"

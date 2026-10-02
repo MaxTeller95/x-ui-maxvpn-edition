@@ -14,7 +14,7 @@ is created or changed in the panel, and the UUID is never printed.
 So "my connection is slow" becomes a number: if the config answers in 0.3 s and pulls
 90 Mbit/s from here, the problem is between the user and the hub, not on the server.
 """
-import glob, json, os, socket, sqlite3, subprocess, sys, tempfile, time
+import glob, json, os, socket, subprocess, sys, tempfile, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 

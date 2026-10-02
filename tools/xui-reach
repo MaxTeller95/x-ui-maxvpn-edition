@@ -23,7 +23,7 @@ Settings (optional) in /etc/xui-reach.json:
      "fails_to_alert": 2}           # rounds in a row before Telegram hears about it
 A timer (xui-reach.timer) runs one round every 10 minutes.
 """
-import json, os, sqlite3, subprocess, sys, time, urllib.parse, urllib.request
+import json, os, subprocess, sys, time, urllib.parse, urllib.request
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 

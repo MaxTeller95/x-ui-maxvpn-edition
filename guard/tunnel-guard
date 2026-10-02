@@ -15,7 +15,7 @@
 Settings: /etc/tunnel-guard.json (see tunnel-guard.example.json)
 Decisions are logged to the journal: journalctl -t tunnel-guard
 """
-import json, os, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
+import json, os, subprocess, sys, syslog, tempfile, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  a backup mixed over several tunnels is reached through its balancer
@@ -490,6 +490,17 @@ if __name__ == "__main__":
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit(0)
+        if not (check_only or "--report" in sys.argv or "--test" in sys.argv or "--say" in sys.argv):
+            sys.exit(0)                     # the timer: a run is already going, skip this minute
+        print("a run of the guard is in progress; waiting for it...", file=sys.stderr)
+        for _ in range(90):                 # asked by hand: wait for it rather than print nothing
+            time.sleep(1)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                continue
+        else:
+            sys.exit("the guard's run did not finish in 90 s; see journalctl -t tunnel-guard")
     syslog.openlog("tunnel-guard")
     main()

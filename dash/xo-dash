@@ -10,7 +10,7 @@ Besides the switches, a background collector reads Xray's stats API every 5 s an
 one bucket per minute for 24 h in /var/lib/xo-dash/history.json, so the page can show
 live throughput per path, per inbound and per user without touching the panel's database.
 """
-import collections, http.server, json, os, re, shutil, sqlite3, ssl, subprocess, threading, time, urllib.parse, urllib.request, sys
+import collections, http.server, json, os, re, shutil, ssl, subprocess, threading, time, urllib.parse, urllib.request, sys
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  paths mixed over several tunnels
@@ -692,7 +692,7 @@ def mix_share(hours=1):
         rows = [c for t, c in METRICS.copies if t > cut]
     for c in rows:
         for tag, b in c.items():
-            base, idx = xuimix.base_of(tag), re.sub(r"\D", "", tag.split(xuimix.SEP)[-1])
+            base, idx = xuimix.base_of(tag), str(xuimix.copy_index(tag))
             path = base[:-4] if base.endswith("-mux") else base
             if idx:
                 out.setdefault(path, {})[int(idx)] = out.setdefault(path, {}).get(int(idx), 0) + b

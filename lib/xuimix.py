@@ -2,12 +2,16 @@
 
 A path NAME is normally one outbound aimed at one tunnel address. Mixed, it becomes:
 
-    NAME~1, NAME~2, NAME~2b ...   copies of NAME, one per tunnel (weight 2 = a second copy, so
+    mix~NAME~1, mix~NAME~2b ...   copies of NAME, one per tunnel (weight 2 = a second copy, so
                                   that tunnel gets twice the share of new connections)
     balancer mix-NAME             picks a copy for every new connection
     every rule that went to NAME  goes to the balancer instead (users, DNS, the guard's probe)
     burstObservatory              pings each copy, so a tunnel that stops answering is skipped;
-                                  the first tunnel is the fallback when none answers
+                                  the first tunnel is the fallback when none answers. Its one
+                                  selector "mix~" covers every path's copies and stays even
+                                  when nothing is mixed: the observatory is the only part Xray
+                                  cannot change while running, so this way only the very first
+                                  mix ever needs a restart and every later change is live
 
 NAME itself stays as it is, unused: it is the model the copies are made from, the tools that
 read it keep working, and turning mixing off only points the rules back at it. NAME-mux
@@ -24,9 +28,10 @@ how: smart      every healthy tunnel takes new connections; one that drops pings
      random     each new connection picks a tunnel at random, by weight
      roundrobin one tunnel after the other
 """
-import copy, json, os, re, subprocess
+import copy, json, re, subprocess
 
-MIX, SEP = "mix-", "~"
+MIX, SEP = "mix-", "~"             # balancer tag prefix; separator in copies' tags
+COPY = "mix~"                      # every per-tunnel copy starts so: one observatory selector for all
 HOW = ("smart", "random", "roundrobin")
 GUARD_CONF = "/etc/tunnel-guard.json"
 PING = {"destination": "https://www.google.com/generate_204", "connectivity": "",
@@ -44,11 +49,21 @@ def target(rule):
 
 
 def is_clone(tag):
-    return SEP in (tag or "")
+    return (tag or "").startswith(COPY)
 
 
 def base_of(tag):
-    return (tag or "").split(SEP)[0]
+    """mix~NAME~2b -> NAME; anything else is its own base."""
+    return tag[len(COPY):].rsplit(SEP, 1)[0] if is_clone(tag) else (tag or "")
+
+
+def copy_index(tag):
+    """mix~NAME~2b -> 2 (the tunnel's place in the mix, from 1)."""
+    return int(re.sub(r"\D", "", tag.rsplit(SEP, 1)[-1]) or 1)
+
+
+def copy_tag(f, i, k=0):
+    return "%s%s%s%d%s" % (COPY, f, SEP, i, "" if k == 0 else "bcd"[k - 1])
 
 
 def mixed(t):
@@ -153,18 +168,17 @@ def remove(t, name):
     """Take NAME's mix out of a template: copies, balancers, observatory subjects; rules back
     to the outbounds."""
     fam = {name, name + "-mux"}
-    t["outbounds"] = [o for o in t.get("outbounds", []) if not (is_clone(o.get("tag")) and base_of(o.get("tag")) in fam)]
+    old_style = lambda tag: not is_clone(tag) and SEP in (tag or "") and tag.split(SEP)[0] in fam
+    t["outbounds"] = [o for o in t.get("outbounds", []) if not ((is_clone(o.get("tag")) and base_of(o.get("tag")) in fam)
+                                                               or old_style(o.get("tag")))]
     routing = t.setdefault("routing", {})
     bal = [b for b in routing.get("balancers") or [] if b.get("tag") not in {MIX + f for f in fam}]
     if bal:
         routing["balancers"] = bal
     else:
         routing.pop("balancers", None)
-    obs = t.get("burstObservatory")
-    if obs:
-        obs["subjectSelector"] = [s for s in obs.get("subjectSelector") or [] if s not in {f + SEP for f in fam}]
-        if not obs["subjectSelector"]:
-            t.pop("burstObservatory")
+    # the observatory stays (selector "mix~"): taking it away would need a restart, and with
+    # no copies left it watches nothing
     point(routing.get("rules") or [], t)
     return t
 
@@ -186,21 +200,26 @@ def build(t, name, spec, ifs=None):
         for i, (addr, w) in enumerate(zip(spec["addrs"], spec["weights"]), 1):
             for k in range(w):
                 c = copy.deepcopy(base)
-                c["tag"] = "%s%s%d%s" % (f, SEP, i, "" if k == 0 else "bcd"[k - 1])
+                c["tag"] = copy_tag(f, i, k)
                 set_addr(c, addr, ifs)
                 copies.append(c)
         at = outs.index(base) + 1
         outs[at:at] = copies
         routing.setdefault("balancers", []).append({
-            "tag": MIX + f, "selector": [f + SEP], "fallbackTag": copies[0]["tag"],
+            "tag": MIX + f, "selector": [COPY + f + SEP], "fallbackTag": copies[0]["tag"],
             "strategy": strategy(spec["how"], len(copies))})
-        obs = t.setdefault("burstObservatory", {"subjectSelector": [], "pingConfig": dict(PING)})
-        obs.setdefault("pingConfig", dict(PING))
-        sel = obs.setdefault("subjectSelector", [])
-        if f + SEP not in sel:
-            sel.append(f + SEP)
+        observatory(t)
     point(routing.setdefault("rules", []), t)
     return t
+
+
+def observatory(t):
+    """One selector for every mix, present for good (see the top)."""
+    obs = t.setdefault("burstObservatory", {"subjectSelector": [], "pingConfig": dict(PING)})
+    obs.setdefault("pingConfig", dict(PING))
+    # earlier versions named copies NAME~1 and listed "NAME~" per path: those go
+    obs["subjectSelector"] = [s for s in obs.get("subjectSelector") or [] if not s.endswith(SEP)] + [COPY]
+    obs["subjectSelector"] = list(dict.fromkeys(obs["subjectSelector"]))
 
 
 def reapply(t, conf=None):

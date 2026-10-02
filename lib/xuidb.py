@@ -21,7 +21,7 @@ As a command (installed as xui-db):
     xui-db backup FOLDER               back it up into FOLDER
     xui-db restore FILE                put a backup back (stops and starts x-ui)
 """
-import json, os, re, shutil, sqlite3, subprocess, sys, time, urllib.parse
+import json, os, re, shutil, sqlite3, subprocess, sys, urllib.parse
 
 SERVICE = "x-ui"
 KEYS = ("XUI_DB_TYPE", "XUI_DB_DSN", "XUI_DB_FOLDER")

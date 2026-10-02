@@ -16,9 +16,10 @@ panel's template, tests the result with `xray -test` and restarts x-ui.
 Deleting a rule on purpose is fine - run `config-guard --save` (or press the button on
 the Optimizer page) and that becomes the new baseline.
 """
-import glob, json, os, shutil, sqlite3, subprocess, sys, time
+import glob, json, os, shutil, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuilive  # noqa: E402  template changes into the running Xray, no restart
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 CFG = BIN + "/config.json"
@@ -249,15 +250,16 @@ def main():
     if os.path.exists(CFG):
         shutil.copy2(CFG, backup)
     c = db()
+    old = json.loads(c.execute("select value from settings where key=?", (KEY,)).fetchone()[0])
     c.execute("update settings set value=? where key=?", (json.dumps(patched, indent=2), KEY))
     c.commit()
     c.close()
-    subprocess.run(["systemctl", "restart", "x-ui"], check=False)
-    time.sleep(6)
+    how = xuilive.apply(patched, old)                  # the missing pieces back, live when Xray can take them
+    time.sleep(2)
     back = [tag for tag in m["rules"] if tag in snapshot(template())["tags"]]
     log_event({"ts": int(time.time()), "missing": m, "fixed": True, "backup": os.path.basename(backup)})
-    say("🛠 config-guard: %s از کانفیگ پاک شده بود و برگرداندمش (%d قانون). x-ui ری‌استارت شد.\n"
-        "اگر خودتان عمداً حذفش کردید: config-guard --save" % (what, len(back)))
+    say("🛠 config-guard: %s از کانفیگ پاک شده بود و برگرداندمش (%d قانون)، %s.\n"
+        "اگر خودتان عمداً حذفش کردید: config-guard --save" % (what, len(back), "بدون ری‌استارت" if how == "live" else "Xray ری‌استارت شد"))
     print("restored: %s (backup %s)" % (what, backup))
 
 

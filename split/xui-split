@@ -50,10 +50,11 @@ Also, for tunnel-guard: Xray's RoutingService is enabled so routes can be switch
 restart, and every proxy outbound gets a local-only probe port (socks, 127.0.0.1:10808, ...).
 The DNS cache's upstream rule is tagged "dns-upstream".
 """
-import glob, json, os, random, re, shutil, sqlite3, subprocess, sys, time
+import glob, json, os, random, re, shutil, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  paths mixed over several tunnels: rules aim at a balancer
+import xuilive  # noqa: E402  template changes into the running Xray, no restart
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 SETTINGS, GUARD_CONF = "/etc/xui-split.json", "/etc/tunnel-guard.json"
@@ -281,10 +282,11 @@ def accept_in_config_guard():
         subprocess.run(["config-guard", "--save"], capture_output=True)
 
 
-def restart():
-    subprocess.run(["systemctl", "restart", "x-ui"], check=True)
-    time.sleep(6)
-    return subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
+def restart(new, old):
+    """Into the running Xray: live when Xray can take it, else Xray alone restarts (see xuilive)."""
+    how = xuilive.apply(new, old)
+    state = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
+    return "%s (%s)" % (state, "live, no restart" if how == "live" else "Xray restarted")
 
 
 # ---------------------------------------------------------------- check / fix
@@ -434,7 +436,7 @@ def tune_source(out, cfg):
         addrs = ((((load_json(GUARD_CONF, {}) or {}).get("tunnels") or {}).get(out) or {}).get("mix") or {}).get("addrs") or []
         gone = set(st.get("mix_out") or [])
         for o in copies:
-            i = int(re.sub(r"\D", "", o["tag"].split(xuimix.SEP)[-1]) or 1) - 1
+            i = xuimix.copy_index(o["tag"]) - 1
             a = addrs[i] if i < len(addrs) else None
             if a not in gone:
                 return o, a
@@ -639,8 +641,7 @@ def fix(auto=False):
     accept_in_config_guard()                             # before config.json changes: see below
     how = "بدون ری‌استارت (از راه API)"
     if not (hot and hot_replace(new, muxes, LEGACY if legacy_live else ())):
-        restart()
-        how = "با ری‌استارت x-ui"
+        how = "بدون ری‌استارت" if restart(new, tpl).find("live") >= 0 else "با ری‌استارت Xray"
     if want is not None:
         sync_guard(want)
     after = check(new)
@@ -733,6 +734,7 @@ def main():
             return
         mode = "apply"                                    # never built: build it
 
+    old = template()
     tpl, want = patch(template(), remove=(mode == "remove"))
     ok, detail = test_candidate(tpl)
     if not ok:
@@ -755,7 +757,7 @@ def main():
     # the new baseline before x-ui rewrites config.json: config-guard reacts to that write and
     # would otherwise put the removed (old-name or disabled) rules straight back
     accept_in_config_guard()
-    state = restart()
+    state = restart(tpl, old)
     sync_guard(want)
     print(f"{mode} done, backup {b}, x-ui {state}")
     print(f"  undo: {xuidb.undo_hint(b)}")

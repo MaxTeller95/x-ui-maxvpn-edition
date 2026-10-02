@@ -48,10 +48,11 @@ untouched) and Telegram is told. It comes back after 3 clean minutes. When every
 alike nothing is taken out: the trouble is past the tunnels. After an x-ui restart the live
 copies are compared with what should run and the exclusion is put back.
 """
-import glob, ipaddress, json, os, re, shutil, socket, sqlite3, subprocess, sys, syslog, tempfile, time, urllib.parse
+import glob, ipaddress, json, os, re, shutil, socket, subprocess, sys, syslog, tempfile, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  one path over several tunnels at once
+import xuilive  # noqa: E402  template changes into the running Xray, no restart
 from concurrent.futures import ThreadPoolExecutor
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
@@ -537,9 +538,8 @@ def use(name, addr, why="by hand"):
         os.remove(path)
         hot = hot and rc == 0
     save(CFG, cfg)                          # what the page, config-guard and the guard read
-    if not hot:                             # the API refused: fall back to a restart
-        run("systemctl", "restart", "x-ui", timeout=60)
-        time.sleep(7)
+    if not hot:                             # the API refused: Xray alone is restarted, not the panel
+        xuilive.restart_xray()
     run("config-guard", "--save", timeout=30)
 
     # 3. the guard pings the new peer, and watches an AWG handshake only when it is an AWG tunnel
@@ -736,9 +736,9 @@ def mix_set(name, spec):
                     set_addr(o, first)
     write_template(new)
     save(GUARD_CONF, c)
-    run("config-guard", "--save", timeout=30)        # before x-ui rewrites config.json
-    run("systemctl", "restart", "x-ui", timeout=60)
-    time.sleep(8)
+    run("config-guard", "--save", timeout=30)        # before config.json changes
+    how = xuilive.apply(new, old)                    # live: users keep their connections and their bytes are billed
+    time.sleep(3)
     answers = probe_live(name, load(CFG, {}))
     if answers is False:
         write_template(old)
@@ -746,7 +746,7 @@ def mix_set(name, spec):
         c.setdefault("tunnels", {}).setdefault(name, {})["mix"] = old_spec
         save(GUARD_CONF, c)
         run("config-guard", "--save", timeout=30)
-        run("systemctl", "restart", "x-ui", timeout=60)
+        xuilive.apply(old, new)
         raise ValueError("بعد از اعمال، %s از پورت probe جواب نداد؛ همه‌چیز برگردانده شد (بکاپ: %s)" % (name, backup))
     st = load(STATE, {})
     s = st.setdefault(name, {})
@@ -757,11 +757,12 @@ def mix_set(name, spec):
         s.pop(k, None)
     save(STATE, st)
     log("%s: mix %s" % (name, ("on " + ",".join(spec["addrs"]) + " " + spec["how"]) if spec else "off"))
-    how = {"smart": "هوشمند", "random": "تصادفی", "roundrobin": "نوبتی"}
+    how_fa = {"smart": "هوشمند", "random": "تصادفی", "roundrobin": "نوبتی"}
     if spec:
-        return {"ok": True, "backup": backup, "msg": "%s حالا همزمان روی %s است (%s)؛ x-ui یک بار ری‌استارت شد" % (
-            name, " و ".join(spec["addrs"]), how[spec["how"]])}
-    return {"ok": True, "backup": backup, "msg": "%s دوباره روی یک تانل است (%s)" % (name, (old_spec.get("addrs") or ["?"])[0])}
+        return {"ok": True, "backup": backup, "msg": "%s حالا همزمان روی %s است (%s)؛ %s" % (
+            name, " و ".join(spec["addrs"]), how_fa[spec["how"]], "بدون ری‌استارت" if how == "live" else "Xray یک بار ری‌استارت شد")}
+    return {"ok": True, "backup": backup, "msg": "%s دوباره روی یک تانل است (%s)؛ %s" % (
+        name, (old_spec.get("addrs") or ["?"])[0], "بدون ری‌استارت" if how == "live" else "Xray یک بار ری‌استارت شد")}
 
 
 def pinned(name, cfg=None):
@@ -775,7 +776,7 @@ def pinned(name, cfg=None):
     if not tag:
         return None
     spec = (((conf().get("tunnels") or {}).get(name) or {}).get("mix") or {}).get("addrs") or []
-    i = int(re.sub(r"\D", "", tag.split(xuimix.SEP)[-1]) or 0) - 1
+    i = xuimix.copy_index(tag) - 1
     return spec[i] if 0 <= i < len(spec) else tag
 
 
@@ -795,7 +796,7 @@ def mix_pin(name, addr):
         raise ValueError("%s جزو تانل‌های ترکیب %s نیست" % (addr, name))
     i = spec["addrs"].index(addr) + 1
     for f in fams:
-        rc, out = run(XRAY, "api", "bo", api, "-b", xuimix.MIX + f, "%s%s%d" % (f, xuimix.SEP, i), timeout=8)
+        rc, out = run(XRAY, "api", "bo", api, "-b", xuimix.MIX + f, xuimix.copy_tag(f, i), timeout=8)
         if rc:
             raise ValueError("Xray قبول نکرد: " + out[-200:])
     return {"ok": True, "msg": "%s فعلاً فقط روی %s است (تا برداشتن سنجاق یا ری‌استارت x-ui)" % (name, addr)}
@@ -852,7 +853,9 @@ def live_tags(cfg):
 
 
 def xray_pid():
-    rc, out = run("pgrep", "-o", "-f", "xray-linux", timeout=5)
+    """The panel's own Xray (a child of x-ui) - not another xray on the box, like WGDashboard's."""
+    rc, main = run("systemctl", "show", "-p", "MainPID", "--value", "x-ui", timeout=5)
+    rc, out = run("pgrep", "-P", main.strip() or "0", "xray", timeout=5)
     return out.split()[0] if rc == 0 and out else ""
 
 
@@ -875,9 +878,9 @@ def live_mix(name, spec, out, s, cfg=None):
     for f in (name, name + "-mux"):
         copies = [o for o in cfg.get("outbounds", []) if xuimix.is_clone(o.get("tag")) and xuimix.base_of(o["tag"]) == f]
         for o in copies:
-            i = int(re.sub(r"\D", "", o["tag"].split(xuimix.SEP)[-1]) or 1) - 1
+            i = xuimix.copy_index(o["tag"]) - 1
             addr = spec["addrs"][i] if i < len(spec["addrs"]) else None
-            fallback = o["tag"] == "%s%s1" % (f, xuimix.SEP)
+            fallback = o["tag"] == xuimix.copy_tag(f, 1)
             gone = addr in out and not fallback
             aim = keep[0] if (addr in out and fallback) else addr
             live_now = o["tag"] in live

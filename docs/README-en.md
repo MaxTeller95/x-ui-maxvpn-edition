@@ -32,6 +32,21 @@ touching anything, back up the panel's database (`x-ui.db`, or `x-ui.pgdump` on 
 + `config.json` to `/root/xui-backup-<time>/`, and replace their own rules on a re-run instead
 of adding more.
 
+### Users' traffic, byte for byte
+
+3x-ui bills each user from Xray's counters, read every 5 seconds. Every Xray restart loses two
+pieces for good: what the old process counted since the last read, and what the new one counts
+before the first (after a restart the panel only takes a baseline) - up to about 10 seconds of
+every user's traffic, and every connection drops. So no tool here restarts for anything Xray
+takes live (`lib/xuilive.py`): outbounds and probe ports through the API one by one, all rules
+and balancers in one call, with the panel's own additions to the config (its `panel-egress`
+rule, dropped `enabled`/`comment`) reproduced exactly. Only what Xray cannot change while running
+(the dns block, the observatory, geo lists, users' inbounds) restarts, and then Xray alone
+(`systemctl reload x-ui`), not the panel. Measured on a hub: two real mix changes in 40 s, the
+same Xray process throughout, 22.4 MB counted by Xray and 22.3 MB billed by the panel (the
+difference is only the panel's 5-second read timing). Recommended: turn off the panel's
+`restartXrayOnClientDisable`, or every expiring user restarts Xray for everyone.
+
 ### SQLite or PostgreSQL
 
 3x-ui 3.x can keep its data in PostgreSQL instead of `/etc/x-ui/x-ui.db` (`XUI_DB_TYPE=postgres`,
@@ -445,7 +460,7 @@ an x-ui restart the state is applied again.
 
 Turning it on, changing it or off restarts x-ui once, after an Xray test and a backup; the path
 is then checked through its own probe port and everything is put back if it does not answer.
-How: one copy of the path's outbound per tunnel (`MAIN~1`, `MAIN~2`, `MAIN~1b` for a
+How: one copy of the path's outbound per tunnel (`mix~MAIN~1`, `mix~MAIN~2`, `mix~MAIN~1b` for a
 2x weight), a balancer `mix-MAIN` over them, and every rule that went to `MAIN` (users,
 DNS, the guard's probe) now names the balancer. `MAIN` itself stays, unused, as the model of
 the copies, so tunnel-guard failover, xui-split (which re-applies the mix after every rebuild),

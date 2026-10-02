@@ -17,9 +17,10 @@ them when the panel itself is updated, so on a long-running hub they grow old wh
 Downloads go direct first and through the guard's probe ports (the tunnels) when GitHub
 does not answer from the hub.
 """
-import glob, hashlib, json, os, shutil, sqlite3, subprocess, sys, time
+import glob, hashlib, json, os, shutil, subprocess, sys, time
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
+import xuilive  # noqa: E402  template changes into the running Xray, no restart
 
 DB, BIN = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin"
 CFG = BIN + "/config.json"
@@ -144,8 +145,8 @@ def update(restart):
     finally:
         shutil.rmtree(work, ignore_errors=True)
     save(STATE, {"tag": rel.get("tag"), "date": rel.get("date"), "updated": int(time.time())})
-    if changed and restart:
-        subprocess.run(["systemctl", "restart", "x-ui"], check=False)
+    if changed and restart:                            # new lists are read only at start: Xray alone restarts
+        xuilive.restart_xray()
     return {"ok": True, "changed": changed,
             "msg": ("فهرست‌های ایران به %s به‌روز شد%s" % (rel.get("tag") or "?", " و x-ui ری‌استارت شد" if restart
                                                           else "؛ با ری‌استارت بعدی x-ui اعمال می‌شود"))
@@ -157,6 +158,7 @@ def security(on):
     Only this rule changes; config-guard learns it before x-ui restarts."""
     db = xuidb.connect()
     tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    old = json.loads(json.dumps(tpl))
     rules = [r for r in tpl["routing"]["rules"] if r.get("ruleTag") != TAG]
     kinds = {o.get("tag"): o.get("protocol") for o in tpl["outbounds"]}
     if on:
@@ -197,7 +199,7 @@ def security(on):
     db.close()
     if shutil.which("config-guard"):                   # before x-ui rewrites config.json
         subprocess.run(["config-guard", "--save"], capture_output=True)
-    subprocess.run(["systemctl", "restart", "x-ui"], check=False)
+    xuilive.apply(tpl, old)                            # one rule: live, no restart
     return {"ok": True, "backup": backup,
             "msg": "بستن بدافزار، فیشینگ و استخراج رمزارز %s شد" % ("روشن" if on else "خاموش")}
 
