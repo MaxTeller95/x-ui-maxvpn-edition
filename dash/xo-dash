@@ -721,11 +721,13 @@ def confguard():
     # history, not something to fix. Keep only what the current baseline still watches.
     now = set(g.get("tags") or []) | set(path_order()) | {"guard-" + n.lower() for n in path_order()}
     now |= {o.get("tag") for o in xray_cfg().get("outbounds", [])}
+    now |= {b.get("tag") for b in (xray_cfg().get("routing") or {}).get("balancers", [])}
     kept = []
     for e in g.get("events") or []:
         m = e.get("missing") or {}
-        m = {k: ([x for x in m.get(k) or [] if x in now] if k != "dns" else m.get(k)) for k in m}
-        if any(m.get(k) for k in ("rules", "outbounds", "inbounds", "dns")):
+        # lists of tags are filtered; flags (dns, observatory) are kept as they are
+        m = {k: ([x for x in v if x in now] if isinstance(v, list) else v) for k, v in m.items()}
+        if any(m.get(k) for k in ("rules", "outbounds", "inbounds", "dns", "balancers", "observatory")):
             kept.append(dict(e, missing=m))
     g["events"] = kept
     return g
