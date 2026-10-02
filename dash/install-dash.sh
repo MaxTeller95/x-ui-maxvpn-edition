@@ -54,6 +54,9 @@ server {
 }
 CONF
 if [ "$MODE" = move ]; then
+  # remember the panel's own listen address so --uninstall can give the port back to x-ui;
+  # kept on a re-install, which would otherwise record our own 127.0.0.1
+  [ -f /etc/xo-dash.weblisten ] || get webListen > /etc/xo-dash.weblisten
   python3 -c "$PYDB; c = xuidb.connect(); c.execute(\"update settings set value='127.0.0.1' where key='webListen'\"); c.commit()"
   systemctl restart x-ui; sleep 5
 fi

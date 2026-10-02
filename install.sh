@@ -59,6 +59,39 @@ done
 
 # --------------------------------------------------------------------- حذف
 if [ -n "$UNINSTALL" ]; then
+  # صفحه‌ی Optimizer اول: nginx پورت پنل را آزاد کند و x-ui دوباره روی آدرس خودش گوش دهد
+  # (پیش از پاک شدن lib، که دسترسی به دیتابیس پنل از آن است)
+  dash_conf=""
+  if [ -f /etc/nginx/conf.d/xo-dash.conf ]; then
+    dash_conf=1
+    rm -f /etc/nginx/conf.d/xo-dash.conf
+    nginx -t 2>/dev/null && systemctl reload nginx || true
+  fi
+  if [ -n "$dash_conf" ] || [ -f /etc/xo-dash.weblisten ]; then
+    # نصب‌های قدیمی فایل /etc/xo-dash.weblisten را ندارند؛ آن‌جا 127.0.0.1 را همان --move گذاشته است
+    if PYTHONPATH=/usr/local/lib/xui-optimizer:$HOME_DIR/lib python3 - <<'PY'
+import os, sys, xuidb
+saved = "/etc/xo-dash.weblisten"
+c = xuidb.connect()
+r = c.execute("select value from settings where key=?", ("webListen",)).fetchone()
+cur = r[0] if r else ""
+if os.path.exists(saved):
+    old = open(saved).read().strip()
+elif cur == "127.0.0.1":
+    old = ""
+else:
+    sys.exit(1)
+if cur == old:
+    sys.exit(1)
+c.execute("update settings set value=? where key=?", (old, "webListen"))
+c.commit()
+PY
+    then
+      systemctl restart x-ui && ok "پنل دوباره روی پورت خودش در دسترس است (webListen برگردانده شد)"
+    fi
+    rm -f /etc/xo-dash.weblisten
+  fi
+
   inf "خاموش کردن تایمرها و سرویس‌ها"
   [ -f /usr/local/share/xui-optimizer/subpage/index.html ] && { "$DEST/xui-subpage" off || true; }
   rm -rf /usr/local/share/xui-optimizer /usr/local/lib/xui-optimizer
@@ -68,15 +101,10 @@ if [ -n "$UNINSTALL" ]; then
   for u in $UNITS; do rm -f "/etc/systemd/system/$(basename "$u")"; done
   rm -f /etc/systemd/system/xo-dash.service
   rm -f /etc/cron.d/xui-mtu /etc/xui-mtu.pins     # MTUهایی که تنظیم شده‌اند در فایل تانل‌ها می‌مانند
-  if [ -f /etc/nginx/conf.d/xo-dash.conf ]; then
-    rm -f /etc/nginx/conf.d/xo-dash.conf
-    nginx -t 2>/dev/null && systemctl reload nginx || true
-  fi
   rm -rf /opt/xo-dash
   systemctl daemon-reload
   ok "حذف شد. این‌ها دست نخوردند: /etc/tunnel-guard.json، بکاپ‌های /root/xui-backup-* و $HOME_DIR"
   echo "تغییراتی که ابزارها در پنل داده‌اند (قانون‌های مسیریابی، کش DNS و ...) در خود پنل می‌مانند."
-  echo "اگر صفحه را با --move نصب کرده بودید، webListen پنل را در تنظیمات پنل خالی کنید و x-ui را ری‌استارت کنید."
   exit 0
 fi
 
