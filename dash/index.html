@@ -108,6 +108,20 @@
   .tc.spare { opacity: .55; }
   .tc .pct { font-weight: 700; color: var(--accent); }
   .tc button.pin.on { color: var(--accent); }
+  .upb { margin-top: 8px; display: grid; gap: 4px; }
+  .upb .uh { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .ur { display: grid; grid-template-columns: minmax(70px, auto) minmax(80px, 1fr) 76px; gap: 8px; align-items: center; font-size: 12px; }
+  .ur .bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  .ur .bar i { display: block; height: 100%; background: var(--accent); opacity: .55; border-radius: 4px; }
+  .ur.live .bar i { opacity: 1; }
+  .ur.top .bar i { background: var(--ok); opacity: .9; }
+  .ur b { font-weight: 600; text-align: left; direction: ltr; }
+  .ur .who { display: flex; gap: 4px; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
+  .ur .who small.tn { font-weight: 700; color: var(--accent); }
+  .ur .meta { grid-column: 2 / 4; color: var(--muted); font-size: 11px; margin-top: -2px; }
+  .mtu td, .mtu th { font-size: 12px; padding: 4px 6px; }
+  pre.key { white-space: pre-wrap; word-break: break-all; font-size: 11px; background: var(--bg); border: 1px solid var(--line);
+            border-radius: 6px; padding: 6px; direction: ltr; text-align: left; margin: 4px 0; }
   .mixed { margin-top: 8px; padding: 10px; border: 1px dashed var(--line); border-radius: 10px; display: grid; gap: 8px; }
   .mixed .mr { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
   .mixed .mr select { padding: 1px 6px; font-size: 12px; }
@@ -404,6 +418,7 @@
         <h2>تانل‌ها <span class="muted">چند تانل برای یک مسیر</span>
           <button id="tn-scanall" title="کانفیگ هر مسیر روی آدرس همه‌ی تانل‌ها امتحان می‌شود">اسکن همه</button></h2>
         <div id="tn-list"><div class="muted">...</div></div>
+        <div id="tn-steer" style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center"></div>
         <div class="find" style="margin-top:10px">
           <select id="tn-path" style="flex:0 0 140px"></select>
           <input id="tn-addr" dir="ltr" placeholder="10.0.30.1 / 10.0.1.2@sb0">
@@ -415,8 +430,38 @@
           زیر همان مسیر می‌آیند. رنگ نقطه: آبی = فعال، سبز = آخرین تست جواب داد، قرمز = جواب نداد. کلیک روی آدرس = تست؛
           آدرس@تانل (مثل 10.0.1.2@sb0) یعنی همان آدرس، ولی از داخل تانل sing-box.
           ⇄ = برو روی این (از راه API خود Xray، بدون ری‌استارت x-ui)؛ ▲ = ترجیح بالاتر؛ × = حذف از فهرست؛ + = پیشنهاد اسکن
-          برای افزودن. با «خودکار»، اگر آدرس فعلی جواب ندهد اوت‌باند به اولین آدرس سالم بعدی می‌رود و وقتی آدرس اول
-          دوباره پایدار شد برمی‌گردد. تایمر هر ساعت همه را دوباره اسکن می‌کند.</div></details>
+          برای افزودن. با «خودکار»، اگر آدرس فعلی جواب ندهد اوت‌باند به اولین آدرس سالم بعدی می‌رود. با «ترتیب هوشمند»،
+          تایمر خودش تانل‌ها را رتبه می‌دهد: سرعت آپلود (هر ۳۰ دقیقه ۶ مگابایت از هر تانل، بیرون از ترافیک کاربران و
+          بدون حساب شدن در حجم کسی)، پکت لاست (هر دقیقه) و پایداری؛ وقتی تانلی سه دقیقه پشت هم یک‌چهارم بهتر از فعلی بود
+          (حداکثر هر ۳۰ دقیقه یک بار) مسیر بدون ری‌استارت رویش می‌رود. جابجایی دستی (⇄ یا ▲) ترتیب را دستی می‌کند تا
+          دوباره «ترتیب هوشمند» را بزنید. «آپلود سنگین»: کاربری که دو دقیقه پشت هم بیش از ۴ مگابیت آپلود کند، اتصال‌های
+          تازه‌اش به بهترین تانل دیگر همان سرور می‌رود تا آپلودش تانل مشترک را پر نکند؛ ۱۰ دقیقه بعد از آرام شدن برمی‌گردد.
+          حجم کاربرها مثل همیشه بایت به بایت حساب می‌شود. تایمر هر ساعت همه را دوباره اسکن می‌کند.</div></details>
+      </div>
+
+      <div class="card wide">
+        <h2>نگهبان MTU <span class="muted">همه‌ی تانل‌ها، هر دو سر</span>
+          <span><span class="mini" title="اصلاح خودکار هر ۵ دقیقه"><label class="switch"><input type="checkbox" id="mtu-auto"><span></span></label>اصلاح خودکار</span>
+            <button id="mtu-check">همین حالا بسنج</button></span></h2>
+        <div id="mtu-list" class="muted">...</div>
+        <details class="tnd"><summary>سرورهای خارج و کلید SSH هاب</summary><div class="muted sm" style="margin-top:6px">
+          برای اینکه هاب سر دیگر تانل‌ها را هم بسنجد و تنظیم کند (MTU و تنظیم‌های کرنل)، این خط را یک بار روی هر سرور خارج
+          به‌عنوان root اجرا کنید. هاب اول آدرس عمومی سرور را امتحان می‌کند و بعد از داخل خود تانل‌ها. چیزی روی آن سرور نصب نمی‌شود.
+          <pre class="key" id="mtu-install">...</pre>
+          <button id="mtu-copy">کپی</button>
+          <div id="mtu-servers" style="margin-top:6px"></div>
+          <div class="find" style="margin-top:6px"><input id="mtu-host" dir="ltr" placeholder="آدرس سرور: 1.2.3.4 یا 10.0.1.2">
+            <input id="mtu-port" dir="ltr" placeholder="22" style="flex:0 0 60px"><button id="mtu-host-try">امتحان SSH</button></div></div></details>
+        <details class="tnd"><summary>راهنما</summary><div class="muted sm" style="margin-top:6px">
+          تانلی که MTU آن از توان مسیر بزرگ‌تر باشد ping و بسته‌ی کوچک را رد می‌کند ولی بسته‌ی کامل را گم می‌کند: صفحه‌ها گیر
+          می‌کنند و سرعت می‌افتد. نگهبان هر ۵ دقیقه از داخل هر تانل ping با «تکه نشو» به اندازه‌ی MTU می‌فرستد؛ اگر رد شد کاری
+          نمی‌کند. اگر نه، بزرگ‌ترین اندازه‌ای که رد می‌شود را پیدا می‌کند (هر اندازه ۴ بار، تا پکت لاست با MTU کوچک اشتباه نشود)،
+          سر دیگر را هم از طریق SSH در جهت برعکس می‌سنجد، و فقط وقتی دو بار پشت هم همان را دید MTU همان تانل را در هر دو سر
+          کم می‌کند. کم کردن MTU اتصال‌های باز را قطع نمی‌کند. تانلی که ترافیک دارد هیچ‌وقت خودکار بالا برده نمی‌شود؛ تانل
+          بیکاری که قبلاً کم شده هر ۶ ساعت با MTU قبلی امتحان می‌شود. تانل‌های داخل تانل بعد از تانل بیرونی سنجیده می‌شوند و به
+          MTU تانل‌های دیگر دست زده نمی‌شود. تانل‌هایی که روی TCP سوارند (AWG داخل wstunnel، Backhaul، sing-box) بسته
+          گم نمی‌کنند و دست نمی‌خورند. تغییر در فایل خود تانل (systemd یا کانفیگ awg/wg) و در /etc/xui-mtu.pins هر دو سرور
+          ثبت می‌شود تا بعد از ریبوت هم بماند.</div></details>
       </div>
 
       <div class="card wide">
@@ -776,7 +821,7 @@ function renderCheckup(c) {
   $("#checks").innerHTML = c.checks.map((x) => `<div class="check"><span class="dot ${x.level}"></span><div>
     <b>${esc(x.title)}</b> — ${esc(x.detail)}
     ${x.hint ? `<div class="muted">${esc(x.hint)}</div>` : ""}
-    ${x.fix ? `<button data-fix="${esc(x.fix)}" style="margin-top:6px">${x.fix === "kernel-fix" ? "اعمال و ثبت دائم" : "تعمیر کن"}</button>` : ""}</div></div>`).join("");
+    ${x.fix ? `<button data-fix="${esc(x.fix)}" style="margin-top:6px">${x.fix === "kernel-fix" || x.fix === "kernel-all" ? "اعمال و ثبت دائم" : "تعمیر کن"}</button>` : ""}</div></div>`).join("");
   try { localStorage.setItem("xo-checkup", JSON.stringify(c)); } catch (e) {}
 }
 
@@ -878,7 +923,37 @@ function mixEditor(r) {
     <div class="muted sm">بدون ری‌استارت اعمال می‌شود (فقط اولین ترکیب روی این هاب یک بار Xray را ری‌استارت می‌کند). بعدش مسیر تست می‌شود و اگر جواب ندهد همه‌چیز خودکار برمی‌گردد.
       تانل‌ها باید به یک سرور برسند تا IP خروجی کاربر عوض نشود.</div></div>`;
 }
+function upBars(r) {
+  const rows = r.addrs.filter((a) => a.up != null || a.place);
+  if (!rows.length) return r.addrs.length > 1 && !(r.mix || {}).on
+    ? `<div class="upb"><div class="uh">سرعت آپلود تانل‌ها: هنوز اندازه گرفته نشده
+        <button class="ic" data-tupload="${esc(r.name)}" title="همین حالا آپلود همه‌ی تانل‌ها را بسنج (حدود یک دقیقه)">⇡ بسنج</button></div></div>` : "";
+  const max = Math.max(1, ...r.addrs.map((a) => a.up || 0));
+  const best = (r.rank || [])[0];
+  return `<div class="upb"><div class="uh"><b>سرعت آپلود تانل‌ها</b>${r.up_at ? " · " + ago(r.up_at) : ""}
+      ${r.order === "auto" ? '<span class="chip accent" title="مسیر خودش روی بهترین تانل می‌رود">ترتیب هوشمند</span>'
+        : '<span class="chip" title="ترتیب فهرست، همان‌طور که دستی چیده شده">ترتیب دستی</span>'}
+      <button class="ic" data-tupload="${esc(r.name)}" title="همین حالا بسنج (حدود یک دقیقه)">⇡ بسنج</button></div>
+    ${r.addrs.map((a) => {
+      const [pa, via] = a.addr.split("@"), name = via || a.iface || a.kind || "";
+      return `<div class="ur ${a.live ? "live" : ""} ${a.addr === best ? "top" : ""}" title="امتیاز ${a.score} = آپلود × (۱ − لاست/۲۰) × پایداری²">
+        <span class="who">${a.place ? `<span class="muted">#${a.place}</span>` : ""}${name ? `<small class="tn" dir="ltr">${esc(name)}</small>` : ""}<span dir="ltr">${esc(pa)}</span></span>
+        <div class="bar"><i style="width:${Math.round(100 * (a.up || 0) / max)}%"></i></div>
+        <b>${a.up != null ? a.up + " Mbit/s" : "—"}</b>
+        <span class="meta">${a.live ? "فعال · " : ""}پکت لاست ${a.loss != null ? a.loss : "?"}٪ · پایداری ${Math.round((a.stab || 0) * 100)}٪${a.addr === best ? " · بهترین" : ""}${r.steer_to === a.addr ? " · مقصد آپلودهای سنگین" : ""}</span></div>`;
+    }).join("")}</div>`;
+}
+let STEER = {};
+function renderSteer(v) {
+  STEER = v || {};
+  const moved = Object.entries(STEER.moved || {});
+  $("#tn-steer").innerHTML = `<label class="mini"><input type="checkbox" id="steer-on" ${STEER.on ? "checked" : ""}>آپلود سنگین را جدا کن</label>
+    <span class="muted sm">بیش از ${STEER.limit || 4} مگابیت، دو دقیقه پشت هم${STEER.total_mbps != null ? " · آپلود همه‌ی کاربران الان: " + STEER.total_mbps + " Mbit/s" : ""}</span>
+    ${moved.length ? moved.map(([e, m]) => `<span class="chip warn" title="از ${ago(m.since)}">⇡ ${esc(e)} · ${m.mbps} Mbit/s</span>`).join(" ")
+      : '<span class="muted sm">· الان کسی جدا نشده</span>'}`;
+}
 function renderTunnels(list) {
+  if (list && !Array.isArray(list)) { renderSteer(list.steer); list = list.paths; }
   TN = list || [];
   const many = (r) => r.addrs.length > 1 || r.offer.length;
   $("#tn-list").innerHTML = TN.filter(many).map((r) => {
@@ -893,7 +968,9 @@ function renderTunnels(list) {
            ${(m.drift || []).length ? '<span class="chip warn" title="کپی‌های تانل‌ها با اوت‌باند اصلی فرق دارند؛ «اعمال تغییرات» آن‌ها را از نو می‌سازد">نیاز به اعمال دوباره</span>' : ""}`
         : `<button class="ic" data-tmixedit="${n}" title="ترافیک کاربران همزمان از چند تانل این مسیر رد شود">⧉ همزمان</button>`) : "";
     return `<div class="tr"><div class="th"><b dir="ltr">${n}</b>
-      ${r.addrs.length > 1 && !m.on ? `<label class="mini"><input type="checkbox" data-tauto="${n}" ${r.auto ? "checked" : ""}>خودکار</label>` : ""}
+      ${r.addrs.length > 1 && !m.on ? `<label class="mini"><input type="checkbox" data-tauto="${n}" ${r.auto ? "checked" : ""}>خودکار</label>
+        <label class="mini" title="رتبه‌بندی خودکار تانل‌ها با سرعت آپلود، پکت لاست و پایداری؛ خاموش = همان ترتیب فهرست"><input type="checkbox" data-torder="${n}" ${r.order === "auto" ? "checked" : ""}>ترتیب هوشمند</label>` : ""}
+      ${r.steer_to ? `<span class="chip warn" title="کاربران با آپلود سنگین روی این تانل‌اند">⇡ آپلود سنگین → <span dir="ltr">${esc(r.steer_to)}</span></span>` : ""}
       ${mixHead}
       ${m.pending ? '<span class="chip warn">تنظیم شده ولی هنوز در کانفیگ نیست</span>' : ""}
       <button class="ic" data-tscan="${n}" title="اسکن تانل‌ها برای ${n}">⟳</button>
@@ -903,6 +980,7 @@ function renderTunnels(list) {
           title="${o.test && o.test.ok ? "اسکن: این مسیر اینجا هم جواب داد" : "تانل دیگری به همین سرور"} — کلیک: اضافه کن">+
           ${o.iface ? `<small class="tn" dir="ltr">${esc(o.iface)}</small>` : ""}<b dir="ltr">${esc(o.addr.split("@")[0])}</b><small>${o.test && o.test.ok && o.test.ms ? o.test.ms + "ms" : ""}</small></button>`).join("")}
       </div>${m.on && m.share_bytes ? `<div class="muted sm" style="margin-top:4px">سهم هر تانل از ترافیک یک ساعت اخیر: ${bytes(m.share_bytes)}</div>` : ""}
+      ${upBars(r)}
       ${MIXEDIT === r.name ? mixEditor(r) : ""}</div>`;
   }).join("") || '<div class="muted">هیچ مسیری آدرس جایگزین ندارد؛ «اسکن همه» را بزنید یا آدرس دستی اضافه کنید.</div>';
   const single = TN.filter((r) => !many(r));
@@ -951,6 +1029,31 @@ function renderFound(list) {
         ${esc((t.paths || []).join("، ")) || "—"}</div></div>`;
   }).join("") || "تانلی پیدا نشد.";
 }
+const MTU_STATE = { ok: ["ok", "سالم"], small: ["warn", "کوچک‌تر رد می‌شود"], fixed: ["accent", "اصلاح شد"],
+  tcp: ["", "روی TCP"], down: ["bad", "پایین"], silent: ["bad", "بی‌پاسخ"], other: ["", "نگهبان دیگر"] };
+let MTU = {};
+function renderMtu(v) {
+  MTU = v || {};
+  if ($("#mtu-auto")) $("#mtu-auto").checked = MTU.auto !== false;
+  $("#mtu-install").textContent = MTU.install || "";
+  const t = MTU.tunnels || [];
+  $("#mtu-list").classList.toggle("muted", !t.length);
+  $("#mtu-list").innerHTML = !t.length ? "هنوز سنجیده نشده. «همین حالا بسنج» را بزنید." :
+    `<div class="muted sm">آخرین سنجش ${ago(MTU.at)}</div><div style="overflow-x:auto"><table class="mtu"><tbody>
+     <tr><th>تانل</th><th>MTU این‌جا</th><th>سر دیگر</th><th>رد می‌شود</th><th>وضعیت</th></tr>
+     ${t.map((r) => { const st = MTU_STATE[r.state] || ["", r.state || "?"];
+       return `<tr><td><b dir="ltr">${esc(r.iface)}</b> <span class="muted">${esc(r.kind)}</span>${r.busy ? ' <span class="chip accent" title="ترافیک دارد">فعال</span>' : ""}</td>
+         <td>${r.mtu}</td>
+         <td>${r.far_iface ? `<span dir="ltr">${esc(r.far_host || r.far)} · ${esc(r.far_iface)}</span> ${r.far_mtu}` : r.state === "tcp" ? "—" : '<span class="muted" title="کلید SSH هاب روی آن سرور نیست">در دسترس نیست</span>'}</td>
+         <td>${r.fit ? r.fit + (r.back ? ` <span class="muted" title="از آن سر به این سر">↩ ${r.back}</span>` : "") : "—"}</td>
+         <td><span class="chip ${st[0]}">${st[1]}</span> <span class="muted sm">${esc(r.note || "")}</span>
+           ${(r.events || []).map((e) => `<div class="muted sm">${ago(e.t)}: ${esc(e.what)}</div>`).join("")}</td></tr>`; }).join("")}
+     </tbody></table></div>`;
+  $("#mtu-servers").innerHTML = (MTU.servers || []).map((h) =>
+    `<span class="chip ${h.ok ? "ok" : "bad"}" title="${esc(h.err || "")}" dir="ltr">${esc(h.host || h.addr)}${h.host ? " (" + esc(h.addr) + ")" : ""}</span>`).join(" ")
+    || '<span class="muted">هنوز به سروری وصل نشده.</span>';
+}
+async function loadMtu() { const v = await get("mtu"); if (v) renderMtu(v); }
 async function tnSave(name, addrs, extra = {}) {
   const r = await post("tunnel-set", Object.assign({ name, addrs }, extra));
   toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
@@ -1004,13 +1107,31 @@ document.querySelectorAll("nav.tabs button").forEach((b) => {
     if (TAB === "users") loadSpeeds();
     if (TAB === "health" && !L) { loadLint(); loadCG(); }
     if (TAB === "health") loadReach();
-    if (TAB === "tools") { loadUnits(); loadPaths(); loadTunnels(); }
+    if (TAB === "tools") { loadUnits(); loadPaths(); loadTunnels(); loadMtu(); }
   };
 });
 $("#r-3h").onclick = () => { RANGE = "3h"; $("#r-3h").classList.add("primary"); $("#r-24h").classList.remove("primary"); loadLive(); };
 $("#r-24h").onclick = () => { RANGE = "24h"; $("#r-24h").classList.add("primary"); $("#r-3h").classList.remove("primary"); loadLive(); };
 
-document.addEventListener("change", (e) => {
+document.addEventListener("change", async (e) => {
+  if (e.target.dataset && e.target.dataset.torder) {
+    const r = await post("tunnel-order", { name: e.target.dataset.torder, auto: e.target.checked });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadTunnels();
+    return;
+  }
+  if (e.target.id === "steer-on") {
+    const r = await post("steer", { on: e.target.checked });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadTunnels();
+    return;
+  }
+  if (e.target.id === "mtu-auto") {
+    const r = await post("mtu-auto", { on: e.target.checked });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadMtu();
+    return;
+  }
   if (e.target.name && e.target.name.startsWith("mhow-")) {
     const tip = e.target.closest(".mixed").querySelector("[data-mtip]");
     if (tip) tip.textContent = HOW_TIP[e.target.value] || "";
@@ -1037,6 +1158,15 @@ document.addEventListener("click", async (e) => {
     const r = await post("path-remove", { name });
     toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
     loadPaths(); loadStatus();
+    return;
+  }
+  const tup = e.target.closest("[data-tupload]");
+  if (tup) {
+    tup.disabled = true; toast("اندازه‌گیری آپلود تانل‌های " + tup.dataset.tupload + " ... (حدود یک دقیقه)");
+    const r = await post("tunnel-upload", { name: tup.dataset.tupload });
+    tup.disabled = false;
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadTunnels();
     return;
   }
   const tu = e.target.closest("[data-sgtune]");
@@ -1104,7 +1234,7 @@ document.addEventListener("click", async (e) => {
       loadTunnels(); loadPaths(); loadStatus();
     } else if (d.tup) {
       const i = +d.i; [addrs[i - 1], addrs[i]] = [addrs[i], addrs[i - 1]];
-      tnSave(name, addrs);
+      tnSave(name, addrs, { reordered: true });          // set by hand: the order stays as given
     } else if (d.tdel) {
       addrs.splice(+d.i, 1);
       tnSave(name, addrs);
@@ -1156,13 +1286,14 @@ document.addEventListener("click", async (e) => {
     const cg = f.dataset.fix === "confguard-fix";
     if (!confirm(cg ? "قانون‌های گم‌شده برمی‌گردند و x-ui ری‌استارت می‌شود (چند ثانیه قطعی). ادامه؟"
                     : f.dataset.fix === "kernel-fix" ? "تنظیم‌های TCP کرنل همین حالا اعمال و در /etc/sysctl.d ذخیره می‌شوند تا بعد از ریبوت هم بمانند. ری‌استارت لازم نیست و کاربرها قطع نمی‌شوند. ادامه؟"
+                    : f.dataset.fix === "kernel-all" ? "تنظیم‌های TCP کرنل روی این هاب و همه‌ی سرورهای خارجی که کلید SSH هاب را دارند، فقط جایی که لازم است، اعمال و در /etc/sysctl.d ذخیره می‌شوند. ری‌استارت لازم نیست و کاربرها قطع نمی‌شوند. ادامه؟"
                     : f.dataset.fix === "split-fix" ? "اوت‌باند mux و قانون‌های تقسیم بررسی و تعمیر می‌شوند. اگر فقط اوت‌باند خراب باشد بدون ری‌استارت، وگرنه با ری‌استارت x-ui. قبلش بکاپ گرفته می‌شود. ادامه؟"
                     : "قبل از تعمیر بکاپ گرفته می‌شود. ادامه؟")) return;
     f.disabled = true; toast("در حال تعمیر...");
     const r = await post(f.dataset.fix);
     toast(r.ok ? (r.msg || "تعمیر شد") : "خطا: " + (r.msg || ""));
     if (cg || f.dataset.fix === "split-fix") { loadCG(); loadStatus(); }
-    if (f.dataset.fix === "kernel-fix" && r.ok) $("#run-checkup") && $("#run-checkup").click();
+    if ((f.dataset.fix === "kernel-fix" || f.dataset.fix === "kernel-all") && r.ok) $("#run-checkup") && $("#run-checkup").click();
     loadLint();
     return;
   }
@@ -1327,6 +1458,23 @@ $("#tn-scanall").onclick = async (e) => {
   e.target.disabled = false; e.target.textContent = "اسکن همه";
   toast(`اسکن تمام شد: ${found} آدرس جواب داد`);
   loadTunnels();
+};
+$("#mtu-check").onclick = async (e) => {
+  e.target.disabled = true; toast("در حال سنجش MTU همه‌ی تانل‌ها، هر دو سر ... (یکی دو دقیقه)");
+  const r = await post("mtu-check");
+  e.target.disabled = false;
+  toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+  loadMtu();
+};
+$("#mtu-copy").onclick = () => { navigator.clipboard && navigator.clipboard.writeText(MTU.install || ""); toast("کپی شد"); };
+$("#mtu-host-try").onclick = async (e) => {
+  const addr = $("#mtu-host").value.trim(), port = $("#mtu-port").value.trim() || "22";
+  if (!addr) return;
+  e.target.disabled = true; toast("امتحان SSH به " + addr + " ...");
+  const r = await post("mtu-host", { addr, port });
+  e.target.disabled = false;
+  toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+  loadMtu();
 };
 $("#tn-add").onclick = async () => {
   const name = $("#tn-path").value, addr = $("#tn-addr").value.trim();

@@ -1,0 +1,8 @@
+[Unit]
+Description=MTU guard: tunnels that lose full-size packets get a smaller MTU, both ends
+After=network-online.target x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-mtu auto
+TimeoutStartSec=600

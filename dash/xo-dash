@@ -14,6 +14,7 @@ import collections, http.server, json, os, re, shutil, ssl, subprocess, threadin
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
 import xuimix  # noqa: E402  paths mixed over several tunnels
+import xuiagent  # noqa: E402  kernel settings (here and, through xui-mtu, on the far servers)
 from concurrent.futures import ThreadPoolExecutor
 
 DB, CFG = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/bin/config.json"
@@ -241,6 +242,8 @@ class Metrics(threading.Thread):
                 if xuimix.is_clone(name):        # a mixed path's per-tunnel copy: counted as the path
                     cp[name] = cp.get(name, 0) + d
                     name = xuimix.base_of(name)
+                elif name.startswith("up~"):     # a heavy uploader's copy of a path: counted as the path
+                    name = name[3:]
                 o.setdefault(name, [0, 0])[slot] += d
             elif kind == "inbound" and not name.startswith("guard-") and name != "api":
                 i.setdefault(name, [0, 0])[slot] += d
@@ -684,33 +687,28 @@ def paths_view():
     return jrun("xui-path", "list", "--json", timeout=20) or []
 
 
-# TCP for proxied connections. tcp_notsent_lowat counts as set at any small value: the point is
-# not the Linux default (unlimited); a tunnel like Backhaul sets 32768 itself when it starts.
-KERNEL = {"net.ipv4.tcp_slow_start_after_idle": ("0", None), "net.ipv4.tcp_notsent_lowat": ("16384", (1, 65536)),
-          "net.ipv4.tcp_mtu_probing": ("1", None)}
-KERNEL_FILE = "/etc/sysctl.d/99-proxy-tcp.conf"
+KERNEL_FILE = xuiagent.KERNEL_FILE
+kernel_off = xuiagent.kernel_off
 
 
-def kernel_off():
-    off = []
-    for k, (want, rng) in KERNEL.items():
-        got = run("sysctl", "-n", k, timeout=5)[1].strip()
-        ok = got == want if not rng else got.isdigit() and rng[0] <= int(got) <= rng[1]
-        if not ok:
-            off.append(k)
-    return off
+def kernel_fix(everywhere=False):
+    """Apply the settings now and keep them for the next boot: on this hub, or (everywhere) on
+    every far server xui-mtu reaches over SSH too."""
+    if everywhere:
+        rows = jrun("xui-mtu", "kernel", "--apply", "--json", timeout=300) or []
+        bad = [r["server"] for r in rows if r.get("off")]
+        lost = [r["server"] for r in rows if r.get("off") is None]
+        return {"ok": bool(rows) and not bad, "rows": rows,
+                "msg": "روی %d سرور اعمال و ثبت دائم شد%s%s" % (len(rows) - len(bad) - len(lost),
+                                                             (" · نشد: " + "، ".join(bad)) if bad else "",
+                                                             (" · در دسترس نبود: " + "، ".join(lost)) if lost else "")}
+    r = xuiagent.kernel_fix()
+    return {"ok": r["ok"], "msg": "اعمال و در %s ذخیره شد" % KERNEL_FILE if r["ok"]
+            else "اعمال نشد: " + "، ".join(r["off"]) + " " + r.get("msg", "")}
 
 
-def kernel_fix():
-    """Apply the three now and keep them for the next boot."""
-    lines = ["# xui-optimizer: TCP for proxied connections (users <-> x-ui <-> tunnel <-> abroad)"]
-    lines += ["%s = %s" % (k, v[0]) for k, v in KERNEL.items()]
-    with open(KERNEL_FILE, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    rc, out = run("sysctl", "-p", KERNEL_FILE, timeout=15)
-    off = kernel_off()
-    return {"ok": rc == 0 and not off, "msg": "اعمال و در %s ذخیره شد" % KERNEL_FILE if not off
-            else "اعمال نشد: " + "، ".join(off) + " " + out[-200:]}
+def mtu_view():
+    return jrun("xui-mtu", "status", "--json", timeout=20) or {}
 
 
 def live_tunnel(path):
@@ -758,6 +756,9 @@ def mix_share(hours=1):
 
 def tunnels_view():
     rows = jrun("xui-tunnel", "list", "--json", timeout=40) or []
+    steer = jrun("xui-tunnel", "steer", "--json", timeout=20) or {}
+    for r in rows:
+        r["steer_to"] = (steer.get("to") or {}).get(r.get("name"))
     share = mix_share()
     for r in rows:
         m = r.get("mix") or {}
@@ -766,7 +767,7 @@ def tunnels_view():
         m["share"] = {a: round(100.0 * got.get(i, 0) / total) if total else None
                       for i, a in enumerate(m.get("addrs") or [], 1)}
         m["share_bytes"] = total
-    return rows
+    return {"paths": rows, "steer": steer}
 
 
 def confguard():
@@ -1085,6 +1086,18 @@ def checkup():
         add("ok", "کش DNS", "روشن است؛ جواب‌های تکراری از روی هاب می‌آیند" + extra)
 
     def mtu():
+        m = mtu_view()
+        if m.get("tunnels"):
+            small = [t for t in m["tunnels"] if t.get("state") == "small"]
+            fixed = [t for t in m["tunnels"] if t.get("state") == "fixed"]
+            far = [t for t in m["tunnels"] if t.get("far_iface")]
+            add("warn" if small else "ok", "MTU تانل‌ها (نگهبان MTU)",
+                ("%d تانل بسته‌ی کامل را رد نمی‌کند: %s" % (len(small), "، ".join(t["iface"] for t in small))) if small
+                else "همه‌ی تانل‌ها بسته‌ی کامل را رد می‌کنند" + (" · %d تانل اصلاح شد" % len(fixed) if fixed else "")
+                + " · %d تانل هر دو سر پایش می‌شود" % len(far),
+                "" if not small else ("نگهبان MTU بار بعد دوباره اندازه می‌گیرد و اگر ثابت ماند MTU را کم می‌کند."
+                                      if m.get("auto") else "اصلاح خودکار خاموش است؛ کارت «نگهبان MTU» در ابزارها."))
+            return
         p = (c.get("paths") or {}).get(c.get("primary")) or {}
         if not p.get("peer") or not p.get("iface"):
             return
@@ -1198,10 +1211,17 @@ def checkup():
 
     def kernel():
         off = kernel_off()
-        add("ok" if not off else "warn", "تنظیم‌های کرنل",
-            "هر سه اعمال شده" if not off else "اعمال نشده: " + "، ".join(off),
-            "" if not off else "با دکمه همین حالا اعمال و در %s ذخیره می‌شوند تا بعد از ریبوت هم بمانند." % KERNEL_FILE,
-            "kernel-fix" if off else None)
+        far = (mtu_view().get("kernel") or {}).get("rows") or []
+        far_off = [r for r in far if r.get("addr") and r.get("off")]
+        everywhere = bool(far_off)
+        add("ok" if not off and not far_off else "warn", "تنظیم‌های کرنل",
+            ("روی این هاب اعمال شده" if not off else "روی این هاب اعمال نشده: " + "، ".join(off))
+            + ("" if not far else " · سرورهای خارج: " + "، ".join(
+                "%s %s" % (r["server"], "✓" if r.get("off") == [] else "?" if r.get("off") is None else "✗")
+                for r in far if r.get("addr"))),
+            "" if not off and not far_off else "با دکمه همین حالا روی هاب%s اعمال و در %s ذخیره می‌شوند تا بعد از ریبوت هم بمانند." % (
+                " و همه‌ی سرورهای خارجی که کلید SSH هاب را دارند" if everywhere else "", KERNEL_FILE),
+            ("kernel-all" if everywhere else "kernel-fix") if (off or far_off) else None)
 
     for fn in (clock, xray_test, paths, speed, dns, mtu, machine, cert, subscription, geo, reach, panel,
                config_guard, backup, kernel):
@@ -1256,6 +1276,31 @@ def action(name, body):
         return {"ok": rc == 0, "msg": "report sent" if rc == 0 else out}
     if name == "kernel-fix":
         return kernel_fix()
+    if name == "kernel-all":                     # this hub and every far server reached over SSH
+        return kernel_fix(everywhere=True)
+    if name == "mtu-check":                      # measures every tunnel (both ends): a minute or two
+        rows = jrun("xui-mtu", "check", "--apply", "--json", timeout=600)
+        if rows is None:
+            return {"ok": False, "msg": "انجام نشد"}
+        fixed = [r["iface"] for r in rows if r.get("state") == "fixed"]
+        small = [r["iface"] for r in rows if r.get("state") == "small"]
+        return {"ok": True, "msg": ("اصلاح شد: " + "، ".join(fixed)) if fixed else
+                ("بار اول کوچک‌تر دیده شد، بار بعد تأیید و اصلاح می‌شود: " + "، ".join(small)) if small
+                else "همه‌ی تانل‌ها بسته‌ی کامل را رد می‌کنند"}
+    if name == "mtu-auto":
+        rc, out = run("xui-mtu", "on" if body.get("on") else "off", timeout=15)
+        return {"ok": rc == 0, "msg": "اصلاح خودکار MTU " + ("روشن شد" if body.get("on") else "خاموش شد")}
+    if name == "mtu-host":                       # one more far server: try SSH with the hub's key
+        addr = str(body.get("addr") or "").strip()
+        port = str(body.get("port") or "22").strip()
+        if not re.match(r"^[A-Za-z0-9.:-]{2,64}$", addr) or not port.isdigit():
+            return {"ok": False, "msg": "آدرس نامعتبر"}
+        r = jrun_any("xui-mtu", "host", addr, "--port", port, "--json", timeout=40) or {}
+        return {"ok": bool(r.get("ok")), "msg": ("وصل شد: %s" % (r.get("answer") or {}).get("host", addr)) if r.get("ok")
+                else "SSH وصل نشد؛ کلید عمومی هاب را روی آن سرور در authorized_keys گذاشته‌اید؟"}
+    if name == "steer":
+        rc, out = run("xui-tunnel", "steer", "on" if body.get("on") else "off", timeout=20)
+        return {"ok": rc == 0, "msg": "جابجایی آپلودهای سنگین " + ("روشن شد" if body.get("on") else "خاموش شد")}
     if name == "dns-fast":  # restarts x-ui: the page asks first
         rc, out = run("xui-optimizer", "--dns-fast", "on" if body.get("on") else "off", timeout=150)
         lines = [l for l in out.splitlines() if l.strip()]
@@ -1415,6 +1460,14 @@ def action(name, body):
         if weights:
             cmd[-1:-1] = ["--weights", ",".join(weights)]
         return jrun_any(*cmd, timeout=150) or {"ok": False, "msg": "انجام نشد"}
+    if name in ("tunnel-order", "tunnel-upload"):
+        path = str(body.get("name") or "").strip()
+        if path not in path_order():
+            return {"ok": False, "msg": "این مسیر در فهرست نیست"}
+        if name == "tunnel-order":
+            return jrun_any("xui-tunnel", "order", path, "auto" if body.get("auto") else "manual", "--json", timeout=20) \
+                or {"ok": False, "msg": "ذخیره نشد"}
+        return jrun_any("xui-tunnel", "upload", path, "--json", timeout=300) or {"ok": False, "msg": "اندازه‌گیری نشد"}
     if name in ("tunnel-set", "tunnel-use", "tunnel-test", "tunnel-add", "tunnel-scan"):
         path = str(body.get("name") or "").strip()
         if path not in path_order():
@@ -1427,7 +1480,10 @@ def action(name, body):
             cmd = ["xui-tunnel", "set", path, ",".join(addrs), "--json"]
             if "auto" in body:
                 cmd += ["--auto", "on" if body.get("auto") else "off"]
-            return jrun_any(*cmd, timeout=20) or {"ok": False, "msg": "ذخیره نشد"}
+            r = jrun_any(*cmd, timeout=20) or {"ok": False, "msg": "ذخیره نشد"}
+            if r.get("ok") and body.get("reordered"):        # a person set the order: kept as given
+                run("xui-tunnel", "order", path, "manual", timeout=20)
+            return r
         addr = str(body.get("addr") or "").strip()
         if not re.match(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$", addr):
             return {"ok": False, "msg": "آدرس نامعتبر"}
@@ -1474,7 +1530,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "xo-dash"
     GETS = {"api/status": status, "api/live": lambda: METRICS.snapshot(), "api/users": users_view,
             "api/lint": lint, "api/confguard": confguard, "api/units": units, "api/paths": paths_view,
-            "api/tunnels": tunnels_view, "api/reach": reach_view, "api/speeds": speed_by_inbound}
+            "api/tunnels": tunnels_view, "api/reach": reach_view, "api/speeds": speed_by_inbound,
+            "api/mtu": mtu_view}
 
     def log_message(self, *a):
         pass

@@ -16,6 +16,10 @@
                                             use those tunnels at the same time (first = fallback)
     xui-tunnel mix NAME off                 back to one tunnel at a time (the first of the mix)
     xui-tunnel mix NAME pin ADDR|none       only ADDR for now, without a restart (until x-ui restarts)
+    xui-tunnel order NAME auto|manual       auto: the timer ranks NAME's tunnels itself (upload speed,
+                                            packet loss, stability); manual: the list order, as set
+    xui-tunnel upload NAME [ADDR] [--json]  measure upload speed through NAME's tunnels now
+    xui-tunnel steer [on|off] [--json]      users moved off the busy tunnel for a heavy upload
 
 A GRE tunnel and an AWG tunnel to the same server reach the same Xray listener, only at a
 different address (10.0.1.2 vs 10.0.10.1). So instead of one path per tunnel, a path keeps
@@ -47,7 +51,24 @@ running Xray (its copies are removed through the API; no restart, the panel's te
 untouched) and Telegram is told. It comes back after 3 clean minutes. When every tunnel loses
 alike nothing is taken out: the trouble is past the tunnels. After an x-ui restart the live
 copies are compared with what should run and the exclusion is put back.
+
+Ranking: every 30 minutes each tunnel of a path uploads 6 MB to a speed test (through a
+throwaway Xray, so no user is billed for it), every minute each one is pinged (25 pings), and each
+check is remembered as answered or not. A tunnel's score is its upload speed (median of the last
+three), cut by its packet loss (20% loss = nothing left) and by its instability (answered share,
+squared). With the order on auto the path moves to the best tunnel when it scores a quarter better
+than the current one three minutes running, at most every 30 minutes; a dead tunnel is left for
+the best one that answers. Moving the path by hand, or reordering its list, turns the order to
+manual (the list as given) until it is set to auto again.
+
+Heavy upload: every minute the users' upload counters are read from Xray (read only: the panel's
+billing counts on them and they are never reset). A user uploading 4 Mbit/s or more (heavy_up_mbps)
+for two minutes running gets their own rules, ahead of the path's rules, to a copy of the path on
+its best other tunnel - new connections of that user only, so a big upload does not fill the
+tunnel everyone shares and gets a free one. Ten quiet minutes later the rules go. Changed live
+(xuilive, no restart), never while the guard has failed the primary path over.
 """
+import contextlib, statistics
 import glob, ipaddress, json, os, re, shutil, socket, subprocess, sys, syslog, tempfile, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
 import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL, as x-ui itself uses it
@@ -74,6 +95,20 @@ LOSS_MIN_ROUNDS = 3     # no verdict on less than this
 LOSS_BAD = 3.0          # % lost: leaves the mix ...
 LOSS_MARGIN = 2.0       # ... when also this many points worse than the cleanest tunnel
 LOSS_BACK_ROUNDS = 3    # clean rounds (at most one ping lost in all) before it comes back
+UP_URL = "https://speed.cloudflare.com/__up"
+UP_BYTES = 6 << 20      # one upload measurement
+UP_EVERY = 1800         # each path's tunnels are measured this often
+UP_KEEP = 6
+OK_KEEP = 20            # answered / not, per tunnel, for stability
+RANK_BETTER = 1.25      # a tunnel this much better than the current one ...
+RANK_ROUNDS = 3         # ... this many minutes running ...
+RANK_GAP = 1800         # ... and not sooner than this after the last move
+LOSS_ZERO = 20.0        # % loss that leaves nothing of a tunnel's score
+STEER = "up~"           # outbound copies for heavy uploaders: up~NAME
+HEAVY_MBPS = 4.0        # a user uploading this fast ...
+HEAVY_ROUNDS = 2        # ... for this many minutes is moved
+CALM = 600              # back after this long below half of it
+STEER_MAX = 6           # users moved at once, at most
 ADDR_OK = re.compile(r"^[A-Za-z0-9.:-]{2,64}(@[A-Za-z0-9_.-]{1,15})?$")   # ADDR or ADDR@tun
 
 
@@ -374,11 +409,15 @@ def listing():
         mix["loss"] = (st.get(name) or {}).get("loss_pct") or {}
         mix["out"] = (st.get(name) or {}).get("mix_out") or []
         mix["rtt"] = (st.get(name) or {}).get("rtt") or {}
+        ps = st.get(name) or {}
+        rank = ranked(addrs, ps) if measured(addrs, ps) else []
         rows.append({
             "name": name, "current": addr, "port": port, "auto": bool(spec.get("auto")), "mix": mix,
-            "managed": bool(addrs),
-            "addrs": [dict(addr=a, iface=info(a).get("iface") or route_of(a)[0], kind=info(a).get("kind") or route_of(a)[1],
-                           carrier=info(a).get("carrier", ""), live=a == addr, test=tests.get(a)) for a in addrs],
+            "managed": bool(addrs), "order": spec.get("order") or "auto", "rank": rank, "up_at": ps.get("up_at"),
+            "addrs": [dict(score(ps, a), addr=a, iface=info(a).get("iface") or route_of(a)[0],
+                           kind=info(a).get("kind") or route_of(a)[1], carrier=info(a).get("carrier", ""),
+                           live=a == addr, test=tests.get(a), place=(rank.index(a) + 1) if a in rank else None)
+                      for a in addrs],
             "offer": [x for x in cand if x.get("new")],
             "scanned": scan.get("at"),
             "last": (st.get(name) or {}).get("events", [])[-5:],
@@ -396,12 +435,15 @@ def free_port():
     return p
 
 
-def test(name, addr, cfg=None):
-    """Start a throwaway Xray with NAME's outbound pointed at ADDR and fetch a page through it."""
+@contextlib.contextmanager
+def throwaway(name, addr, cfg=None):
+    """A throwaway Xray with NAME's outbound pointed at ADDR: yields its local socks port (None
+    when there is no such outbound). Nothing here is a user's traffic, nothing is billed."""
     cfg = cfg or load(CFG, {})
     o = next((x for x in cfg.get("outbounds", []) if x.get("tag") == name), None)
     if not o:
-        return {"ok": False, "ms": None, "err": "no outbound " + name}
+        yield None
+        return
     o = json.loads(json.dumps(o))
     set_addr(o, addr)
     o["tag"] = "t"
@@ -417,7 +459,19 @@ def test(name, addr, cfg=None):
     p = subprocess.Popen([XRAY, "run", "-c", path], cwd=BIN, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(0.8)
-        res = {"ok": False, "ms": None}
+        yield port
+    finally:
+        p.kill()
+        p.wait()
+        os.remove(path)
+
+
+def test(name, addr, cfg=None):
+    """Start a throwaway Xray with NAME's outbound pointed at ADDR and fetch a page through it."""
+    res = {"ok": False, "ms": None}
+    with throwaway(name, addr, cfg) as port:
+        if not port:
+            return dict(res, err="no outbound " + name, at=int(time.time()))
         for _ in range(2):
             rc, out = run("curl", "-s", "-o", "/dev/null", "-m", "8", "--socks5-hostname", "127.0.0.1:%d" % port,
                           "-w", "%{http_code} %{time_total}", TEST_URL, timeout=12)
@@ -426,12 +480,262 @@ def test(name, addr, cfg=None):
                 res = {"ok": True, "ms": int(float(parts[1]) * 1000)}
                 break
             time.sleep(1)
-    finally:
-        p.kill()
-        p.wait()
-        os.remove(path)
     res["at"] = int(time.time())
     return res
+
+
+# ---------------------------------------------------------------- upload speed and ranking
+
+def blob():
+    path = "/var/lib/tunnel-guard/upload.bin"
+    if not os.path.exists(path) or os.path.getsize(path) != UP_BYTES:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(os.urandom(UP_BYTES))            # random: nothing on the way can compress it
+    return path
+
+
+def upload(name, addr, cfg=None):
+    """Upload speed (Mbit/s) through NAME on ADDR, or None. TLS setup is left out of the time."""
+    with throwaway(name, addr, cfg) as port:
+        if not port:
+            return None
+        rc, out = run("curl", "-s", "-o", "/dev/null", "-m", "15", "--socks5-hostname", "127.0.0.1:%d" % port,
+                      "-H", "Content-Type: application/octet-stream", "--data-binary", "@" + blob(),
+                      "-w", "%{http_code} %{size_upload} %{time_total} %{time_pretransfer}", UP_URL, timeout=22)
+    p = out.split()
+    try:
+        size, total, pre = int(float(p[1])), float(p[2]), float(p[3])
+    except (IndexError, ValueError):
+        return None
+    if size < (1 << 20) or total - pre <= 0:
+        return None
+    return round(size * 8 / (total - pre) / 1e6, 1)
+
+
+def remember(s, addr, ok):
+    h = s.setdefault("okhist", {}).setdefault(addr, [])
+    h.append(1 if ok else 0)
+    del h[:-OK_KEEP]
+
+
+def measure_uploads(name, addrs, s, cfg=None, force=False):
+    """Each tunnel in turn (one at a time, so they do not share the hub's uplink). A tunnel whose
+    pings all went unanswered last round is not waited on: it counts as failed."""
+    now = int(time.time())
+    if not force and now - s.get("up_at", 0) < UP_EVERY:
+        return False
+    s["up_at"] = now
+    cfg = cfg or load(CFG, {})
+    for a in addrs:
+        last = ((s.get("loss") or {}).get(a) or [[1, 1]])[-1]
+        mbps = upload(name, a, cfg) if force or last[1] > 0 else None
+        remember(s, a, mbps is not None)
+        h = s.setdefault("up", {}).setdefault(a, [])
+        h.append([now, mbps])
+        del h[:-UP_KEEP]
+    for a in list(s.get("up") or {}):
+        if a not in addrs:
+            s["up"].pop(a)
+    return True
+
+
+def score(s, a, load=0.0):
+    """{"up", "loss", "stab", "score"} for tunnel a of a path (state s). `load`: what users upload
+    through it right now (Mbit/s), which its own measurement had to share the tunnel with."""
+    ups = [x[1] for x in ((s.get("up") or {}).get(a) or [])[-3:] if x[1] is not None]
+    up = round(statistics.median(ups) + load, 1) if ups else None
+    loss = (s.get("loss_pct") or {}).get(a) or 0.0
+    hist = (s.get("okhist") or {}).get(a) or []
+    stab = sum(hist) / len(hist) if hist else 0.5
+    sc = (up if up is not None else 0.0) * max(0.0, 1 - loss / LOSS_ZERO) * stab ** 2
+    return {"up": up, "loss": loss, "stab": round(stab, 2), "score": round(sc, 2)}
+
+
+def ranked(addrs, s):
+    """addrs best first; ties (nothing measured yet) keep the list order."""
+    sc = {a: score(s, a)["score"] for a in addrs}
+    return sorted(addrs, key=lambda a: (-sc[a], addrs.index(a)))
+
+
+def measured(addrs, s):
+    """Enough to rank on: an upload result for at least two of the tunnels."""
+    return sum(1 for a in addrs if any(x[1] is not None for x in ((s.get("up") or {}).get(a) or []))) >= 2
+
+
+def rank_move(name, cur, pref, st, cfg, now):
+    """Order on auto: go to the best-ranked tunnel when it stays clearly better. The current
+    tunnel's measurement shared it with the users, so their upload is added back to it."""
+    s = st[name]
+    best = pref[0]
+    if best == cur:
+        s["rank_oks"] = 0
+        return False
+    load = (st.get("_users") or {}).get("total_mbps") or 0.0
+    b = score(s, best)
+    c = score(s, cur, load)["score"] if cur in pref else 0.0
+    if not (b["score"] > 0 and b["score"] >= RANK_BETTER * c + 0.01):
+        s["rank_oks"] = 0
+        return False
+    s["rank_oks"] = s.get("rank_oks", 0) + 1
+    if s["rank_oks"] < RANK_ROUNDS or now - s.get("last_switch", 0) < RANK_GAP:
+        return False
+    r = test(name, best, cfg)
+    remember(s, best, r["ok"])
+    s["rank_oks"] = 0
+    if not r["ok"]:
+        return False
+    save(STATE, st)
+    use(name, best, "ranked better: up %s Mbit/s, loss %s%%" % (b["up"], b["loss"]))
+    telegram("📈 %s: تانل %s بهتر است (آپلود %s Mbit/s، پکت لاست %s٪، پایداری %d٪)؛ مسیر بدون ری‌استارت روی آن رفت."
+             % (name, best, b["up"], b["loss"], b["stab"] * 100))
+    return True
+
+
+# ---------------------------------------------------------------- heavy uploaders
+
+def user_uplinks(cfg):
+    """{email: bytes uploaded since Xray started}. Read only: no -reset, the panel bills on these."""
+    rc, out = run(XRAY, "api", "statsquery", "--server=" + api_addr(cfg), "-pattern", "user>>>", timeout=15)
+    got = {}
+    try:
+        for x in json.loads(out).get("stat") or []:
+            p = x.get("name", "").split(">>>")
+            if len(p) == 4 and p[3] == "uplink":
+                got[p[1]] = int(x.get("value") or 0)
+    except ValueError:
+        return None
+    return got
+
+
+def steer_targets(c, st):
+    """{path: tunnel address} a heavy uploader of that path is moved to: its best tunnel other than
+    the one in use, answering at its last test. Single-tunnel paths with two or more tunnels only;
+    not the primary while the guard has failed it over."""
+    guard = load("/var/lib/tunnel-guard/state.json", {})
+    cfg = load(CFG, {})
+    outs = {o.get("tag"): o for o in cfg.get("outbounds", [])}
+    got = {}
+    for name, spec in (c.get("tunnels") or {}).items():
+        addrs = spec.get("addrs") or []
+        if len(addrs) < 2 or xuimix.spec_of(c, name) or name not in outs:
+            continue
+        if name == c.get("primary") and guard.get("failed_over"):
+            continue
+        s = st.get(name) or {}
+        cur = addr_of(outs[name])[0]
+        smart = measured(addrs, s)
+        alive = lambda a: ((s.get("okhist") or {}).get(a) or [0])[-1] == 1 or ((s.get("tests") or {}).get(a) or {}).get("ok")
+        pick = [a for a in (ranked(addrs, s) if smart else addrs)
+                if a != cur and alive(a) and (not smart or score(s, a)["score"] > 0)]
+        if pick:
+            got[name] = pick[0]
+    return got
+
+
+def steer_template(t, moves):
+    """The template with heavy uploaders' rules: for each path NAME in moves {NAME: (addr, users)},
+    an outbound up~NAME (NAME aimed at addr) and, ahead of every rule that sends to NAME or NAME-mux,
+    the same rule for those users only, sent to up~NAME. Earlier ones are taken out first."""
+    t["outbounds"] = [o for o in t.get("outbounds", []) if not (o.get("tag") or "").startswith(STEER)]
+    rules = [r for r in (t.get("routing") or {}).get("rules") or [] if not (r.get("outboundTag") or "").startswith(STEER)]
+    outs = {o.get("tag"): o for o in t["outbounds"]}
+    for name, (addr, users) in sorted(moves.items()):
+        if name not in outs or not users:
+            continue
+        o = json.loads(json.dumps(outs[name]))
+        o["tag"] = STEER + name
+        set_addr(o, addr)
+        t["outbounds"].append(o)
+        out = []
+        for r in rules:
+            if r.get("outboundTag") in (name, name + "-mux") and "user" not in r and r.get("enabled") is not False:
+                out.append(dict({k: v for k, v in r.items() if k not in ("ruleTag", "outboundTag", "comment")},
+                                user=sorted(users), outboundTag=STEER + name))
+            out.append(r)
+        rules = out
+    t.setdefault("routing", {})["rules"] = rules
+    return t
+
+
+def steer(c, now):
+    """Who uploads heavily right now, and moving them (see the top)."""
+    cfg = load(CFG, {})
+    st = load(STATE, {})
+    up = user_uplinks(cfg)
+    if up is None:
+        return
+    u = st.setdefault("_users", {})
+    prev, dt, pid = u.get("up") or {}, now - u.get("t", 0), xray_pid()
+    u.update(t=now, up=up)
+    if not prev or not 20 <= dt <= 600 or u.get("pid") != pid:      # a restart zeroes the counters
+        u["pid"] = pid
+        save(STATE, st)
+        return
+    rate = {e: (v - prev[e]) * 8 / dt / 1e6 for e, v in up.items() if e in prev and v >= prev[e]}
+    u["total_mbps"] = round(sum(rate.values()), 1)
+    limit = float(c.get("heavy_up_mbps") or HEAVY_MBPS)
+    heavy = u.setdefault("heavy", {})
+    for e in list(heavy):
+        if rate.get(e, 0) < limit:
+            heavy.pop(e)
+    for e, r in rate.items():
+        if r >= limit:
+            heavy[e] = heavy.get(e, 0) + 1
+    u["top"] = sorted(([e, round(r, 1)] for e, r in rate.items() if r >= 0.5), key=lambda x: -x[1])[:8]
+    moved = st.setdefault("_steer", {})
+    for e, m in list(moved.items()):
+        if rate.get(e, 0) >= limit / 2:
+            m["seen"], m["mbps"] = now, round(rate.get(e, 0), 1)
+        elif now - m.get("seen", 0) >= CALM:
+            moved.pop(e)
+    for e in sorted(heavy, key=lambda e: -rate[e]):
+        if heavy[e] >= HEAVY_ROUNDS and e not in moved and len(moved) < STEER_MAX:
+            moved[e] = {"since": now, "seen": now, "mbps": round(rate[e], 1)}
+    if c.get("steer") is False:
+        moved.clear()
+    targets = steer_targets(c, st) if moved else {}
+    want = {n: (a, sorted(moved)) for n, a in targets.items()}
+    before = {n: (a, sorted(us)) for n, (a, us) in (u.get("applied") or {}).items()}
+    tpl_has = any((o.get("tag") or "").startswith(STEER) for o in cfg.get("outbounds", []))
+    if want == before and bool(want) == tpl_has:
+        save(STATE, st)
+        return
+    old = template()
+    new = steer_template(json.loads(json.dumps(old)), want)
+    if new != old:
+        write_template(new)
+        try:
+            xuilive.apply(new, old, allow_restart=False)
+        except xuilive.Failed as e:                      # never restart Xray for this
+            write_template(old)
+            log("heavy upload: not applied live (%s); left as it was" % e)
+            save(STATE, st)
+            return
+        run("config-guard", "--save", timeout=30)
+    u["applied"] = {n: [a, us] for n, (a, us) in want.items()}
+    st.setdefault("_steer_log", []).append({"t": now, "to": {n: a for n, (a, _) in want.items()}, "users": sorted(moved)})
+    st["_steer_log"] = st["_steer_log"][-20:]
+    save(STATE, st)
+    log("heavy upload: %s" % ((", ".join("%s -> %s" % (n, a) for n, (a, _) in want.items()) + " for " +
+                                ", ".join(sorted(moved))) if want else "nobody moved"))
+
+
+def track_loss(addrs, s):
+    """Loss over the last minutes for every tunnel of a single-tunnel path (a mix has its own)."""
+    with ThreadPoolExecutor(max_workers=max(1, len(addrs))) as ex:
+        got = dict(zip(addrs, ex.map(ping_loss, addrs)))
+    hist = s.setdefault("loss", {})
+    for a in list(hist):
+        if a not in addrs:
+            hist.pop(a)
+    for a, r in got.items():
+        if r:
+            hist.setdefault(a, []).append([r[0], r[1]])
+            hist[a] = hist[a][-LOSS_WINDOW:]
+            s.setdefault("rtt", {})[a] = r[2]
+    s["loss_pct"] = {a: loss_pct(hist.get(a) or []) for a in addrs}
+    return got
 
 
 def scan(name, save_found=False, extra=()):
@@ -593,6 +897,12 @@ def use(name, addr, why="by hand"):
     s.setdefault("events", []).append({"t": int(time.time()), "from": old, "to": addr, "why": why})
     s["events"] = s["events"][-20:]
     save(STATE, st)
+    if why == "by hand":                    # a person chose: the timer keeps the list order from now on
+        c = conf()
+        spec = c.setdefault("tunnels", {}).setdefault(name, {})
+        if spec.get("order", "auto") != "manual":
+            spec["order"] = "manual"
+            save(GUARD_CONF, c)
     log("%s: %s -> %s (%s)%s" % (name, old, addr, why, "" if hot else " - via x-ui restart"))
     return {"ok": True, "msg": "%s از %s به %s رفت%s" % (name, old, addr, "" if hot else " (با ری‌استارت x-ui)")}
 
@@ -642,7 +952,7 @@ def rescan_all():
 
 def auto():
     c, st = conf(), load(STATE, {})
-    now = int(time.time())
+    now, due = int(time.time()), []
     for name, spec in (c.get("tunnels") or {}).items():
         mx = xuimix.spec_of(c, name)
         if mx:
@@ -662,17 +972,27 @@ def auto():
         cur, _ = addr_of(o)
         s = st.setdefault(name, {})
         tests = s.setdefault("tests", {})
+        try:
+            track_loss(addrs, s)
+        except Exception as e:                           # never let a measurement stop the timer
+            log("%s: loss check failed: %s" % (name, e))
+        if now - s.get("up_at", 0) >= UP_EVERY:
+            due.append((name, addrs))
+        smart = spec.get("order", "auto") != "manual" and measured(addrs, s)
+        pref = ranked(addrs, s) if smart else addrs
         ok = probe_live(name, cfg)
         if ok is None:
             ok = test(name, cur, cfg)["ok"]
         tests[cur] = {"ok": ok, "at": now, "ms": None, "live": True}
+        remember(s, cur, ok)
         if not ok:
             s["fails"] = s.get("fails", 0) + 1
             s["back_oks"] = 0
             if now - s.get("last_switch", 0) < SWITCH_GAP:
                 continue
-            for a in [x for x in addrs if x != cur]:
+            for a in [x for x in pref if x != cur]:
                 r = tests[a] = test(name, a, cfg)
+                remember(s, a, r["ok"])
                 if r["ok"]:
                     save(STATE, st)
                     use(name, a, "tunnel %s stopped answering" % cur)
@@ -684,6 +1004,10 @@ def auto():
                 log("%s: %s is down and no other tunnel answered" % (name, cur))
             continue
         s["fails"] = 0
+        if smart:
+            if rank_move(name, cur, pref, st, cfg, now):
+                st = load(STATE, {})
+            continue
         better = addrs[:addrs.index(cur)] if cur in addrs else addrs
         if not better or now - s.get("last_switch", 0) < RETURN_GAP:
             continue
@@ -695,6 +1019,17 @@ def auto():
             st = load(STATE, {})
             telegram("✅ %s: تانل ترجیحی %s سالم است؛ اوت‌باند به آن برگشت." % (name, better[0]))
     save(STATE, st)
+    for name, addrs in due:          # after any move: a dead tunnel is left first, measured after
+        try:
+            st = load(STATE, {})
+            measure_uploads(name, addrs, st.setdefault(name, {}))
+            save(STATE, st)
+        except Exception as e:
+            log("%s: upload measurement failed: %s" % (name, e))
+    try:
+        steer(c, now)
+    except Exception as e:
+        log("heavy upload check failed: %s" % e)
     rescan_all()
 
 
@@ -991,6 +1326,43 @@ def watch_loss(name, spec, st):
     return out
 
 
+def set_order(name, order):
+    if order not in ("auto", "manual"):
+        raise ValueError("ترتیب: auto یا manual")
+    c = conf()
+    spec = (c.get("tunnels") or {}).get(name)
+    if spec is None:
+        raise ValueError("%s تانلی در فهرست ندارد" % name)
+    spec["order"] = order
+    save(GUARD_CONF, c)
+    return {"ok": True, "msg": "ترتیب تانل‌های %s: %s" % (
+        name, "خودکار (بر اساس سرعت آپلود، پکت لاست و پایداری)" if order == "auto" else "دستی (همان ترتیب فهرست)")}
+
+
+def upload_now(name, addr=None):
+    c, st = conf(), load(STATE, {})
+    addrs = [addr] if addr else (((c.get("tunnels") or {}).get(name) or {}).get("addrs") or [])
+    if not addrs:
+        raise ValueError("%s تانلی در فهرست ندارد" % name)
+    s = st.setdefault(name, {})
+    keep = s.get("up_at")
+    measure_uploads(name, addrs, s, force=True)
+    if addr:
+        s["up_at"] = keep or s["up_at"]
+    save(STATE, st)
+    rows = [dict(score(s, a), addr=a, last=((s.get("up") or {}).get(a) or [[0, None]])[-1][1]) for a in addrs]
+    return {"ok": True, "rows": rows, "msg": "، ".join("%s: %s" % (r["addr"], "%s Mbit/s" % r["last"] if r["last"]
+                                                                    else "نشد") for r in rows)}
+
+
+def steer_view():
+    st, c = load(STATE, {}), conf()
+    u = st.get("_users") or {}
+    return {"on": c.get("steer") is not False, "limit": float(c.get("heavy_up_mbps") or HEAVY_MBPS),
+            "moved": st.get("_steer") or {}, "to": {n: a for n, (a, _) in (u.get("applied") or {}).items()},
+            "total_mbps": u.get("total_mbps"), "top": u.get("top") or [], "log": (st.get("_steer_log") or [])[-5:]}
+
+
 def set_addrs(name, addrs, auto_flag):
     c = conf()
     order = [n for n in [c.get("primary")] + (c.get("backups") or []) if n]
@@ -1059,6 +1431,20 @@ def main():
             out(dict(d, ok=True, reachable=d["ok"]), "ok %s ms" % d["ms"] if d["ok"] else "no answer")
         elif mode == "auto":
             auto()
+        elif mode == "order" and len(args) >= 3:
+            d = set_order(args[1], args[2])
+            out(d, d["msg"])
+        elif mode == "upload" and len(args) >= 2:
+            d = upload_now(args[1], args[2] if len(args) > 2 else None)
+            out(d, d["msg"])
+        elif mode == "steer":
+            if len(args) >= 2 and args[1] in ("on", "off"):
+                c = conf()
+                c["steer"] = args[1] == "on"
+                save(GUARD_CONF, c)
+            d = steer_view()
+            out(d, "heavy upload moving %s (%s Mbit/s); moved now: %s" % (
+                "on" if d["on"] else "off", d["limit"], ", ".join(d["moved"]) or "nobody"))
         elif mode == "mix" and len(args) >= 2:
             name, sub = args[1], (args[2] if len(args) > 2 else "")
             opt = lambda k, d=None: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else d

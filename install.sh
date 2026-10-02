@@ -28,15 +28,15 @@ REPO=MaxTeller95/xui-optimizer
 HOME_DIR=/opt/xui-optimizer
 DEST=/usr/local/sbin
 TOOLS="xui-optimizer split/xui-split abroad/abroad-tune
-       guard/tunnel-guard guard/config-guard guard/xui-path guard/xui-tunnel guard/awg-hop guard/awg-port
+       guard/tunnel-guard guard/config-guard guard/xui-path guard/xui-tunnel guard/xui-mtu guard/awg-hop guard/awg-port
        tools/mux-bench tools/xui-fix-inbound-lists tools/xui-probe-client tools/path-score
        tools/xui-reach tools/xui-geo tools/xui-cert tools/xui-subpage"
 UNITS="guard/tunnel-guard.service guard/tunnel-guard.timer
        guard/config-guard.service guard/config-guard.path guard/config-guard.timer
-       guard/xui-tunnel.service guard/xui-tunnel.timer
+       guard/xui-tunnel.service guard/xui-tunnel.timer guard/xui-mtu.service guard/xui-mtu.timer
        tools/xui-reach.service tools/xui-reach.timer tools/xui-geo.service tools/xui-geo.timer
        tools/xui-subpage.service tools/xui-subpage.path split/xui-split-tune.service split/xui-split-tune.timer"
-TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer xui-reach.timer xui-geo.timer xui-subpage.path xui-split-tune.timer"
+TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer xui-mtu.timer xui-reach.timer xui-geo.timer xui-subpage.path xui-split-tune.timer"
 
 red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 inf() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -67,6 +67,7 @@ if [ -n "$UNINSTALL" ]; then
   for f in $TOOLS; do rm -f "$DEST/$(basename "$f")"; done
   for u in $UNITS; do rm -f "/etc/systemd/system/$(basename "$u")"; done
   rm -f /etc/systemd/system/xo-dash.service
+  rm -f /etc/cron.d/xui-mtu /etc/xui-mtu.pins     # MTUهایی که تنظیم شده‌اند در فایل تانل‌ها می‌مانند
   if [ -f /etc/nginx/conf.d/xo-dash.conf ]; then
     rm -f /etc/nginx/conf.d/xo-dash.conf
     nginx -t 2>/dev/null && systemctl reload nginx || true
@@ -180,6 +181,8 @@ xui-optimizer ($ver) نصب شد. قدم‌های بعدی (هر ابزار او
   nano /etc/tunnel-guard.json && tunnel-guard --check && systemctl enable --now tunnel-guard.timer
   config-guard && systemctl enable --now config-guard.path config-guard.timer
   systemctl enable --now xui-tunnel.timer         # جابجایی خودکار بین تانل‌های یک سرور
+  xui-mtu key && systemctl enable --now xui-mtu.timer   # MTU تانل‌ها، هر دو سر (کلید را روی سرورهای خارج بگذارید)
+  xui-mtu kernel --apply                          # تنظیم‌های TCP روی هاب و همه‌ی سرورهای خارج
   systemctl enable --now xui-reach.timer          # دسترسی هاب از داخل ایران، هر ۱۰ دقیقه
   xui-geo update --restart && systemctl enable --now xui-geo.timer   # فهرست‌های ایران، هفتگی
   xui-cert status                                 # گواهی‌ها؛ تمدید خودکار: xui-cert auto DOMAIN --dns dns_arvan

@@ -1,0 +1,10 @@
+[Unit]
+Description=Measure every tunnel's MTU every 5 minutes
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=300
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target

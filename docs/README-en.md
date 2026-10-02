@@ -469,6 +469,53 @@ working. `MAIN-mux` is mixed the same way. A loopback outbound in front of the b
 have left the rules alone, but Xray counts loopback traffic against the same user a second time
 and quotas would run out twice as fast. Shared code: `lib/xuimix.py`.
 
+### Upload speed, automatic ranking and heavy uploads
+
+Every 30 minutes each tunnel of a path uploads 6 MB of random data to speed.cloudflare.com
+through a throwaway Xray (no user's traffic, billed to nobody), one tunnel at a time; a tunnel
+whose pings go unanswered is not waited on. The page shows a separate "upload speed" bar per
+tunnel, with loss, stability and rank; ⇡ measures now (`xui-tunnel upload NAME`).
+
+Score = upload (median of the last three) x (1 - loss/20%) x stability² (share of checks that
+answered). The current tunnel shares its measurement with the users, so their upload is added
+back to it. With the order on auto, a tunnel a quarter better than the current one for three
+minutes running (and 30 minutes after the last move) takes the path, live, and Telegram is told;
+a dead tunnel is left for the best one that answers. Moving the path by hand or reordering its
+list makes the order manual until it is set back: `xui-tunnel order NAME auto|manual`.
+
+Heavy uploads: every minute the users' upload counters are read (read only, never reset: the
+panel bills on them). A user uploading 4 Mbit/s or more (`heavy_up_mbps`) two minutes running
+gets rules of their own, ahead of the path's rules, to a copy of the path on its best other
+tunnel (`up~NAME`) - new connections of that user only - and loses them after ten quiet minutes.
+Live (xuilive), never while the guard has failed the primary over. `xui-tunnel steer on|off`.
+Billing is unchanged: Xray counts bytes per user, not per outbound.
+
+## xui-mtu - MTU guard, both ends of every tunnel
+
+A tunnel whose MTU is larger than its path carries passes pings and small packets and loses
+full-size ones: pages stall while the tunnel looks alive. Every 5 minutes `xui-mtu` sends Don't
+Fragment pings through each tunnel at its MTU; when they pass nothing is touched. When they do
+not, the biggest size that passes is searched (four tries per size, so loss is not mistaken
+for a small path), the far end is measured the other way over SSH, and only after the same
+result twice is the MTU lowered on both ends. Lowering does not drop open connections.
+
+- A tunnel carrying traffic is never raised automatically; an idle one that was lowered is
+  tried at its old MTU every 6 hours.
+- Tunnels inside tunnels are measured after the outer one; TCP-carried tunnels (AWG over
+  wstunnel, Backhaul, sing-box) cannot blackhole and are left alone.
+- A tunnel another MTU guard looks after (mtu-guard, gre-mtu-guard, mh-mtu-guard, on either
+  end), or whose MTU something else changed (for a day), is left alone.
+- A change is written where the tunnel is made (systemd unit, awg/wg config) and pinned in
+  `/etc/xui-mtu.pins`, re-applied every 5 minutes by cron.
+
+Far servers are reached with the hub's own key (`/etc/xui-optimizer/ssh/id_ed25519`), at the
+public address first, then through the tunnels; nothing is installed there - `lib/xuiagent.py`
+is sent on each call and run with the server's python3. `xui-mtu key` prints the key and the
+line to add it; `xui-mtu kernel [--apply]` checks (and sets, only where needed) the TCP settings
+on the hub and every far server reached.
+
+    xui-mtu status | check [--apply] | key | host ADDR | kernel [--apply] | on | off
+
 ## xui-reach, xui-geo, xui-cert
 
 - **xui-reach** - every probe the hub runs goes outwards, but a user's outage is often on the

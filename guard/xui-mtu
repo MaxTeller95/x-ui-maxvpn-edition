@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""xui-mtu - MTU guard for every tunnel of this hub, both ends, plus the kernel settings everywhere.
+
+    xui-mtu status [--json]          tunnels, their MTU, what last got through, the far servers
+    xui-mtu check [--apply] [--json] measure every tunnel now; --apply fixes what is wrong
+    xui-mtu auto                     what the timer runs (every 5 minutes): check --apply, quietly
+    xui-mtu key                      this hub's SSH key for the far servers, and how to install it
+    xui-mtu host ADDR [--port N] [--user U]
+                                     try (and remember) SSH to a far server at ADDR
+    xui-mtu kernel [--apply] [--json]
+                                     the TCP settings on this hub and on every far server reached
+    xui-mtu on|off                   the timer's MTU fixing (measuring for the page goes on)
+
+Why: a tunnel whose MTU is bigger than its path can carry passes pings and small packets but
+loses full-size ones - a "blackhole": pages stall, speed collapses, a tunnel looks alive and
+works badly. That is what happened to Geneve over a path that carried only 1349 bytes.
+
+How it measures, without bothering users: pings with Don't Fragment, through the tunnel, at the
+tunnel's MTU. When those get through nothing is touched. When small ones do and full-size ones
+do not (four tries per size, so packet loss is not taken for a small path), the biggest size that
+gets through is searched (between 576 and the MTU) and found twice in a row before anything
+changes. The far end is measured the same way over SSH, in the other direction.
+
+What it changes: only the MTU of that tunnel, only downward on a tunnel that carries traffic (a
+lower MTU is taken by running connections without dropping them; TCP just sends smaller
+segments), both ends to the same value. A tunnel that was lowered and carries nothing (no path
+on it, no other tunnel inside it) is tried at its old MTU again every 6 hours and goes back up
+when that gets through. Tunnels inside tunnels are measured after the one that carries them. A
+tunnel riding TCP (AWG through wstunnel, a Backhaul or sing-box tun) cannot blackhole and is
+left alone, and so is a tunnel another MTU guard looks after (mtunnel's mtu-guard,
+gre-mtu-guard, mh-mtu-guard - on either end), or whose MTU something else changed (hands off for
+a day): two guards on one tunnel would push it back and forth. Each change is written where the tunnel is made (its systemd unit, its awg/wg
+config) and pinned (/etc/xui-mtu.pins, re-applied every 5 minutes by cron), on both servers.
+
+Far servers: reached over SSH with this hub's own key (/etc/xui-optimizer/ssh/id_ed25519), tried
+at the server's public address, then through each tunnel to it. Nothing is installed there: the
+helper (xuiagent.py) is sent on each call and run with the server's own python3.
+"""
+import ipaddress, json, os, re, subprocess, sys, syslog, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuiagent  # noqa: E402  the per-server part, run here and sent to the far servers
+
+KEY = "/etc/xui-optimizer/ssh/id_ed25519"
+CONF = "/etc/xui-optimizer/mtu.json"         # {"auto": true, "hosts": {ADDR: {"port": 22, "user": "root"}}}
+STATE = "/var/lib/xui-optimizer/mtu.json"
+CFG = "/usr/local/x-ui/bin/config.json"
+AGENT = xuiagent.__file__
+UDP_KINDS = ("gre", "gretap", "ipip", "sit", "geneve", "vxlan", "wireguard", "amneziawg", "ip6gre", "ip6tnl")
+RAISE_EVERY = 6 * 3600
+HOST_RECHECK = 1800          # a server that did not answer SSH is tried again after this long
+PROXY = ("vless", "vmess", "trojan", "shadowsocks")
+
+
+def run(*cmd, timeout=20, data=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=data)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def log(msg):
+    syslog.openlog("xui-mtu")
+    syslog.syslog(msg)
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+
+
+# ---------------------------------------------------------------- SSH to the far servers
+
+def key():
+    if not os.path.exists(KEY):
+        os.makedirs(os.path.dirname(KEY), mode=0o700, exist_ok=True)
+        run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "xui-optimizer@" + run("hostname")[1], "-f", KEY)
+    return open(KEY + ".pub").read().strip()
+
+
+def ssh(addr, args, timeout=60, port=None, user=None):
+    """Run the agent on ADDR: (ok, parsed answer or error text)."""
+    h = (load(CONF, {}).get("hosts") or {}).get(addr) or {}
+    port, user = port or h.get("port") or 22, user or h.get("user") or "root"
+    cmd = ["ssh", "-i", KEY, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+           "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
+           "-p", str(port), "%s@%s" % (user, addr), "python3", "-"] + list(args)
+    rc, out = run(*cmd, timeout=timeout, data=open(AGENT).read())
+    try:
+        return rc == 0, json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return False, out[-300:]
+
+
+def reach(addrs, st):
+    """The first of addrs this hub can SSH to (remembered for half an hour either way)."""
+    hosts = st.setdefault("hosts", {})
+    now = int(time.time())
+    for a in addrs:
+        h = hosts.get(a) or {}
+        if h.get("ok") and now - h.get("at", 0) < HOST_RECHECK:
+            return a, h
+    for a in addrs:
+        h = hosts.get(a) or {}
+        if not h.get("ok") and now - h.get("at", 0) < HOST_RECHECK:
+            continue
+        ok, ans = ssh(a, ["hello"], timeout=25)
+        hosts[a] = dict(ans, ok=True, at=now) if ok and isinstance(ans, dict) else \
+            {"ok": False, "at": now, "err": (ans if isinstance(ans, str) else "")[-160:]}
+        if ok:
+            return a, hosts[a]
+    return None, None
+
+
+# ---------------------------------------------------------------- the tunnels
+
+def route_dev(addr):
+    rc, out = run("ip", "-j", "route", "get", addr, timeout=5)
+    try:
+        r = (json.loads(out) or [{}])[0] if rc == 0 else {}
+    except ValueError:
+        return ""
+    return "" if r.get("gateway") else r.get("dev", "")
+
+
+def carrier(t):
+    """How the tunnel's packets cross: 'udp' (or gre/ipip: packets, can blackhole), 'tcp' (no)."""
+    if t["kind"] == "tun":
+        return "tcp"
+    if t["kind"] in ("wireguard", "amneziawg"):
+        tool = "awg" if t["kind"] == "amneziawg" else "wg"
+        rc, eps = run(tool, "show", t["iface"], "endpoints", timeout=5)
+        ep = (eps.split() + ["", ""])[1] if rc == 0 else ""
+        host = ep.rpartition(":")[0].strip("[]")
+        t["remote"] = host
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return "tcp"
+    return "packet"
+
+
+def tunnels():
+    """Point-to-point tunnels (a /30 or smaller with one peer), outer ones first."""
+    out = []
+    for l in xuiagent.links():
+        if not l["tunnel"] or not l["local"] or l["prefix"] < 30:
+            continue
+        net = ipaddress.ip_interface("%s/%s" % (l["local"], l["prefix"])).network
+        hosts = [str(h) for h in (net.hosts() if net.prefixlen == 30 else net) if str(h) != l["local"]]
+        if len(hosts) != 1:
+            continue
+        t = dict(l, peer=hosts[0])
+        t["carrier"] = carrier(t)
+        t["via"] = route_dev(t["remote"]) if t["remote"] and not t["remote"].startswith("127.") else ""
+        out.append(t)
+    by = {t["iface"]: t for t in out}
+    depth = lambda t, n=0: n if n > 5 or t["via"] not in by else depth(by[t["via"]], n + 1)
+    return sorted(out, key=depth)
+
+
+def busy(tuns):
+    """Interfaces that carry traffic now: a proxy outbound's address goes through them, or
+    another tunnel rides inside them."""
+    used = set()
+    try:
+        cfg = load(CFG, {})
+        for o in cfg.get("outbounds", []):
+            if o.get("protocol") not in PROXY:
+                continue
+            s = o.get("settings") or {}
+            addr = s.get("address") or ((s.get("vnext") or s.get("servers") or [{}])[0]).get("address")
+            if o.get("sendThrough"):
+                used.update(t["iface"] for t in tuns if t["local"] == o["sendThrough"])
+            elif addr:
+                used.add(route_dev(addr))
+    except Exception:
+        pass
+    used.update(t["via"] for t in tuns if t["via"])
+    return used
+
+
+def far_addrs(t, tuns):
+    """Where this tunnel's far server can be reached over SSH: its public address first (or,
+    for a tunnel inside a tunnel, the outer tunnel's server), then through each tunnel to it."""
+    def public(x, n=0):
+        if x["via"] and n < 5:
+            outer = next((y for y in tuns if y["iface"] == x["via"]), None)
+            if outer:
+                return public(outer, n + 1)
+        return x["remote"] if x["remote"] and not x["remote"].startswith("127.") else ""
+    pub = public(t)
+    same = [x["peer"] for x in tuns if pub and public(x) == pub and x["iface"] != t["iface"] and x["up"]]
+    return [a for a in dict.fromkeys([pub] + same + [t["peer"]]) if a]
+
+
+def remote_iface(addr, peer):
+    """The far server's interface that holds the tunnel's peer address."""
+    ok, ls = ssh(addr, ["links"], timeout=30)
+    if not ok or not isinstance(ls, list):
+        return None
+    return next((l for l in ls if l.get("local") == peer), None)
+
+
+# ---------------------------------------------------------------- measuring and fixing
+
+def check(apply=False, quiet=False):
+    c, st = load(CONF, {}), load(STATE, {})
+    if quiet:                                    # the timer: only when fixing is on
+        apply = apply and c.get("auto", True) is not False
+    tuns = tunnels()
+    used = busy(tuns)
+    now = int(time.time())
+    rows = []
+    key()
+    for t in tuns:
+        s = st.setdefault("tunnels", {}).setdefault(t["iface"], {})
+        row = {"iface": t["iface"], "kind": t["kind"], "mtu": t["mtu"], "peer": t["peer"], "remote": t["remote"],
+               "carrier": t["carrier"], "busy": t["iface"] in used, "via": t["via"]}
+        rows.append(row)
+        if t["carrier"] == "tcp":
+            row.update(state="tcp", note="روی TCP؛ تکه‌شدن بسته مشکلی نمی‌سازد")
+            continue
+        if not t["up"]:
+            row.update(state="down", note="تانل پایین است")
+            continue
+        if t.get("owner"):
+            row.update(state="other", note="زیر نظر %s است؛ دست نمی‌خورد" % t["owner"])
+            s["seen"] = t["mtu"]
+            continue
+        if s.get("seen") and s["seen"] != t["mtu"] and s.get("mtu") != t["mtu"]:
+            s["foreign_until"] = now + 86400             # someone else set it: theirs for a day
+            event(st, t["iface"], "MTU بیرون از نگهبان %s → %s شد" % (s["seen"], t["mtu"]))
+        s["seen"] = t["mtu"]
+        if now < s.get("foreign_until", 0):
+            row.update(state="other", note="MTU را چیز دیگری عوض کرده؛ تا فردا دست نمی‌خورد (فقط سنجیده می‌شود)")
+            apply_here = False
+        else:
+            apply_here = apply
+        got = xuiagent.probe(t["iface"], t["peer"], t["mtu"])
+        s["at"], s["size"] = now, got
+        if got == 0:
+            row.update(state="silent", note="از تانل جواب نمی‌آید (یا ping بسته است)")
+            continue
+        # the far end, in the other direction (every half hour while all is well)
+        far, host, rif, back = None, None, None, None
+        if got < t["mtu"] or s.get("suspect") or now - s.get("far_at", 0) > 1800:
+            far, host = reach(far_addrs(t, tuns), st)
+            rif = remote_iface(far, t["peer"]) if far else None
+            if rif:
+                ok, ans = ssh(far, ["probe", rif["iface"], t["local"], str(rif["mtu"])], timeout=120)
+                back = ans.get("size") if ok and isinstance(ans, dict) else None
+            s.update(far_at=now, far=far or "", far_host=(host or {}).get("host", ""),
+                     far_iface=(rif or {}).get("iface", ""), far_mtu=(rif or {}).get("mtu"), back=back)
+            s["far_owner"] = (rif or {}).get("owner", "")
+        row.update({k: s.get(k) for k in ("far", "far_host", "far_iface", "far_mtu", "back", "far_owner")})
+        if s.get("far_mtu") and back is None and s.get("back"):
+            back = s["back"]
+        row["fit"] = min(x for x in (got, back) if x) if back else got
+        # each end sends: the hub's packets are measured by `got`, the far end's by `back`
+        want, far_want = min(t["mtu"], got), min(s.get("far_mtu") or 0, back or 9000) or None
+        state = "ok" if want >= t["mtu"] and (not far_want or far_want >= s["far_mtu"]) else "small"
+        row["state"] = state if row.get("state") != "other" or state == "small" else "other"
+        want = min(x for x in (want, far_want) if x)       # both ends the same, the smaller
+        if state == "ok":
+            s.pop("suspect", None)
+            if row["state"] == "ok":
+                row["note"] = "بسته‌ی کامل %d بایتی رد می‌شود" % t["mtu"]
+            raise_back(t, s, row, used, far, rif, apply_here, now)
+            continue
+        # found twice in a row before anything changes
+        if s.get("suspect") != want:
+            s["suspect"] = want
+            row["note"] = "فقط تا %d بایت رد می‌شود؛ بار بعد دوباره اندازه گرفته می‌شود" % want
+            continue
+        row["note"] = "فقط تا %d بایت رد می‌شود (دو بار)" % want
+        if not apply_here:
+            continue
+        s.setdefault("orig", t["mtu"])
+        if rif:
+            s.setdefault("far_orig", rif["mtu"])
+        res = xuiagent.setmtu(t["iface"], want) if want < t["mtu"] else {"files": []}
+        far_res = ssh(far, ["setmtu", rif["iface"], str(want)], timeout=40)[1] \
+            if rif and rif["mtu"] > want and not rif.get("owner") else None
+        if far_res:
+            s["far_mtu"] = want
+        s.update(set_at=now, mtu=want, seen=want, suspect=None)
+        row.update(state="fixed", mtu=want, files=res.get("files"), far_files=(far_res or {}).get("files")
+                   if isinstance(far_res, dict) else None)
+        row["note"] = "MTU به %d رسید (بود %d)%s" % (want, t["mtu"], " (هر دو سر)" if far_res else
+                                                 " (سر دیگر در دسترس نیست)" if not rif else "")
+        event(st, t["iface"], "%d → %d%s" % (max(t["mtu"], rif["mtu"] if rif else 0), want, " هر دو سر" if far_res else ""))
+        log("%s: mtu %d -> %d (path carries %d)%s" % (t["iface"], t["mtu"], want, row["fit"],
+                                                     " far %s too" % far if far_res else ""))
+    st["at"], st["rows"] = now, rows
+    save(STATE, st)
+    return rows
+
+
+def raise_back(t, s, row, used, far, rif, apply, now):
+    """A tunnel we lowered, idle now: try its old MTU again every few hours."""
+    orig = s.get("orig")
+    if not orig or orig <= t["mtu"] or t["iface"] in used or not apply or now - s.get("raise_at", 0) < RAISE_EVERY \
+            or s.get("mtu") != t["mtu"]:
+        return
+    s["raise_at"] = now
+    before = t["mtu"]
+    xuiagent.setmtu(t["iface"], orig)
+    if xuiagent.probe(t["iface"], t["peer"], orig) >= orig:
+        if rif and s.get("far_orig") and not rif.get("owner"):
+            ssh(far, ["setmtu", rif["iface"], str(s["far_orig"])], timeout=40)
+        s.pop("orig", None)
+        s.pop("far_orig", None)
+        s["mtu"] = s["seen"] = orig
+        row.update(state="fixed", mtu=orig, note="مسیر دوباره بسته‌ی کامل را می‌برد؛ MTU به %d برگشت" % orig)
+        event(None, t["iface"], "%d → %d (برگشت)" % (before, orig), s)
+        log("%s: mtu back up %d -> %d" % (t["iface"], before, orig))
+    else:
+        xuiagent.setmtu(t["iface"], before)
+
+
+def event(st, iface, text, s=None):
+    s = s if s is not None else st["tunnels"][iface]
+    s.setdefault("events", []).append({"t": int(time.time()), "what": text})
+    s["events"] = s["events"][-10:]
+
+
+def kernel(apply=False):
+    """The TCP settings here and on every far server this hub reaches."""
+    st = load(STATE, {})
+    tuns = tunnels()
+    seen, out = set(), []
+    here = xuiagent.kernel_fix() if apply and xuiagent.kernel_off() else {"off": xuiagent.kernel_off()}
+    out.append({"server": "این هاب", "addr": "", "off": here.get("off", []), "fixed": bool(apply and not here.get("off"))})
+    for t in tuns:
+        far, host = reach(far_addrs(t, tuns), st)
+        if not far or (host or {}).get("id") in seen:
+            continue
+        seen.add((host or {}).get("id"))
+        ok, ans = ssh(far, ["kernel"], timeout=30)
+        if ok and apply and ans.get("off"):
+            ok, ans = ssh(far, ["kernel", "--apply"], timeout=40)
+        out.append({"server": (host or {}).get("host") or far, "addr": far, "off": ans.get("off", []) if ok else None,
+                    "fixed": bool(ok and apply and not ans.get("off")), "err": "" if ok else str(ans)[-160:]})
+    st["kernel"] = {"at": int(time.time()), "rows": out}
+    save(STATE, st)
+    return out
+
+
+def status():
+    st, c = load(STATE, {}), load(CONF, {})
+    servers = {}
+    for a, h in (st.get("hosts") or {}).items():
+        servers[a] = {"addr": a, "ok": h.get("ok"), "host": h.get("host", ""), "at": h.get("at"), "err": h.get("err", "")}
+    for r in st.get("rows") or []:
+        r["events"] = ((st.get("tunnels") or {}).get(r["iface"]) or {}).get("events", [])[-3:]
+    return {"auto": c.get("auto", True) is not False, "at": st.get("at"), "tunnels": st.get("rows") or [],
+            "servers": list(servers.values()), "kernel": st.get("kernel"), "key": key(),
+            "install": "mkdir -p ~/.ssh && echo '%s' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" % key()}
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    mode = args[0] if args else "status"
+    show = lambda d, text: print(json.dumps(d, ensure_ascii=False) if as_json else text)
+    if mode == "status":
+        d = status()
+        show(d, "\n".join("%-8s %-10s mtu %-5s %-7s %s" % (r["iface"], r["kind"], r["mtu"], r.get("state", ""),
+                                                           r.get("note", "")) for r in d["tunnels"]) or "not measured yet")
+    elif mode in ("check", "auto"):
+        rows = check(apply=mode == "auto" or "--apply" in args, quiet=mode == "auto")
+        if mode == "auto" and time.time() - (load(STATE, {}).get("kernel") or {}).get("at", 0) > 6 * 3600:
+            kernel(False)                    # only looks: the page offers the fix
+        if mode != "auto":
+            show(rows, "\n".join("%-8s %-10s mtu %-5s %-7s far %-15s %s" % (
+                r["iface"], r["kind"], r["mtu"], r.get("state", ""), r.get("far") or "-", r.get("note", "")) for r in rows))
+    elif mode == "key":
+        k = key()
+        show({"key": k}, "%s\n\non every far server, as root:\n  mkdir -p ~/.ssh && echo '%s' >> ~/.ssh/authorized_keys"
+             % (k, k))
+    elif mode == "host" and len(args) >= 2:
+        addr = args[1]
+        opt = lambda k: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else None
+        if not re.match(r"^[A-Za-z0-9.:-]{2,64}$", addr):
+            sys.exit("bad address")
+        key()
+        ok, ans = ssh(addr, ["hello"], timeout=25, port=opt("--port"), user=opt("--user"))
+        if ok:
+            c = load(CONF, {})
+            c.setdefault("hosts", {})[addr] = {"port": int(opt("--port") or 22), "user": opt("--user") or "root"}
+            save(CONF, c)
+            st = load(STATE, {})
+            st.setdefault("hosts", {})[addr] = dict(ans, ok=True)
+            save(STATE, st)
+        show({"ok": ok, "answer": ans}, ("ok: %s" % ans.get("host")) if ok else "no: %s" % ans)
+        sys.exit(0 if ok else 1)
+    elif mode == "kernel":
+        rows = kernel("--apply" in args)
+        show(rows, "\n".join("%-20s %s" % (r["server"], "ok" if r["off"] == [] else "not reached" if r["off"] is None
+                                           else "off: " + ", ".join(r["off"])) for r in rows))
+    elif mode in ("on", "off"):
+        c = load(CONF, {})
+        c["auto"] = mode == "on"
+        save(CONF, c)
+        show({"ok": True}, "MTU fixing " + mode)
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()
