@@ -188,15 +188,30 @@ def busy(tuns):
     return used
 
 
+def discovered(cache=[]):
+    """{tunnel: far server} as xui-tunnel works it out (a gost/Backhaul tun, a carrier on 127.0.0.1)."""
+    if not cache:
+        rc, out = run("xui-tunnel", "discover", "--json", timeout=60)
+        try:
+            cache.append({t["iface"]: t.get("far_ip") or t.get("far") or "" for t in json.loads(out)})
+        except (ValueError, TypeError):
+            cache.append({})
+    return cache[0]
+
+
 def far_addrs(t, tuns):
     """Where this tunnel's far server can be reached over SSH: its public address first (or,
     for a tunnel inside a tunnel, the outer tunnel's server), then through each tunnel to it."""
+    found = discovered()
+
     def public(x, n=0):
         if x["via"] and n < 5:
             outer = next((y for y in tuns if y["iface"] == x["via"]), None)
             if outer:
                 return public(outer, n + 1)
-        return x["remote"] if x["remote"] and not x["remote"].startswith("127.") else ""
+        if x["remote"] and not x["remote"].startswith("127.") and not x["via"]:
+            return x["remote"]
+        return found.get(x["iface"], "")            # a tun or a local carrier: xui-tunnel followed it
     pub = public(t)
     same = [x["peer"] for x in tuns if pub and public(x) == pub and x["iface"] != t["iface"] and x["up"]]
     return [a for a in dict.fromkeys([pub] + same + [t["peer"]]) if a]

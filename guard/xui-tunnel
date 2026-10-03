@@ -32,6 +32,10 @@ is used differently: the address stays the same and the outbound is sent through
 (Xray's sendThrough = the tun's own address; the hub's policy routing sends that into the tun,
 sing-box carries it to its server, and the connection lands on the same listener there).
 Such an entry is written ADDR@IFACE, for example 10.0.1.2@sb0.
+Any other tun (gost, Backhaul, ...) is a routed tunnel with a peer: its far server is found from
+the process holding the tun open - its one remote connection, or, when it has several, the one
+whose byte counters move during a short ping burst through the tunnel (cached per process for an
+hour). A Geneve/VXLAN/GRE tunnel whose remote sits inside another tunnel is that tunnel's server.
 A scan does not trust the guess of where a tunnel lands: it starts NAME's own outbound on each
 tunnel's far address and keeps the ones that fetch a page, so it finds tunnels whose far end is
 unknown too. xui-path runs a scan right after it adds a path.
@@ -82,7 +86,7 @@ STATE = "/var/lib/tunnel-guard/tunnels.json"
 KEY = "xrayTemplateConfig"
 XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
 PROXY = ("vless", "vmess", "trojan", "shadowsocks")
-ROUTED = ("gre", "ipip", "sit", "wireguard", "amneziawg")
+ROUTED = ("gre", "ipip", "sit", "geneve", "vxlan", "wireguard", "amneziawg")
 TEST_URL = "https://www.google.com/generate_204"
 SWITCH_GAP = 120        # seconds between two moves of the same path
 RETURN_OKS = 3          # healthy checks of a better tunnel before going back to it
@@ -205,12 +209,110 @@ def family(name):
 
 # ---------------------------------------------------------------- discovery
 
-def far_of_endpoint(ep):
-    """An AWG endpoint of 127.0.0.1:P means a local wstunnel carries it: find where to."""
+FAR_CACHE = "/var/lib/tunnel-guard/far.json"     # what traffic matching found, per tunnel and carrier process
+LOOPBACK = ("127.", "::1", "::ffff:127.")
+
+
+def proc_name(pid):
+    try:
+        return open("/proc/%s/comm" % pid).read().strip()
+    except OSError:
+        return ""
+
+
+def tun_owner(iface):
+    """The process that holds a tun device open (gost, sing-box, Backhaul, wireguard-go, ...)."""
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            for fd in os.listdir("/proc/%s/fdinfo" % pid):
+                try:
+                    if re.search(r"^iff:\s*%s\s*$" % re.escape(iface), open("/proc/%s/fdinfo/%s" % (pid, fd)).read(), re.M):
+                        return pid
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return ""
+
+
+def udp_owner(port):
+    """The process listening on local UDP PORT (the carrier an AWG endpoint 127.0.0.1:PORT feeds)."""
+    rc, out = run("ss", "-Hulnp", "sport = :%s" % port, timeout=5)
+    m = re.search(r"pid=(\d+)", out)
+    return m.group(1) if m else ""
+
+
+def remote_sockets(pid):
+    """{(remote ip, local port, remote port): bytes moved} for PID's TCP connections off this box."""
+    rc, out = run("ss", "-Htinp", "state", "established", timeout=8)
+    got, lines = {}, out.splitlines()
+    for i, line in enumerate(lines):
+        if "pid=%s," % pid not in line:
+            continue
+        p = line.split()
+        if len(p) < 4:
+            continue
+        lip, rip = p[2].rpartition(":")[0].strip("[]"), p[3].rpartition(":")[0].strip("[]")
+        rip = rip[7:] if rip.startswith("::ffff:") else rip
+        if rip.startswith(LOOPBACK) or rip == lip:
+            continue
+        info = lines[i + 1] if i + 1 < len(lines) else ""
+        moved = sum(int(x) for x in re.findall(r"bytes_(?:acked|received):(\d+)", info))
+        key = (rip, p[2].rpartition(":")[2], p[3].rpartition(":")[2])
+        got[key] = got.get(key, 0) + moved
+    return got
+
+
+def far_by_traffic(pid, iface, peer):
+    """Which of PID's connections carries IFACE: with one remote server it is that one; with
+    several, a short burst of pings through the tunnel shows which connection moves."""
+    socks = remote_sockets(pid)
+    ips = {k[0] for k in socks}
+    if len(ips) <= 1:
+        return next(iter(ips), "")
+    if not peer:
+        return ""
+    run("ping", "-n", "-q", "-c", "40", "-i", "0.02", "-s", "1200", "-W", "1", "-I", iface, peer, timeout=8)
+    after = remote_sockets(pid)
+    delta = {k: after.get(k, 0) - socks.get(k, 0) for k in after}
+    best = max(delta, key=delta.get) if delta else None
+    return best[0] if best and delta[best] >= 40 * 1000 else ""
+
+
+def carrier_of(pid):
+    """A carrier process's name and the protocol its connections use, e.g. 'gost · tcp'."""
+    name = proc_name(pid)
+    rc, out = run("ss", "-Hunp", timeout=5)
+    udp = "pid=%s," % pid in out
+    return "%s · %s" % (name or "?", "udp" if udp and not remote_sockets(pid) else "tcp")
+
+
+def cached_far(iface, pid, find):
+    """FIND() once per tunnel and carrier process (an hour at most): the ping burst is not repeated
+    on every listing."""
+    cache = load(FAR_CACHE, {})
+    hit = cache.get(iface) or {}
+    if hit.get("pid") == pid and hit.get("far") and time.time() - hit.get("at", 0) < 3600:
+        return hit["far"]
+    far = find()
+    if far:
+        cache[iface] = {"pid": pid, "far": far, "at": int(time.time())}
+        save(FAR_CACHE, cache)
+    return far
+
+
+def far_of_endpoint(ep, iface=""):
+    """An AWG endpoint of 127.0.0.1:P means a local carrier (wstunnel, udp2raw, ...) takes it
+    abroad: the process listening on P, and the server it is connected to."""
     host, _, port = ep.rpartition(":")
     if host not in ("127.0.0.1", "localhost", "[::1]"):
         return host.strip("[]"), "udp"
-    for unit in glob.glob("/etc/systemd/system/*.service"):
+    pid = udp_owner(port)
+    if pid:
+        far = cached_far(iface or ep, pid, lambda: far_by_traffic(pid, iface, ""))
+        if far:
+            return far, carrier_of(pid)
+    for unit in glob.glob("/etc/systemd/system/*.service"):          # the carrier is down: read its unit
         try:
             text = open(unit).read()
         except OSError:
@@ -244,8 +346,25 @@ def resolve(host):
         return ""
 
 
+def server_names():
+    """{far ip: hostname} for the servers xui-mtu reached over SSH."""
+    st = load("/var/lib/xui-optimizer/mtu.json", {})
+    names = {}
+    for addr, h in (st.get("hosts") or {}).items():
+        if h.get("ok") and h.get("host"):
+            names[addr] = h["host"]
+    for t in (st.get("tunnels") or {}).values():
+        if t.get("far") and t.get("far_host"):
+            names.setdefault(t["far"], t["far_host"])
+    return names
+
+
 def tunnels():
-    """Every point-to-point tunnel on this hub, with the address of its far end."""
+    """Every point-to-point tunnel on this hub, with the server at its far end and what carries
+    it - worked out, not configured: GRE/IPIP/Geneve/VXLAN by their remote, WireGuard/AmneziaWG
+    by their endpoint (a local carrier on 127.0.0.1 is followed to its server), a tun by the
+    process that holds it open and that process's connection (matched by traffic when it has
+    several), and a tunnel whose remote lies inside another tunnel by that tunnel's server."""
     rc, raw = run("ip", "-j", "-d", "addr", "show")
     links = json.loads(raw) if rc == 0 else []
     sb = singbox_far()
@@ -262,23 +381,54 @@ def tunnels():
             continue
         hosts = [str(h) for h in (net.hosts() if net.prefixlen == 30 else net) if str(h) != a["local"]]
         peer = hosts[0] if len(hosts) == 1 else ""
-        t = {"iface": name, "kind": kind, "local": a["local"], "peer": peer, "far": "", "carrier": "",
-             "up": "UP" in l.get("flags", []) or l.get("operstate") in ("UP", "UNKNOWN"), "routed": kind in ROUTED}
-        if kind in ("gre", "ipip", "sit"):
-            t["far"], t["carrier"] = ((l["linkinfo"].get("info_data") or {}).get("remote") or ""), kind
+        t = {"iface": name, "kind": kind, "local": a["local"], "peer": peer, "far": "", "carrier": "", "via": "",
+             "mtu": l.get("mtu"), "up": "UP" in l.get("flags", []) or l.get("operstate") in ("UP", "UNKNOWN"),
+             "routed": kind in ROUTED}
+        info = l["linkinfo"].get("info_data") or {}
+        if kind in ("gre", "ipip", "sit", "geneve", "vxlan"):
+            t["far"], t["carrier"] = info.get("remote") or "", kind
         elif kind in ("wireguard", "amneziawg"):
             tool = "awg" if kind == "amneziawg" else "wg"
             rc, eps = run(tool, "show", name, "endpoints", timeout=5)
             ep = (eps.split() + ["", ""])[1] if rc == 0 else ""
             if ep and ep != "(none)":
-                t["far"], t["carrier"] = far_of_endpoint(ep)
+                t["far"], t["carrier"] = far_of_endpoint(ep, name)
             rc, hs = run(tool, "show", name, "latest-handshakes", timeout=5)
             last = int((hs.split() + ["0", "0"])[1] or 0) if rc == 0 else 0
             t["handshake"] = int(time.time()) - last if last else None
-        else:
-            t["far"], t["carrier"], t["peer"] = sb.get(name, ""), "sing-box", ""
-        t["far_ip"] = resolve(t["far"])
+        elif name in sb:                    # sing-box: the outbound is sent through the tun, no peer
+            t["far"], t["carrier"], t["peer"] = sb[name], "sing-box", ""
+        else:                               # gost, Backhaul, ...: a routed tun with a peer
+            pid = tun_owner(name)
+            t["routed"] = bool(peer)
+            if pid:
+                t["far"] = cached_far(name, pid, lambda: far_by_traffic(pid, name, peer))
+                t["carrier"] = carrier_of(pid)
         out.append(t)
+    # a remote that is itself inside a tunnel (Geneve over a gost tun, AWG over AWG): that
+    # tunnel's server is the far end, and the carrier says what it rides
+    by_net = [(ipaddress.ip_interface("%s/30" % x["local"]).network, x) for x in out if x["local"]]
+    for t in out:
+        f = t["far"]
+        try:
+            ip = ipaddress.ip_address(f) if f else None
+        except ValueError:
+            ip = None
+        outer = next((x for n, x in by_net if ip and ip in n and x is not t), None)
+        if outer:
+            t["via"] = outer["iface"]
+    for _ in range(3):                      # nested more than once: follow it outward
+        for t in out:
+            outer = next((x for x in out if x["iface"] == t["via"]), None)
+            if outer and outer.get("far"):
+                t["far"] = outer["far"] if outer["via"] == "" else outer["far"]
+    names = server_names()
+    for t in out:
+        if t["via"]:
+            outer = next(x for x in out if x["iface"] == t["via"])
+            t["carrier"] = "%s داخل %s (%s)" % (t["kind"], outer["iface"], outer["carrier"] or outer["kind"])
+        t["far_ip"] = resolve(t["far"])
+        t["far_host"] = names.get(t["far_ip"]) or names.get(t["far"], "")
     return out
 
 
