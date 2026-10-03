@@ -508,41 +508,61 @@ def quic_share(lines=20000):
 def speed_by_inbound(hours=24):
     """The fastest real transfer each user reached (5-second average), grouped by the inbound
     they connect through - so two transports (say WebSocket on 80 and TLS on 443) can be
-    compared on the same users' own networks. Users on several inbounds are kept apart."""
+    compared on the same users' own networks. A user on several inbounds cannot be told apart
+    (Xray counts a user, not a user per inbound): those users get a row per set of inbounds."""
     peaks = METRICS.peak_by_user(hours)
     with db() as c:
         where = collections.defaultdict(set)
         for email, tag in c.execute("select cl.email, i.tag from client_inbounds ci join clients cl on cl.id = ci.client_id "
                                     "join inbounds i on i.id = ci.inbound_id"):
             where[email].add(tag)
-        meta = {r["tag"]: dict(r) for r in c.execute("select tag, remark, port, protocol, stream_settings from inbounds")}
-    groups = collections.defaultdict(lambda: {"up": [], "down": []})
+        meta = {r["tag"]: dict(r) for r in c.execute("select tag, remark, port, protocol, stream_settings, enable from inbounds")}
+    key_of = lambda tags: next(iter(tags)) if len(tags) == 1 else "*" + "+".join(sorted(tags))
+    groups = collections.defaultdict(lambda: {"up": [], "down": [], "users": 0, "measured": 0})
+    for email, tags in where.items():
+        if tags:
+            groups[key_of(tags)]["users"] += 1
+    for tag, m in meta.items():                  # every inbound with users shows, measured or not
+        if str(m.get("enable")).lower() in ("1", "true", "t") and groups.get(tag, {}).get("users"):
+            groups[tag]
     for email, (up, dn) in peaks.items():
-        tags = where.get(email) or set()
-        key = next(iter(tags)) if len(tags) == 1 else "*multi"
+        tags = where.get(email)
+        if not tags:
+            continue
+        g = groups[key_of(tags)]
+        g["measured"] += 1 if (up or dn) else 0
         if up:
-            groups[key]["up"].append(up)
+            g["up"].append(up)
         if dn:
-            groups[key]["down"].append(dn)
+            g["down"].append(dn)
 
     def spread(v):
         v = sorted(v)
         pick = lambda q: v[min(len(v) - 1, int(q * len(v)))]
         return {"n": len(v), "p50": pick(0.5), "p90": pick(0.9), "max": v[-1]} if v else {"n": 0}
 
+    def name(tag):
+        m = meta.get(tag) or {}
+        r = re.sub(r"\s*\(imported \d+\)\s*", "", m.get("remark") or "").strip()
+        return r or ("پورت %s" % m["port"] if m.get("port") else tag)
+
     rows = []
     for key, g in groups.items():
-        m = meta.get(key) or {}
+        multi = key.startswith("*")
+        m = {} if multi else (meta.get(key) or {})
         try:
             ss = json.loads(m.get("stream_settings") or "{}")
         except ValueError:
             ss = {}
-        rows.append({"inbound": key, "remark": m.get("remark") or ("چند اینباند" if key == "*multi" else key),
+        tags = key[1:].split("+") if multi else [key]
+        rows.append({"inbound": key, "multi": multi,
+                     "remark": ("مشترک: " + " + ".join(name(t) for t in tags)) if multi else name(key),
+                     "ports": [meta.get(t, {}).get("port") for t in tags],
                      "port": m.get("port"), "protocol": m.get("protocol", ""),
                      "network": ss.get("network", ""), "security": ss.get("security", "none"),
-                     "users": len([e for e, t in where.items() if key in t or (key == "*multi" and len(t) > 1)]),
+                     "users": g["users"], "measured": g["measured"],
                      "up": spread(g["up"]), "down": spread(g["down"])})
-    rows.sort(key=lambda r: -r["up"].get("n", 0))
+    rows.sort(key=lambda r: (r["multi"], -r["users"]))
     return {"hours": hours, "rows": rows, "sample_secs": Metrics.STEP}
 
 
