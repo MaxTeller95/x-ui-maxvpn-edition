@@ -71,6 +71,11 @@ for _n, _p in PATHS.items():
         sys.exit(f"tunnel-guard: no probe port guard-{_n.lower()} in {CFG} - run xui-split first")
 
 check_only = "--check" in sys.argv
+# The primary's outbound can be deleted in the panel while it is still named primary here: then
+# there is nothing to fail back to, and the guard keeps users where they are and says so (once a
+# day) until another path is made primary (xui-path primary NAME, or the Optimizer page).
+PRIMARY_GONE = PRIMARY not in PATHS
+ORDER = [n for n in [PRIMARY] + BACKUPS if n in PATHS]
 
 
 def log(msg):
@@ -156,7 +161,7 @@ def send(text, prefer=None):
     if not token or not chat:
         return False
     order = [prefer] if prefer else []
-    order += [n for n in [PRIMARY] + BACKUPS if n not in order]
+    order += [n for n in ORDER if n not in order]
     body = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"})
     for name in order:
         r = run("curl", "-s", "-m", "15", "--socks5-hostname", f"127.0.0.1:{PATHS[name]['socks']}",
@@ -386,7 +391,7 @@ def main():
             st["down"][n] = now
             st["outages"].append({"path": n, "start": now})
             send(f"🔴 مسیر {n} قطع شد\nping loss {r['loss']}%" + (f" | handshake {r['hs']}s ago" if iface else ""),
-                 prefer=next((x for x in [PRIMARY] + BACKUPS if x != n and res[x]["ok"]), None))
+                 prefer=next((x for x in ORDER if x != n and res[x]["ok"]), None))
         # "back" only once it has stayed up OKS_TO_RETURN runs in a row: a filtered UDP tunnel
         # can handshake and pass one probe, then die a minute later - that is not a return.
         if r["ok"] and st["down"].get(n) and st["oks"][n] >= OKS_TO_RETURN:
@@ -448,7 +453,16 @@ def main():
             light_bypass(mux)
 
     # Failover / failback of users' traffic.
-    healthy = [b for b in BACKUPS if res[b]["ok"]]
+    healthy = [b for b in BACKUPS if b in res and res[b]["ok"]]
+    if PRIMARY_GONE:
+        log(f"primary {PRIMARY} has no outbound any more - users stay on {st['on']}; make another path primary")
+        if st.get("primary_gone_told") != time.strftime("%F"):
+            st["primary_gone_told"] = time.strftime("%F")
+            send(f"⚠️ اوت‌باند مسیر اصلی {PRIMARY} در پنل حذف شده. نگهبان کاربرها را جابجا نمی‌کند تا یک مسیر دیگر "
+                 "اصلی شود: صفحه‌ی Optimizer › ابزارها › مسیرها › «اصلی کن» (یا xui-path primary NAME).")
+        json.dump(st, open(STATE, "w"))
+        return
+    st.pop("primary_gone_told", None)
     try:
         hold = open(HOLD).read().strip()
     except FileNotFoundError:

@@ -4,6 +4,9 @@
     xui-path list [--json]
     xui-path add NAME "vless://...#whatever"      paste the link of a server abroad
     xui-path remove NAME
+    xui-path primary NAME [--force]         make a backup path the primary one (live, no restart):
+                                            users' catch-all rule and the DNS cache's upstream move
+                                            to it; a primary whose outbound is gone is dropped
     xui-path prune                          drop probe ports whose outbound is gone (no restart)
     options: --peer HOST   what to ping for this path (default: the link's address)
              --iface IF    the AWG tunnel this path rides (the guard watches its handshake)
@@ -28,7 +31,9 @@ trojan, vmess, shadowsocks, and two QUIC (UDP) protocols for a fast backup on a 
                          or removing such a path restarts sing-box (its own tuns blink too).
 
 Both ride UDP: where UDP abroad is throttled they fail, and the guard simply skips them.
-The primary path cannot be removed, and neither can the one users are on right now.
+The primary path cannot be removed, and neither can the one users are on right now: to drop
+the primary, make another path primary first (its leftovers go with it when its outbound was
+already deleted in the panel).
 """
 import base64, glob, json, os, re, shutil, subprocess, sys, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
@@ -336,7 +341,8 @@ def listing():
                     "network": (o.get("streamSettings") or {}).get("network", "—"),
                     "iface": p.get("iface") or "", "peer": p.get("peer") or "",
                     "probe": probes.get("guard-" + name.lower()), "in_use": name == on,
-                    "removable": i > 0 and name != on})
+                    "removable": i > 0 and name != on, "gone": name not in outs,
+                    "can_primary": i > 0 and name in outs})
     return out
 
 
@@ -416,10 +422,89 @@ def more_addresses(name, addrs):
     return {"tunnels": got.get("answered", []), "tunnels_msg": got.get("msg", "")}
 
 
+def user_inbounds():
+    """Tags of the panel's enabled inbounds: who a new catch-all rule is for."""
+    db = xuidb.connect()
+    try:
+        rows = db.execute("select tag, enable from inbounds").fetchall()
+    finally:
+        db.close()
+    return [r[0] for r in rows if r[0] and str(r[1]).lower() in ("1", "true", "t")]
+
+
+def make_primary(name, as_json, force=False):
+    """NAME becomes the primary path. Users' catch-all (main-OLD, or a new one for every inbound
+    when the panel lost it) and the DNS cache's upstream are sent to NAME; when the old primary's
+    outbound is gone, its leftovers (its -mux copy, probe port, split rules) go too."""
+    t, c = template(), conf()
+    old, backups = c.get("primary"), list(c.get("backups") or [])
+    if name == old:
+        die("%s از قبل مسیر اصلی است" % name, as_json)
+    if name not in backups:
+        die("مسیری به اسم %s در پشتیبان‌ها نیست" % name, as_json)
+    outs = {o.get("tag") for o in t.get("outbounds", [])}
+    if name not in outs:
+        die("اوت‌باند %s در پنل نیست" % name, as_json)
+    port = next((i.get("port") for i in t.get("inbounds", []) if i.get("tag") == "guard-" + name.lower()), None)
+    if not force and port and not try_path(port)["ok"]:
+        die("%s الان جواب نمی‌دهد؛ مسیر اصلی نشد (با --force بدون تست)" % name, as_json)
+    old_gone = old not in outs
+    route = xuimix.route(t, name)                       # its mix balancer when it is mixed
+    rules, moved = t["routing"]["rules"], 0
+    old_main = "main-" + (old or "").lower()
+    for r in rules:
+        is_main = r.get("ruleTag") == old_main or (not r.get("ruleTag") and xuimix.target(r) == old
+                                                    and set(r) <= {"type", "inboundTag", "outboundTag", "balancerTag", "enabled"})
+        is_dns = r.get("inboundTag") == ["dns-internal"] and xuimix.target(r) == old
+        if is_main or is_dns:
+            r.pop("outboundTag", None)
+            r.pop("balancerTag", None)
+            r.update(route)
+            if is_main:
+                r["ruleTag"] = "main-" + name.lower()
+            moved += 1
+    if not any(r.get("ruleTag") == "main-" + name.lower() for r in rules):
+        tags = user_inbounds()
+        if not tags:
+            die("هیچ اینباند فعالی در پنل نیست؛ قانون اصلی ساخته نشد", as_json)
+        rules.append(dict({"type": "field", "ruleTag": "main-" + name.lower(), "inboundTag": tags}, **route))
+    if old_gone and old:                                 # what the deleted primary left behind
+        dead = {old, old + "-mux"}
+        t["outbounds"] = [o for o in t["outbounds"] if o.get("tag") not in dead]
+        t["inbounds"] = [i for i in t.get("inbounds", []) if i.get("tag") not in {"guard-" + d.lower() for d in dead}]
+        t["routing"]["rules"] = [r for r in t["routing"]["rules"] if xuimix.target(r) not in dead]
+    ok, detail = test_config(t)
+    if not ok:
+        die("Xray کانفیگ جدید را رد کرد: " + detail, as_json)
+    backup = apply(t, "primary " + name)
+    # the guard's own failover rules pointed users at a backup; the catch-all does it now
+    subprocess.run([XRAY, "api", "rmrules", "--server=" + xuilive.api_addr(json.load(open(CFG))), "fo-main", "fo-dns"],
+                   capture_output=True)
+    c["primary"] = name
+    c["backups"] = [b for b in backups if b != name] + ([old] if old and not old_gone else [])
+    if old_gone:
+        for k in (old, old + "-mux"):
+            c.get("paths", {}).pop(k, None)
+            (c.get("tunnels") or {}).pop(k, None)
+    write_conf(c)
+    try:
+        st = json.load(open(GUARD_STATE))
+        st.update(on=name, failed_over=False)
+        json.dump(st, open(GUARD_STATE, "w"))
+    except (OSError, ValueError):
+        pass
+    hold = "/var/lib/tunnel-guard/hold"
+    if os.path.exists(hold) and open(hold).read().strip() in (old, name):
+        os.remove(hold)
+    msg = "%s مسیر اصلی شد%s%s" % (name, "؛ %s که اوت‌باندش حذف شده بود پاک شد" % old if old_gone else
+                                  "؛ %s پشتیبان شد" % old, "" if moved else " (قانون اصلی کاربران از نو ساخته شد)")
+    print(json.dumps({"ok": True, "msg": msg, "backup": backup}, ensure_ascii=False) if as_json else msg)
+
+
 def remove(name, as_json):
     t, c = template(), conf()
     if name == c.get("primary"):
-        die("مسیر اصلی را نمی‌شود حذف کرد", as_json)
+        die("مسیر اصلی را نمی‌شود حذف کرد؛ اول یک مسیر دیگر را اصلی کنید (xui-path primary NAME)", as_json)
     if name not in (c.get("backups") or []):
         die("مسیری به اسم %s در نگهبان نیست" % name, as_json)
     try:
@@ -518,6 +603,8 @@ def main():
             [a.strip() for a in opt.get("--addrs", "").split(",") if a.strip()])
     elif mode == "remove" and len(args) >= 2:
         remove(args[1], as_json)
+    elif mode == "primary" and len(args) >= 2:
+        make_primary(args[1], as_json, "--force" in args)
     elif mode == "prune":
         prune(as_json)
     else:

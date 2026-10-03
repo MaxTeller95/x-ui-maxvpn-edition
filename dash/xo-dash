@@ -1394,6 +1394,12 @@ def action(name, body):
         got = str(body.get("name") or "").strip()
         r = jrun_any("xui-path", "remove", got, "--json", timeout=180)
         return r or {"ok": False, "msg": "حذف نشد"}
+    if name == "path-primary":                   # live: the catch-all and DNS upstream move to it
+        got = str(body.get("name") or "").strip()
+        if got not in path_order():
+            return {"ok": False, "msg": "این مسیر در فهرست نیست"}
+        r = jrun_any("xui-path", "primary", got, "--json", timeout=180)
+        return r or {"ok": False, "msg": "انجام نشد"}
     if name == "split-set":                     # one exit's own settings, then build or repair
         _split_cache[0] = 0
         grp = str(body.get("group") or "")

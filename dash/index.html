@@ -859,14 +859,15 @@ function renderUnits(list) {
 async function loadUnits() { const u = await get("units"); if (u) renderUnits(u); }
 
 function renderPaths(list) {
+  window.PATHS_LIST = list;
   $("#paths-tbl").querySelector("tbody").innerHTML = list.map((p) => `<tr>
-    <td><b>${esc(p.name)}</b>${p.in_use ? ' <span class="chip accent" style="font-size:10px">کاربرها اینجان</span>' : ""}
+    <td><b>${esc(p.name)}</b>${p.in_use ? ' <span class="chip accent" style="font-size:10px">کاربرها اینجان</span>' : ""}${p.gone ? ' <span class="chip bad" style="font-size:10px" title="اوت‌باندش در پنل نیست؛ یک مسیر دیگر را «اصلی کن» بزنید تا این پاک شود">اوت‌باند حذف شده</span>' : ""}
       <div class="muted">${p.role === "primary" ? "مسیر اصلی" : "پشتیبان " + esc(p.role.split(" ")[1])}
       · ${esc(p.protocol)}/${esc(p.network)}${p.security && p.security !== "none" ? "/" + esc(p.security) : ""}</div></td>
     <td class="n muted hide-sm">${esc(p.address)}${p.iface ? " · " + esc(p.iface) : ""}</td>
     <td class="n muted">probe ${p.probe || "—"}</td>
-    <td class="act">${p.removable ? `<button data-rmpath="${esc(p.name)}">حذف</button>`
-      : `<button disabled title="${p.in_use ? "کاربرها روی این مسیرند" : "مسیر اصلی"}">حذف</button>`}</td></tr>`).join("")
+    <td class="act">${p.can_primary ? `<button data-mkprimary="${esc(p.name)}" title="این مسیر اصلی شود (بدون ری‌استارت)">اصلی کن</button> ` : ""}${p.removable ? `<button data-rmpath="${esc(p.name)}">حذف</button>`
+      : `<button disabled title="${p.in_use ? "کاربرها روی این مسیرند" : "مسیر اصلی را نمی‌شود حذف کرد؛ اول یک مسیر دیگر را «اصلی کن» بزنید"}">حذف</button>`}</td></tr>`).join("")
     || '<tr><td class="empty">مسیری تعریف نشده.</td></tr>';
 }
 async function loadPaths() { const p = await get("paths"); if (p) renderPaths(p); }
@@ -1150,6 +1151,17 @@ document.addEventListener("click", async (e) => {
   }
   const w = e.target.closest("[data-probe]");
   if (w) { document.querySelector('nav.tabs button[data-tab="users"]').click(); probeUser(w.dataset.probe); return; }
+  const mp = e.target.closest("[data-mkprimary]");
+  if (mp) {
+    const name = mp.dataset.mkprimary, cur = (window.PATHS_LIST || []).find((p) => p.role === "primary");
+    if (!confirm(`${name} مسیر اصلی بشه؟ قانون اصلی کاربرها و DNS به آن می‌رود، بدون ری‌استارت و بعد از تست همین مسیر.`
+        + (cur && cur.gone ? ` ${cur.name} که اوت‌باندش حذف شده، با باقی‌مانده‌هایش پاک می‌شود.` : cur ? ` ${cur.name} پشتیبان می‌شود.` : ""))) return;
+    mp.disabled = true; toast("در حال تست و اعمال...");
+    const r = await post("path-primary", { name });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadPaths(); loadStatus(); loadTunnels();
+    return;
+  }
   const rp = e.target.closest("[data-rmpath]");
   if (rp) {
     const name = rp.dataset.rmpath;
