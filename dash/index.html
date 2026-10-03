@@ -331,7 +331,8 @@
       <div class="card">
         <h2>مصرف ماهانه‌ی تانل‌ها</h2>
         <div class="bars" id="month"></div>
-        <div class="muted">از vnstat روی خود هاب؛ برای کنترل سقف ترافیک سرور خارج.</div>
+        <div class="muted">این ماه، از vnstat روی خود هاب: ↓ آنچه از سرور خارج آمده (دانلود کاربرها)، ↑ آنچه رفته. کنار هر تانل
+          مسیرهایی که الان رویش هستند؛ برای کنترل سقف ترافیک سرور خارج. تانل تازه (یا تغییرنام‌داده) خودکار به vnstat اضافه می‌شود.</div>
       </div>
 
       <div class="card wide">
@@ -744,8 +745,11 @@ function renderStatus(s) {
     { k: "اتصال‌های باز", v: Math.min(100, (r.conns / 8000) * 100), t: r.conns + "" },
     { k: "conntrack", v: (r.conntrack / Math.max(1, r.conntrack_max)) * 100, t: r.conntrack + " از " + r.conntrack_max },
   ]);
-  $("#month").innerHTML = bars(Object.entries(s.month).map(([k, m]) =>
-    ({ k: k + " (" + m.iface + ")", v: m.rx + m.tx, t: bytes(m.rx + m.tx) })));
+  const mo = s.month || {};
+  $("#month").innerHTML = mo.error ? `<div class="empty">${esc(mo.error)}</div>` : bars((mo.rows || []).map((m) => ({
+    k: m.uplink ? `کل سرور (${m.iface})` : (m.paths.length ? m.paths.join("، ") + " ← " : "") + m.iface + (m.kind ? " · " + m.kind : ""),
+    v: m.rx + m.tx, color: m.uplink ? "var(--muted)" : null,
+    t: (m.rx + m.tx ? `↓ ${bytes(m.rx)} · ↑ ${bytes(m.tx)}` : "۰") + (m.new ? " · از همین ماه شمرده می‌شود" : "") })));
   $("#backups").querySelector("tbody").innerHTML = s.backups.map((b) =>
     `<tr><td class="num">${esc(b.name)}</td><td class="n muted hide-sm">${bytes(b.size)} · ${ago(b.at)}</td>
      <td class="act"><a class="back" href="${P}api/backup-file?name=${encodeURIComponent(b.name)}">دانلود</a>

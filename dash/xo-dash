@@ -414,19 +414,71 @@ def resources():
     }
 
 
+TUNNEL_KINDS = ("gre", "gretap", "ipip", "sit", "geneve", "vxlan", "wireguard", "amneziawg", "tun", "ip6gre", "ip6tnl")
+_vnstat_added = set()
+
+
 def vnstat_month():
-    """This month's traffic per tunnel interface, from vnstat."""
-    out = {}
-    for name, p in (conf().get("paths") or {}).items():
-        if not p.get("iface"):
-            continue
-        d = jrun("vnstat", "--json", "m", "-i", p["iface"], timeout=8)
-        try:
-            last = d["interfaces"][0]["traffic"]["month"][-1]
-            out[name] = {"iface": p["iface"], "rx": last["rx"], "tx": last["tx"]}
-        except Exception:
-            continue
-    return out
+    """This month's traffic of every tunnel on the hub, and of the uplink, from vnstat; each with
+    the paths that ride it now. A tunnel vnstat does not count yet (it adds no new interface by
+    itself, and tunnels get renamed) is added: counting starts from then."""
+    if not shutil.which("vnstat"):
+        return {"rows": [], "error": "vnstat نصب نیست"}
+    rc, raw = run("ip", "-j", "-d", "link", "show", timeout=5)
+    try:
+        links = json.loads(raw) if rc == 0 else []
+    except ValueError:
+        links = []
+    kind = {l["ifname"]: (l.get("linkinfo") or {}).get("info_kind", "") for l in links}
+    up = {l["ifname"] for l in links if "UP" in l.get("flags", [])}
+    rc, r = run("ip", "-j", "route", "show", "default", timeout=5)
+    try:
+        uplink = (json.loads(r) or [{}])[0].get("dev", "") if rc == 0 else ""
+    except (ValueError, IndexError):
+        uplink = ""
+    tuns = [n for n in kind if kind[n] in TUNNEL_KINDS and n in up and not n.startswith("wgp-")]  # wgp-: WGDashboard's users
+    data = jrun("vnstat", "--json", "m", timeout=10) or {}
+    known = {i.get("name"): i for i in data.get("interfaces") or []}
+    added = [n for n in tuns if n not in known and n not in _vnstat_added]
+    for n in added:
+        run("vnstat", "--add", "-i", n, timeout=10)
+        _vnstat_added.add(n)
+    if added:
+        run("systemctl", "restart", "vnstat", timeout=20)       # the daemon picks the new ones up
+    # which path rides which tunnel: where each path's outbound address is routed now
+    rides = collections.defaultdict(list)
+    outs = {o.get("tag"): o for o in xray_cfg().get("outbounds", [])}
+    for name in path_order():
+        o = outs.get(xuimix.copy_tag(name, 1)) or outs.get(name) or {}
+        st = o.get("settings") or {}
+        addr = st.get("address") or ((st.get("vnext") or st.get("servers") or [{}])[0]).get("address")
+        if o.get("sendThrough"):
+            dev = next((i for i, a in iface_addrs().items() if a == o["sendThrough"]), "")
+        elif addr:
+            rc, rr = run("ip", "-j", "route", "get", addr, timeout=5)
+            try:
+                g = (json.loads(rr) or [{}])[0] if rc == 0 else {}
+                dev = "" if g.get("gateway") else g.get("dev", "")
+            except (ValueError, IndexError):
+                dev = ""
+        else:
+            dev = ""
+        if dev:
+            rides[dev].append(name)
+    month = time.strftime("%Y-%m")
+    rows = []
+    for n in tuns + ([uplink] if uplink else []):
+        i = known.get(n) or {}
+        last = ((i.get("traffic") or {}).get("month") or [{}])[-1]
+        d = last.get("date") or {}
+        this = "%04d-%02d" % (d.get("year", 0), d.get("month", 0)) == month
+        c = (i.get("created") or {}).get("date") or {}
+        rows.append({"iface": n, "kind": kind.get(n, ""), "paths": rides.get(n, []), "uplink": n == uplink,
+                     "rx": last.get("rx", 0) if this else 0, "tx": last.get("tx", 0) if this else 0,
+                     "new": n in added or not i or "%04d-%02d" % (c.get("year", 0), c.get("month", 0)) == month
+                     and c.get("day", 1) > 1})
+    rows.sort(key=lambda x: (x["uplink"], -(x["rx"] + x["tx"])))
+    return {"rows": rows, "month": month}
 
 
 def backups():
