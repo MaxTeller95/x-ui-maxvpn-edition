@@ -779,6 +779,10 @@ def kernel_fix(everywhere=False):
             else "اعمال نشد: " + "، ".join(r["off"]) + " " + r.get("msg", "")}
 
 
+def route_view():
+    return jrun("xui-route", "show", "--json", timeout=30) or {}
+
+
 def mtu_view():
     return jrun("xui-mtu", "status", "--json", timeout=20) or {}
 
@@ -1475,6 +1479,31 @@ def action(name, body):
         got = str(body.get("name") or "").strip()
         r = jrun_any("xui-path", "remove", got, "--json", timeout=180)
         return r or {"ok": False, "msg": "حذف نشد"}
+    if name == "route-assign":                   # inbound -> exit: the catch-alls, then the split, live
+        ib, ex = str(body.get("inbound") or ""), str(body.get("exit") or "")
+        if not re.match(r"^[A-Za-z0-9._@~-]{1,64}$", ib) or not re.match(r"^[A-Za-z0-9._@~-]{1,64}$", ex):
+            return {"ok": False, "msg": "نام نامعتبر"}
+        _split_cache[0] = 0
+        return jrun_any("xui-route", "assign", ib, ex, "--json", timeout=300) or {"ok": False, "msg": "انجام نشد"}
+    if name == "route-rule":                     # the operator's own rules: live, never a restart
+        op = str(body.get("op") or "")
+        if op not in ("add", "edit", "del", "move", "toggle"):
+            return {"ok": False, "msg": "کار نامعلوم"}
+        cmd = ["xui-route", "rule", op]
+        if op != "add":
+            n, fp = body.get("i"), str(body.get("sha") or "")
+            if not isinstance(n, int) or not re.match(r"^[0-9a-f]{10}$", fp):
+                return {"ok": False, "msg": "قانون نامعتبر"}
+            cmd += [str(n), fp]
+        if op in ("add", "edit"):
+            if not isinstance(body.get("rule"), dict):
+                return {"ok": False, "msg": "قانون نامعتبر"}
+            cmd.append(json.dumps(body["rule"], ensure_ascii=False))
+        if op == "move":
+            cmd.append("up" if body.get("dir") == "up" else "down")
+        if op == "add" and isinstance(body.get("at"), int):
+            cmd += ["--at", str(body["at"])]
+        return jrun_any(*(cmd + ["--json"]), timeout=120) or {"ok": False, "msg": "انجام نشد"}
     if name == "path-rename":                    # live: every tag of the path, and the settings that name it
         got, new = str(body.get("name") or "").strip(), str(body.get("new") or "").strip()
         if got not in path_order() or not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,23}$", new):
@@ -1633,7 +1662,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     GETS = {"api/status": status, "api/live": lambda: METRICS.snapshot(), "api/users": users_view,
             "api/lint": lint, "api/confguard": confguard, "api/units": units, "api/paths": paths_view,
             "api/tunnels": tunnels_view, "api/reach": reach_view, "api/speeds": speed_by_inbound,
-            "api/mtu": mtu_view}
+            "api/mtu": mtu_view, "api/route": route_view}
 
     def log_message(self, *a):
         pass

@@ -499,6 +499,17 @@ tunnel (`up~NAME`) - new connections of that user only - and loses them after te
 Live (xuilive), never while the guard has failed the primary over. `xui-tunnel steer on|off`.
 Billing is unchanged: Xray counts bytes per user, not per outbound.
 
+## xui-route - routing (the page's Routing tab)
+
+Paths (say Turkey and Germany) are kept apart by inbound only: each inbound sends its users to
+exactly one path, or direct / blocked, through that path's catch-all rule (`main-<path>`), and
+xui-split builds each path's mux split from those rules. `xui-route assign INBOUND EXIT` is the
+one place that changes it, then has xui-split rebuild - live, no restart. The Routing tab shows
+that table, the mux/split card, and every rule in order with its owner: the tools' rules (probes,
+split, catch-alls, DNS cache, ad/QUIC/security blocks, heavy-upload moves) are read-only, your
+own can be added, edited, moved, switched off and deleted. Every change is xray-tested, backed up
+and put into the running Xray through its API.
+
 ## xui-mtu - MTU guard, both ends of every tunnel
 
 A tunnel whose MTU is larger than its path carries passes pings and small packets and loses

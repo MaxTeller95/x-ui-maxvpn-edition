@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""xui-route - the hub's routing, the way the Optimizer page edits it.
+
+    xui-route show [--json]                 every rule in order (who owns it, what it matches, where it
+                                            sends), the outbounds, and which path each inbound goes to
+    xui-route assign INBOUND EXIT           send this inbound's users to EXIT: a path (its outbound tag),
+                                            direct or blocked. The one place that decides it.
+    xui-route rule add JSON [--at N]        a rule of your own (JSON as Xray writes it), at position N
+                                            (default: right before the paths' catch-all rules)
+    xui-route rule edit N SHA JSON          replace your rule at position N
+    xui-route rule del N SHA                delete it
+    xui-route rule move N SHA up|down       one place up or down
+    xui-route rule toggle N SHA             switch it on or off (the panel's "enabled")
+    options: --json
+
+Paths are kept apart by inbound: each inbound's users go to exactly one exit, through that
+exit's catch-all rule (main-<exit>), and xui-split builds its light/heavy split for each exit
+from those rules. So assigning an inbound edits only the catch-alls (the inbound leaves every
+other one) and then has xui-split rebuild its rules - all live, no restart, billing untouched.
+
+The rules the tools keep (probe ports, the split, the catch-alls, the DNS cache, the ad/QUIC/
+security blocks, heavy-upload moves) are shown with their owner and are not edited here: their
+tool rebuilds them. Every other rule is yours. N and SHA come from `show` (SHA is the rule's
+fingerprint: a rule that changed since the page loaded is not touched).
+
+Every change: the template is tested with xray -test, backed up, saved, accepted by config-guard
+and put into the running Xray through its API (xuilive) - never a restart.
+"""
+import glob, hashlib, json, os, shutil, subprocess, sys, time
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
+import xuidb  # noqa: E402  the panel's database, SQLite or PostgreSQL
+import xuilive  # noqa: E402  template changes into the running Xray, no restart
+import xuimix  # noqa: E402  a mixed path is reached through its balancer
+
+BIN = "/usr/local/x-ui/bin"
+CFG, GUARD_CONF = BIN + "/config.json", "/etc/tunnel-guard.json"
+KEY = "xrayTemplateConfig"
+XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
+NOT_PROXY = ("freedom", "blackhole", "dns")
+FIELDS = ("inboundTag", "domain", "ip", "port", "sourcePort", "network", "protocol", "user", "source", "attrs")
+
+
+class Bad(Exception):
+    pass
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def template():
+    db = xuidb.connect()
+    try:
+        return json.loads(db.execute("select value from settings where key=?", (KEY,)).fetchone()[0])
+    finally:
+        db.close()
+
+
+def sha(r):
+    return hashlib.sha1(json.dumps(r, sort_keys=True).encode()).hexdigest()[:10]
+
+
+def target(r):
+    return xuimix.target(r) or r.get("outboundTag") or r.get("balancerTag") or ""
+
+
+def kinds(t):
+    return {o.get("tag"): o.get("protocol") for o in t.get("outbounds", [])}
+
+
+def catch_all(r, k):
+    """An inbound-only rule: it decides where an inbound's users go (what assign edits)."""
+    return bool(r.get("inboundTag")) and set(r) <= {"type", "inboundTag", "outboundTag", "balancerTag", "ruleTag", "enabled"} \
+        and "dns-internal" not in r["inboundTag"] and not (r.get("ruleTag") or "").startswith(("guard-", "split-", "fo-")) \
+        and not target(r).endswith("-mux") and r.get("inboundTag") != ["api"]
+
+
+def owner(r, k):
+    """Who keeps this rule (it is rebuilt by them), or '' when it is the operator's own."""
+    tag, to = r.get("ruleTag") or "", target(r)
+    if r.get("inboundTag") == ["api"]:
+        return "Xray API"
+    if tag.startswith("guard-"):
+        return "probe نگهبان"
+    if tag.startswith("split-"):
+        return "تقسیم mux"
+    if tag.startswith("main-") or catch_all(r, k):
+        return "مسیر اینباند"
+    if tag in ("dns-upstream", "xui-optimizer-dns-cache") or r.get("inboundTag") == ["dns-internal"]:
+        return "کش DNS"
+    if tag.startswith("xui-optimizer"):
+        return "Optimizer"
+    if to.startswith("up~"):
+        return "آپلود سنگین"
+    return ""
+
+
+def exits(t):
+    """Where an inbound can be sent: every proxy path (primary and backups first), direct, blocked."""
+    c = load(GUARD_CONF, {})
+    k = kinds(t)
+    order = [n for n in [c.get("primary")] + (c.get("backups") or []) if n in k]
+    rest = [n for n, p in k.items() if p not in NOT_PROXY and n not in order and not n.endswith("-mux")
+            and not xuimix.is_clone(n) and not n.startswith("up~")]
+    return order + rest + [n for n, p in k.items() if p in ("freedom", "blackhole")]
+
+
+def inbound_rows():
+    db = xuidb.connect()
+    try:
+        rows = db.execute("select tag, remark, port, protocol, enable, settings from inbounds").fetchall()
+    finally:
+        db.close()
+    out = []
+    for tag, remark, port, proto, enable, settings in rows:
+        try:
+            n = len(json.loads(settings or "{}").get("clients") or [])
+        except ValueError:
+            n = 0
+        out.append({"tag": tag, "remark": remark or "", "port": port, "protocol": proto,
+                    "enabled": str(enable).lower() in ("1", "true", "t"), "clients": n})
+    return out
+
+
+def where(t):
+    """{inbound: exit} - the first catch-all that names it (rules apply in order)."""
+    k, got = kinds(t), {}
+    for r in t["routing"]["rules"]:
+        if r.get("enabled") is False or not catch_all(r, k):
+            continue
+        for ib in r["inboundTag"]:
+            got.setdefault(ib, target(r))
+    return got
+
+
+def show():
+    t, cfg = template(), load(CFG, {})
+    k = kinds(t)
+    live_extra = [r for r in (cfg.get("routing") or {}).get("rules", []) if (r.get("ruleTag") or "").startswith("fo-")]
+    rules = []
+    for i, r in enumerate(t["routing"]["rules"]):
+        o = owner(r, k)
+        rules.append({"i": i, "sha": sha(r), "owner": o, "mine": not o, "enabled": r.get("enabled") is not False,
+                      "tag": r.get("ruleTag", ""), "to": target(r), "balancer": bool(r.get("balancerTag")),
+                      "match": {f: r[f] for f in FIELDS if f in r}, "rule": r})
+    ib = inbound_rows()
+    w = where(t)
+    for x in ib:
+        x["exit"] = w.get(x["tag"], "")
+    guard = load("/var/lib/tunnel-guard/state.json", {})
+    c = load(GUARD_CONF, {})
+    return {"rules": rules, "inbounds": ib, "exits": exits(t), "primary": c.get("primary"),
+            "failover": live_extra, "on": guard.get("on"),
+            "outbounds": [{"tag": o.get("tag"), "protocol": o.get("protocol")} for o in t.get("outbounds", [])],
+            "balancers": [b.get("tag") for b in (t["routing"].get("balancers") or [])],
+            "domainStrategy": t["routing"].get("domainStrategy", "AsIs")}
+
+
+def xray_test(t):
+    cfg = load(CFG, {})
+    for key in ("outbounds", "routing", "dns", "burstObservatory", "observatory"):
+        if key in t:
+            cfg[key] = t[key]
+    cfg["routing"] = dict(cfg["routing"], rules=xuilive.as_panel_writes(t["routing"]["rules"]))
+    path = "/tmp/xui-route-candidate.json"
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+    r = subprocess.run([XRAY, "run", "-test", "-c", path], cwd=BIN, capture_output=True, text=True, timeout=60)
+    os.remove(path)
+    out = (r.stdout + r.stderr).strip()
+    if "Configuration OK" not in out:
+        raise Bad("Xray این تغییر را قبول نکرد: " + (out.splitlines() or [""])[-1][-200:])
+
+
+def commit(new, old, note):
+    xray_test(new)
+    backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
+    os.makedirs(backup, exist_ok=True)
+    xuidb.backup_to(backup)
+    shutil.copy2(CFG, backup)
+    db = xuidb.connect()
+    db.execute("update settings set value=? where key=?", (json.dumps(new, indent=2, ensure_ascii=False), KEY))
+    db.commit()
+    db.close()
+    subprocess.run(["config-guard", "--save"], capture_output=True)         # the new normal, before config.json changes
+    try:
+        xuilive.apply(new, old, allow_restart=False)
+    except xuilive.Failed as e:                                            # put it back: never half applied
+        db = xuidb.connect()
+        db.execute("update settings set value=? where key=?", (json.dumps(old, indent=2, ensure_ascii=False), KEY))
+        db.commit()
+        db.close()
+        subprocess.run(["config-guard", "--save"], capture_output=True)
+        raise Bad("در Xray در حال اجرا اعمال نشد (%s)؛ چیزی تغییر نکرد" % e)
+    return backup
+
+
+def assign(inbound, exit_):
+    t = template()
+    old = json.loads(json.dumps(t))
+    if inbound not in {x["tag"] for x in inbound_rows()}:
+        raise Bad("اینباندی به اسم %s نیست" % inbound)
+    if exit_ not in exits(t):
+        raise Bad("مقصد %s نیست (مسیرها: %s)" % (exit_, "، ".join(exits(t))))
+    if where(t).get(inbound) == exit_:
+        return {"ok": True, "msg": "%s از قبل به %s می‌رود" % (inbound, exit_)}
+    k = kinds(t)
+    rules = t["routing"]["rules"]
+    for r in rules:                                  # out of every catch-all (and the split's copies)
+        if catch_all(r, k) or (r.get("ruleTag") or "").startswith("split-"):
+            if inbound in r.get("inboundTag", []):
+                r["inboundTag"] = [x for x in r["inboundTag"] if x != inbound]
+    rules[:] = [r for r in rules if not (("inboundTag" in r) and not r["inboundTag"])]
+    route = xuimix.route(t, exit_) if k.get(exit_) not in ("freedom", "blackhole") else {"outboundTag": exit_}
+    tag = "main-" + exit_.lower()
+    home = next((r for r in rules if r.get("ruleTag") == tag), None) or \
+        next((r for r in rules if catch_all(r, k) and target(r) == exit_ and r.get("enabled") is not False), None)
+    if home:
+        home["inboundTag"] = home["inboundTag"] + [inbound]
+        home.setdefault("ruleTag", tag)
+    else:
+        mains = [i for i, r in enumerate(rules) if catch_all(r, k)]
+        at = (mains[-1] + 1) if mains else len(rules)
+        rules.insert(at, dict({"type": "field", "ruleTag": tag, "inboundTag": [inbound]}, **route))
+    backup = commit(t, old, "assign %s %s" % (inbound, exit_))
+    # the split is built from the catch-alls: rebuild it for the new layout (live)
+    r = subprocess.run(["xui-split", "apply", "--no-tg-backup"], capture_output=True, text=True, timeout=240)
+    split = "" if r.returncode == 0 else " (بازسازی تقسیم mux نشد: %s)" % (r.stdout + r.stderr).strip()[-160:]
+    return {"ok": True, "backup": backup, "msg": "کاربران %s حالا به %s می‌روند%s" % (inbound, exit_, split)}
+
+
+def mine(t, n, fp):
+    rules = t["routing"]["rules"]
+    if not 0 <= n < len(rules):
+        raise Bad("قانون %d نیست" % n)
+    if sha(rules[n]) != fp:
+        raise Bad("این قانون از وقتی صفحه باز شد عوض شده؛ صفحه را تازه کنید")
+    if owner(rules[n], kinds(t)):
+        raise Bad("این قانون مال «%s» است و همان ابزار آن را می‌سازد؛ اینجا ویرایش نمی‌شود" % owner(rules[n], kinds(t)))
+    return rules
+
+
+def clean(r, t):
+    if not isinstance(r, dict):
+        raise Bad("قانون باید یک شیء JSON باشد")
+    r = {k: v for k, v in r.items() if k in FIELDS + ("ruleTag", "outboundTag", "balancerTag", "enabled", "type")}
+    r["type"] = "field"
+    to = r.get("outboundTag") or r.get("balancerTag")
+    if not to:
+        raise Bad("مقصد (outboundTag) لازم است")
+    if r.get("outboundTag") and r["outboundTag"] not in kinds(t):
+        raise Bad("اوت‌باند %s نیست" % r["outboundTag"])
+    if not any(k in r for k in FIELDS):
+        raise Bad("قانون دست‌کم یک شرط می‌خواهد (اینباند، دامنه، IP، پورت، ...)")
+    for k in FIELDS:
+        if k in r and isinstance(r[k], list):
+            r[k] = [str(x).strip() for x in r[k] if str(x).strip()]
+            if not r[k]:
+                del r[k]
+    if (r.get("ruleTag") or "").startswith(("guard-", "split-", "main-", "fo-", "xui-optimizer", "dns-")):
+        raise Bad("این نام مال قانون‌های ابزارهاست؛ اسم دیگری بگذارید")
+    if r.get("enabled") is True:
+        r.pop("enabled")
+    if catch_all(r, kinds(t)):
+        raise Bad("قانونی که فقط اینباند دارد مسیر اینباند را تعیین می‌کند؛ از بخش «اینباند → مسیر» عوض کنید")
+    return r
+
+
+def default_at(t):
+    """Right before the first rule that sends users on (split rules or catch-alls)."""
+    k = kinds(t)
+    for i, r in enumerate(t["routing"]["rules"]):
+        if (r.get("ruleTag") or "").startswith("split-") or catch_all(r, k):
+            return i
+    return len(t["routing"]["rules"])
+
+
+def rule_op(op, args):
+    t = template()
+    old = json.loads(json.dumps(t))
+    rules = t["routing"]["rules"]
+    if op == "add":
+        r = clean(json.loads(args[0]), t)
+        at = int(args[args.index("--at") + 1]) if "--at" in args else default_at(t)
+        rules.insert(max(1, min(at, len(rules))), r)
+        what = "قانون اضافه شد"
+    else:
+        n, fp = int(args[0]), args[1]
+        rules = mine(t, n, fp)
+        if op == "edit":
+            rules[n] = clean(json.loads(args[2]), t)
+            what = "قانون عوض شد"
+        elif op == "del":
+            rules.pop(n)
+            what = "قانون حذف شد"
+        elif op == "toggle":
+            if rules[n].get("enabled") is False:
+                rules[n].pop("enabled")
+                what = "قانون روشن شد"
+            else:
+                rules[n]["enabled"] = False
+                what = "قانون خاموش شد"
+        elif op == "move":
+            j = n - 1 if args[2] == "up" else n + 1
+            if not 1 <= j < len(rules):
+                raise Bad("جابه‌جا نمی‌شود")
+            if rules[j].get("inboundTag") == ["api"] or (rules[j].get("ruleTag") or "").startswith("guard-"):
+                raise Bad("قانون API و probeها اول می‌مانند")
+            rules[n], rules[j] = rules[j], rules[n]
+            what = "جابه‌جا شد"
+        else:
+            raise Bad("کار نامعلوم: " + op)
+    backup = commit(t, old, "rule " + op)
+    return {"ok": True, "msg": what + " (بدون ری‌استارت)", "backup": backup}
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    mode = args[0] if args else "show"
+    say = lambda d: print(json.dumps(d, ensure_ascii=False) if as_json else d.get("msg", ""))
+    try:
+        if mode == "show":
+            d = show()
+            if as_json:
+                return print(json.dumps(d, ensure_ascii=False))
+            for x in d["inbounds"]:
+                print("%-16s %-6s -> %s" % (x["tag"], x["port"], x["exit"] or "-"))
+            print()
+            for r in d["rules"]:
+                print("%2d %-24s %-14s -> %-12s %s%s" % (r["i"], r["tag"] or "-", r["owner"] or "mine", r["to"],
+                                                         ",".join(r["match"]), "" if r["enabled"] else "  (off)"))
+        elif mode == "assign" and len(args) >= 3:
+            say(assign(args[1], args[2]))
+        elif mode == "rule" and len(args) >= 2:
+            say(rule_op(args[1], args[2:]))
+        else:
+            print(__doc__)
+            sys.exit(2)
+    except (Bad, ValueError, IndexError) as e:
+        print(json.dumps({"ok": False, "msg": str(e)}, ensure_ascii=False) if as_json else str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run this as root")
+    main()

@@ -102,11 +102,16 @@ def as_panel_writes(rules):
     return out
 
 
-def injected(cfg, old):
-    """Rules the panel adds of its own when it writes config.json (its egress rule, for one):
-    live rules the old template does not account for."""
+def injected(cfg, old, where="top"):
+    """Live rules nobody's template holds, which must survive a replacement of the rules: the
+    panel's own egress rule (it puts it first) and tunnel-guard's failover rules fo-* (added at the
+    end). Nothing else: the running config can be older than the template (rules edited in the
+    panel and not yet applied), and an older copy of a template rule is not a rule to keep - sent
+    together with the new one Xray refuses a duplicate tag."""
     mine = {json.dumps(r, sort_keys=True) for r in as_panel_writes((old.get("routing") or {}).get("rules", []))}
-    return [r for r in (cfg.get("routing") or {}).get("rules", []) if json.dumps(r, sort_keys=True) not in mine]
+    keep = lambda r: json.dumps(r, sort_keys=True) not in mine and (
+        "panel-egress" in (r.get("inboundTag") or []) if where == "top" else (r.get("ruleTag") or "").startswith("fo-"))
+    return [r for r in (cfg.get("routing") or {}).get("rules", []) if keep(r)]
 
 
 def plan(tpl, old, cfg=None):
@@ -129,7 +134,7 @@ def plan(tpl, old, cfg=None):
     live_i, new_i = guard(cfg), guard(tpl)
     add_i = [t for t, i in new_i.items() if t not in live_i or not _same(i, live_i[t])]
     drop_i = [t for t in live_i if t not in new_i]
-    rules = injected(cfg, old) + as_panel_writes(new_r.get("rules", []))
+    rules = injected(cfg, old) + as_panel_writes(new_r.get("rules", [])) + injected(cfg, old, "end")
     same_rules = _same(rules, (cfg.get("routing") or {}).get("rules", [])) and         _same(new_r.get("balancers") or [], (cfg.get("routing") or {}).get("balancers") or [])
     return {"restart": why, "outbounds": (add_o, drop_o), "inbounds": (add_i, drop_i),
             "rules": None if same_rules else rules,

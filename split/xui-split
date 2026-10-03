@@ -207,7 +207,7 @@ def patch(t, remove=False):
     for ob, r in found.items():
         r["ruleTag"] = tags_of(ob)["main"]
     for r in rules:                  # DoH of the DNS cache: whatever outbound it was given
-        if r.get("inboundTag") == ["dns-internal"]:
+        if r.get("inboundTag") == ["dns-internal"] and "user" not in r and not (r.get("outboundTag") or "").startswith("up~"):
             r["ruleTag"] = "dns-upstream"
 
     svc = t.setdefault("api", {}).setdefault("services", [])

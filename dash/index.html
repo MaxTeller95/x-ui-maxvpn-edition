@@ -145,6 +145,21 @@
   table th { text-align: right; font-weight: 600; color: var(--muted); font-size: 12px; padding: 4px 0; }
   table td { padding: 5px 0; border-top: 1px solid var(--line); }
   table td.n { direction: ltr; text-align: left; white-space: nowrap; }
+  .rt-row { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; gap: 8px; align-items: start; padding: 6px 0;
+            border-bottom: 1px solid var(--line); }
+  .rt-row.off { opacity: .5; }
+  .rt-row .no { color: var(--muted); font-size: 12px; padding-top: 2px; text-align: center; }
+  .rt-row .m { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; }
+  .rt-row .m span { font-size: 11px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 0 6px; }
+  .rt-row .acts button { padding: 0 6px; font-size: 12px; }
+  .rt-row.tool .acts { color: var(--muted); font-size: 11px; }
+  .rt-form { border: 1px solid var(--accent); border-radius: 10px; padding: 10px; margin-bottom: 10px; display: grid; gap: 8px; }
+  .rt-form label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+  .rt-form textarea, .rt-form input, .rt-form select { direction: ltr; text-align: left; }
+  .rt-form .ibs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .rt-form .ibs label { display: inline-flex; gap: 4px; align-items: center; }
+  .rt-in-row { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 8px; align-items: center; padding: 6px 0;
+               border-bottom: 1px solid var(--line); }
   .spd { padding: 8px 0; border-bottom: 1px solid var(--line); }
   .spd:last-child { border-bottom: 0; }
   .spd .sh { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 4px; }
@@ -214,6 +229,7 @@
     <button class="on" data-tab="over">نمای کلی</button>
     <button data-tab="users">کاربران</button>
     <button data-tab="health">سلامت</button>
+    <button data-tab="route">مسیریابی</button>
     <button data-tab="tools">ابزارها</button>
   </nav>
 
@@ -359,6 +375,40 @@
     </div>
   </section>
 
+  <section data-panel="route">
+    <div class="grid">
+      <div class="card wide">
+        <h2>اینباند ← مسیر <span class="muted">هر اینباند (پورت) کاربرانش را به کدام سرور بفرستد</span></h2>
+        <div id="rt-in" class="muted">...</div>
+        <div class="muted sm" style="margin-top:6px">مسیرها فقط همین‌جا از هم جدا می‌شوند: هر اینباند دقیقاً به یک مسیر می‌رود (یا مستقیم / مسدود).
+          با عوض کردن، قانون اصلی همان مسیر (main-…) عوض می‌شود و تقسیم mux برای همه‌ی مسیرها از نو ساخته می‌شود؛ بدون ری‌استارت و
+          بدون اثر روی حساب حجم. نگهبان فقط اینباندهای <b>مسیر اصلی</b> را هنگام قطعی به پشتیبان می‌برد.</div>
+      </div>
+
+      <div class="card wide">
+        <h2>Mux و تقسیم ترافیک <span class="muted">سبک با mux، سنگین بدون mux، برای هر مسیر</span>
+          <label class="switch" title="تقسیم ترافیک روشن/خاموش (قانون‌ها از نو ساخته می‌شوند)"><input type="checkbox" id="split"><span></span></label></h2>
+        <div id="split-state" class="sm"></div>
+      </div>
+
+      <div class="card wide">
+        <h2>قانون‌ها <span class="muted" id="rt-count"></span>
+          <span><button id="rt-add" class="primary">+ قانون تازه</button></span></h2>
+        <div id="rt-edit"></div>
+        <div id="rt-fo"></div>
+        <div id="rt-rules" class="muted">...</div>
+        <details class="tnd"><summary>راهنما</summary><div class="muted sm" style="margin-top:6px">
+          قانون‌ها به همین ترتیب از بالا بررسی می‌شوند و اولین قانونی که بخورد مقصد را تعیین می‌کند. قانون‌هایی که برچسب صاحب دارند
+          (probe نگهبان، تقسیم mux، مسیر اینباند، کش DNS، Optimizer، آپلود سنگین) را همان ابزار می‌سازد و اینجا فقط نمایش داده می‌شوند؛
+          بقیه مال شماست: ساختن، ویرایش، جابه‌جا کردن، خاموش/روشن و حذف، همه بدون ری‌استارت و بعد از تست Xray.
+          نمونه‌ی دامنه: <span dir="ltr">domain:example.com</span> (با زیردامنه‌ها)، <span dir="ltr">full:www.example.com</span> (دقیق)،
+          <span dir="ltr">geosite:google</span>، <span dir="ltr">ext:geosite_IR.dat:ir</span>، <span dir="ltr">regexp:.*\.ir$</span>؛
+          IP: <span dir="ltr">1.2.3.4/32</span>، <span dir="ltr">geoip:private</span>، <span dir="ltr">ext:geoip_IR.dat:ir</span>؛
+          پورت: <span dir="ltr">443</span> یا <span dir="ltr">1000-2000,8443</span>.</div></details>
+      </div>
+    </div>
+  </section>
+
   <section data-panel="tools">
     <div class="grid">
       <div class="card">
@@ -373,11 +423,6 @@
 
       <div class="card">
         <h2>ویژگی‌ها</h2>
-        <div class="row">
-          <div>تقسیم ترافیک سبک / سنگین<div class="muted">صفحه‌ها و پیام‌رسان‌ها با Mux، دانلود و ویدیو بدون Mux</div>
-            <div id="split-state" class="sm" style="margin-top:4px"></div></div>
-          <label class="switch"><input type="checkbox" id="split"><span></span></label>
-        </div>
         <div class="row"><div>کش DNS روی هاب</div><span id="f-dns"></span></div>
         <div class="row"><div>مسیرهای پشتیبان<div class="muted" id="f-bk-list"></div></div><span id="f-bk"></span></div>
         <div class="row"><div>بکاپ روزانه به تلگرام</div><span id="f-tg"></span></div>
@@ -1083,6 +1128,92 @@ function renderMtu(v) {
     `<span class="chip ${h.ok ? "ok" : "bad"}" title="${esc(h.err || "")}" dir="ltr">${esc(h.host || h.addr)}${h.host ? " (" + esc(h.addr) + ")" : ""}</span>`).join(" ")
     || '<span class="muted">هنوز به سروری وصل نشده.</span>';
 }
+/* ---------- routing tab ---------- */
+let RT = null, RTEDIT = null;
+const RT_FIELDS = { inboundTag: "اینباند", domain: "دامنه", ip: "IP", port: "پورت", sourcePort: "پورت مبدأ", network: "شبکه",
+  protocol: "پروتکل", user: "کاربر", source: "IP مبدأ", attrs: "attrs" };
+function rtExitName(x) {
+  if (!RT) return x;
+  if (x === "direct") return "مستقیم (از خود هاب)";
+  if (x === "blocked") return "مسدود";
+  return x + (x === RT.primary ? " · اصلی" : "");
+}
+function rtMatch(m) {
+  return Object.entries(m).map(([k, v]) => {
+    const list = Array.isArray(v) ? v : [v];
+    const shown = list.slice(0, 3).join("، ") + (list.length > 3 ? ` و ${list.length - 3} مورد دیگر` : "");
+    return `<span title="${esc(list.join("\n"))}"><b>${RT_FIELDS[k] || k}:</b> <span dir="ltr">${esc(shown)}</span></span>`;
+  }).join("");
+}
+function renderRoute(v) {
+  RT = v || {};
+  if (!RT.rules) { $("#rt-rules").textContent = "xui-route نصب نیست یا جواب نداد."; return; }
+  const ex = RT.exits || [];
+  $("#rt-in").classList.remove("muted");
+  $("#rt-in").innerHTML = (RT.inbounds || []).map((x) => `<div class="rt-in-row">
+      <div><b>${esc(x.remark || x.tag)}</b> ${x.enabled ? "" : '<span class="chip off">خاموش</span>'}
+        <div class="muted sm" dir="ltr">${esc(x.tag)} · ${x.port} · ${esc(x.protocol)} · ${x.clients} clients</div></div>
+      <select data-rtassign="${esc(x.tag)}">${x.exit ? "" : '<option value="" selected>— هیچ‌جا (پیش‌فرض Xray)</option>'}
+        ${ex.map((e) => `<option value="${esc(e)}" ${e === x.exit ? "selected" : ""}>${esc(rtExitName(e))}</option>`).join("")}
+        ${x.exit && !ex.includes(x.exit) ? `<option selected>${esc(x.exit)}</option>` : ""}</select></div>`).join("")
+    || '<div class="muted">اینباندی نیست.</div>';
+  const mine = RT.rules.filter((r) => r.mine).length;
+  $("#rt-count").textContent = `${RT.rules.length} قانون · ${mine} قانون شما`;
+  $("#rt-fo").innerHTML = (RT.failover || []).length ? `<div class="chip warn" style="margin-bottom:6px">نگهبان الان کاربران مسیر اصلی را به
+      ${esc(RT.on || "")} برده (قانون‌های fo-… فقط در Xray در حال اجرا هستند، جلوتر از همه)</div>` : "";
+  $("#rt-rules").classList.remove("muted");
+  $("#rt-rules").innerHTML = RT.rules.map((r) => `<div class="rt-row ${r.enabled ? "" : "off"} ${r.mine ? "" : "tool"}">
+      <div class="no">${r.i}</div>
+      <div><b dir="ltr">${esc(r.tag || (r.mine ? "بی‌نام" : ""))}</b>
+        ${r.mine ? '<span class="chip accent">شما</span>' : `<span class="chip">${esc(r.owner)}</span>`}
+        → <b dir="ltr">${esc(r.to)}</b>${r.balancer ? ' <span class="muted sm">(بالانسر)</span>' : ""}${r.enabled ? "" : ' <span class="chip off">خاموش</span>'}
+        <div class="m">${rtMatch(r.match)}</div></div>
+      <div class="acts">${r.mine ? `<button data-rtop="move" data-dir="up" data-i="${r.i}" data-sha="${r.sha}" title="بالاتر">▲</button><button data-rtop="move" data-dir="down" data-i="${r.i}" data-sha="${r.sha}" title="پایین‌تر">▼</button><button data-rtop="toggle" data-i="${r.i}" data-sha="${r.sha}" title="خاموش/روشن">⏻</button><button data-rtop="edit" data-i="${r.i}" data-sha="${r.sha}" title="ویرایش">✎</button><button data-rtop="del" data-i="${r.i}" data-sha="${r.sha}" title="حذف">×</button>` : "خودکار"}</div></div>`).join("");
+  renderRtEdit();
+}
+function renderRtEdit() {
+  const el = $("#rt-edit");
+  if (!RTEDIT) { el.innerHTML = ""; return; }
+  const r = RTEDIT.rule || {}, lines = (k) => esc((r[k] || []).join("\n"));
+  const tos = (RT.outbounds || []).map((o) => o.tag).filter((t) => t && t !== "api").concat((RT.balancers || []).map((b) => "balancer:" + b));
+  const cur = r.balancerTag ? "balancer:" + r.balancerTag : r.outboundTag || "direct";
+  const ib = r.inboundTag || [];
+  el.innerHTML = `<div class="rt-form">
+    <b>${RTEDIT.i == null ? "قانون تازه" : "ویرایش قانون " + RTEDIT.i}</b>
+    <label>نام (اختیاری)<input id="rf-tag" value="${esc(r.ruleTag || "")}" placeholder="my-rule"></label>
+    <label>مقصد<select id="rf-to">${tos.map((t) => `<option value="${esc(t)}" ${t === cur ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+    <label>اینباندها (هیچ = همه)<div class="ibs">${(RT.inbounds || []).map((x) => `<label><input type="checkbox" data-rfib value="${esc(x.tag)}" ${ib.includes(x.tag) ? "checked" : ""}>${esc(x.remark || x.tag)} <span dir="ltr">(${x.port})</span></label>`).join("")}</div></label>
+    <label>دامنه‌ها (هر خط یکی)<textarea id="rf-domain" rows="3" placeholder="domain:example.com">${lines("domain")}</textarea></label>
+    <label>IPها (هر خط یکی)<textarea id="rf-ip" rows="2" placeholder="1.2.3.4/32">${lines("ip")}</textarea></label>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <label style="flex:1">پورت<input id="rf-port" value="${esc(r.port || "")}" placeholder="443,8000-9000"></label>
+      <label style="flex:1">شبکه<select id="rf-net">${["", "tcp", "udp", "tcp,udp"].map((n) => `<option value="${n}" ${String(r.network || "") === n ? "selected" : ""}>${n || "هر دو"}</option>`).join("")}</select></label></div>
+    <label>پروتکل (sniffing)<div class="ibs">${["http", "tls", "quic", "bittorrent"].map((p) => `<label><input type="checkbox" data-rfproto value="${p}" ${(r.protocol || []).includes(p) ? "checked" : ""}>${p}</label>`).join("")}</div></label>
+    <label>کاربران (ایمیل کلاینت، هر خط یکی)<textarea id="rf-user" rows="2">${lines("user")}</textarea></label>
+    <div class="btns"><button class="primary" id="rf-save">${RTEDIT.i == null ? "اضافه کن" : "ذخیره"}</button><button id="rf-cancel">انصراف</button>
+      <span class="muted sm">قبل از اعمال با xray -test سنجیده می‌شود؛ بدون ری‌استارت.${RTEDIT.i == null ? " جای قانون تازه: درست قبل از قانون‌های مسیر (بعد از قانون‌های مسدودسازی)." : ""}</span></div></div>`;
+  $("#rf-cancel").onclick = () => { RTEDIT = null; renderRtEdit(); };
+  $("#rf-save").onclick = async (e) => {
+    const list = (id) => $(id).value.split("\n").map((x) => x.trim()).filter(Boolean);
+    const rule = { type: "field" };
+    const tag = $("#rf-tag").value.trim(); if (tag) rule.ruleTag = tag;
+    const to = $("#rf-to").value; if (to.startsWith("balancer:")) rule.balancerTag = to.slice(9); else rule.outboundTag = to;
+    const ibs = [...document.querySelectorAll("[data-rfib]:checked")].map((c) => c.value); if (ibs.length) rule.inboundTag = ibs;
+    const dm = list("#rf-domain"); if (dm.length) rule.domain = dm;
+    const ip = list("#rf-ip"); if (ip.length) rule.ip = ip;
+    const port = $("#rf-port").value.trim(); if (port) rule.port = port;
+    const net = $("#rf-net").value; if (net) rule.network = net;
+    const pr = [...document.querySelectorAll("[data-rfproto]:checked")].map((c) => c.value); if (pr.length) rule.protocol = pr;
+    const us = list("#rf-user"); if (us.length) rule.user = us;
+    if (RTEDIT.rule && RTEDIT.rule.enabled === false) rule.enabled = false;
+    e.target.disabled = true; toast("در حال تست و اعمال...");
+    const r = await post("route-rule", RTEDIT.i == null ? { op: "add", rule } : { op: "edit", i: RTEDIT.i, sha: RTEDIT.sha, rule });
+    e.target.disabled = false;
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    if (r.ok) { RTEDIT = null; loadRoute(); }
+  };
+}
+async function loadRoute() { const v = await get("route"); renderRoute(v); }
 async function loadMtu() { const v = await get("mtu"); if (v) renderMtu(v); }
 async function tnSave(name, addrs, extra = {}) {
   const r = await post("tunnel-set", Object.assign({ name, addrs }, extra));
@@ -1138,6 +1269,7 @@ document.querySelectorAll("nav.tabs button").forEach((b) => {
     if (TAB === "health" && !L) { loadLint(); loadCG(); }
     if (TAB === "health") loadReach();
     if (TAB === "tools") { loadUnits(); loadPaths(); loadTunnels(); loadMtu(); }
+    if (TAB === "route") { loadRoute(); loadStatus(); }
   };
 });
 $("#r-3h").onclick = () => { RANGE = "3h"; $("#r-3h").classList.add("primary"); $("#r-24h").classList.remove("primary"); loadLive(); };
@@ -1180,6 +1312,18 @@ document.addEventListener("click", async (e) => {
   }
   const w = e.target.closest("[data-probe]");
   if (w) { document.querySelector('nav.tabs button[data-tab="users"]').click(); probeUser(w.dataset.probe); return; }
+  if (e.target.id === "rt-add") { RTEDIT = { i: null, rule: { type: "field" } }; renderRtEdit(); return; }
+  const ro = e.target.closest("[data-rtop]");
+  if (ro) {
+    const d = ro.dataset, i = +d.i, r0 = (RT.rules || []).find((x) => x.i === i);
+    if (d.rtop === "edit") { RTEDIT = { i, sha: d.sha, rule: JSON.parse(JSON.stringify(r0.rule)) }; renderRtEdit(); $("#rt-edit").scrollIntoView({ block: "nearest" }); return; }
+    if (d.rtop === "del" && !confirm(`قانون ${i} (${r0.tag || "بی‌نام"} → ${r0.to}) حذف بشه؟ بدون ری‌استارت.`)) return;
+    ro.disabled = true;
+    const r = await post("route-rule", { op: d.rtop, i, sha: d.sha, dir: d.dir });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadRoute();
+    return;
+  }
   const mv = e.target.closest("[data-mvpath]");
   if (mv) {
     const name = mv.dataset.mvpath;
@@ -1410,6 +1554,18 @@ $("#mux-run").onclick = async () => {
   muxPoll();
 };
 document.addEventListener("change", async (e) => {
+  if (e.target.dataset && e.target.dataset.rtassign) {
+    const ib = e.target.dataset.rtassign, ex = e.target.value;
+    const was = ((RT && RT.inbounds) || []).find((x) => x.tag === ib) || {};
+    if (!ex || !confirm(`کاربران ${was.remark || ib} (پورت ${was.port}) به «${rtExitName(ex)}» بروند؟\nقانون اصلی مسیرها و تقسیم mux از نو ساخته می‌شوند، بدون ری‌استارت. اتصال‌های باز همین اینباند روی مسیر قبلی می‌مانند تا بسته شوند.`)) {
+      loadRoute(); return;
+    }
+    e.target.disabled = true; toast("در حال اعمال...");
+    const r = await post("route-assign", { inbound: ib, exit: ex });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadRoute(); loadStatus();
+    return;
+  }
   if (e.target.id === "smartmux") {
     e.target.disabled = true;
     const r = await post("split-smart", { on: e.target.checked });

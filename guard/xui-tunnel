@@ -799,7 +799,7 @@ def steer_template(t, moves):
         t["outbounds"].append(o)
         out = []
         for r in rules:
-            if r.get("outboundTag") in (name, name + "-mux") and "user" not in r and r.get("enabled") is not False:
+            if r.get("outboundTag") in (name, name + "-mux") and "user" not in r and r.get("enabled") is not False                     and "dns-internal" not in (r.get("inboundTag") or []):       # the DNS cache's own lookups carry no user
                 out.append(dict({k: v for k, v in r.items() if k not in ("ruleTag", "outboundTag", "comment")},
                                 user=sorted(users), outboundTag=STEER + name))
             out.append(r)
