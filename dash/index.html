@@ -866,8 +866,8 @@ function renderPaths(list) {
       · ${esc(p.protocol)}/${esc(p.network)}${p.security && p.security !== "none" ? "/" + esc(p.security) : ""}</div></td>
     <td class="n muted hide-sm">${esc(p.address)}${p.iface ? " · " + esc(p.iface) : ""}</td>
     <td class="n muted">probe ${p.probe || "—"}</td>
-    <td class="act">${p.can_primary ? `<button data-mkprimary="${esc(p.name)}" title="این مسیر اصلی شود (بدون ری‌استارت)">اصلی کن</button> ` : ""}${p.removable ? `<button data-rmpath="${esc(p.name)}">حذف</button>`
-      : `<button disabled title="${p.in_use ? "کاربرها روی این مسیرند" : "مسیر اصلی را نمی‌شود حذف کرد؛ اول یک مسیر دیگر را «اصلی کن» بزنید"}">حذف</button>`}</td></tr>`).join("")
+    <td class="act">${!p.gone ? `<button data-mvpath="${esc(p.name)}" title="تغییر نام (بدون ری‌استارت)">✎</button> ` : ""}${p.can_primary ? `<button data-mkprimary="${esc(p.name)}" title="این مسیر اصلی شود (بدون ری‌استارت)">اصلی کن</button> ` : ""}${p.removable ? `<button data-rmpath="${esc(p.name)}" data-inuse="${p.in_use ? 1 : ""}">حذف</button>`
+      : `<button disabled title="مسیر اصلی را نمی‌شود حذف کرد؛ اول یک مسیر دیگر را «اصلی کن» بزنید">حذف</button>`}</td></tr>`).join("")
     || '<tr><td class="empty">مسیری تعریف نشده.</td></tr>';
 }
 async function loadPaths() { const p = await get("paths"); if (p) renderPaths(p); }
@@ -1151,6 +1151,17 @@ document.addEventListener("click", async (e) => {
   }
   const w = e.target.closest("[data-probe]");
   if (w) { document.querySelector('nav.tabs button[data-tab="users"]').click(); probeUser(w.dataset.probe); return; }
+  const mv = e.target.closest("[data-mvpath]");
+  if (mv) {
+    const name = mv.dataset.mvpath;
+    const nw = (prompt(`اسم تازه برای ${name} (حروف انگلیسی، عدد، - و _):`, name) || "").trim();
+    if (!nw || nw === name) return;
+    mv.disabled = true; toast("در حال تغییر نام...");
+    const r = await post("path-rename", { name, new: nw });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadPaths(); loadStatus(); loadTunnels();
+    return;
+  }
   const mp = e.target.closest("[data-mkprimary]");
   if (mp) {
     const name = mp.dataset.mkprimary, cur = (window.PATHS_LIST || []).find((p) => p.role === "primary");
@@ -1165,7 +1176,8 @@ document.addEventListener("click", async (e) => {
   const rp = e.target.closest("[data-rmpath]");
   if (rp) {
     const name = rp.dataset.rmpath;
-    if (!confirm(`مسیر ${name} از زنجیره حذف بشه؟ اوت‌باند و پورت probe و ردیفش در نگهبان پاک می‌شن و x-ui ری‌استارت می‌شه.`)) return;
+    if (!confirm(`مسیر ${name} از زنجیره حذف بشه؟ اوت‌باند و پورت probe و ردیفش در نگهبان پاک می‌شن (بدون ری‌استارت).`
+        + (rp.dataset.inuse ? " کاربرها الان روی این مسیرند: اول به مسیر اصلی (اگر جواب بده) یا پشتیبان سالم بعدی می‌رن." : ""))) return;
     rp.disabled = true; toast("در حال حذف...");
     const r = await post("path-remove", { name });
     toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));

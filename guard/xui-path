@@ -4,6 +4,8 @@
     xui-path list [--json]
     xui-path add NAME "vless://...#whatever"      paste the link of a server abroad
     xui-path remove NAME
+    xui-path rename NAME NEW                a new name everywhere (outbound, its mux and tunnel copies,
+                                            probe port, rules, guard, split and tunnel settings; live)
     xui-path primary NAME [--force]         make a backup path the primary one (live, no restart):
                                             users' catch-all rule and the DNS cache's upstream move
                                             to it; a primary whose outbound is gone is dropped
@@ -31,9 +33,9 @@ trojan, vmess, shadowsocks, and two QUIC (UDP) protocols for a fast backup on a 
                          or removing such a path restarts sing-box (its own tuns blink too).
 
 Both ride UDP: where UDP abroad is throttled they fail, and the guard simply skips them.
-The primary path cannot be removed, and neither can the one users are on right now: to drop
-the primary, make another path primary first (its leftovers go with it when its outbound was
-already deleted in the panel).
+The primary path cannot be removed: make another path primary first (its leftovers go with it
+when its outbound was already deleted in the panel). A backup users are on right now is removed
+after they are moved: back to the primary when it answers, else to the next backup that does.
 """
 import base64, glob, json, os, re, shutil, subprocess, sys, time, urllib.parse
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), d) for d in ("lib", "../lib")] + ["/usr/local/lib/xui-optimizer"]
@@ -270,9 +272,9 @@ def probe_port(t):
 
 def test_config(t):
     cfg = json.load(open(CFG))
-    for k in ("api", "outbounds", "routing", "dns"):
+    for k in ("api", "outbounds", "routing", "dns", "burstObservatory", "observatory"):
         if k in t:
-            cfg[k] = t[k]
+            cfg[k] = t[k]                               # a mix's balancers need the observatory
     cfg["inbounds"] = [i for i in cfg.get("inbounds", []) if not (i.get("tag") or "").startswith("guard-")] + \
                       [i for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")]
     path = "/tmp/xui-path-candidate.json"
@@ -285,7 +287,7 @@ def test_config(t):
     return "Configuration OK" in out, (out.strip().splitlines() or [""])[-1]
 
 
-def apply(t, note):
+def apply(t, note, allow_restart=True):
     backup = "/root/xui-backup-" + time.strftime("%Y%m%d-%H%M%S")
     os.makedirs(backup, exist_ok=True)
     xuidb.backup_to(backup)
@@ -298,7 +300,7 @@ def apply(t, note):
     # the new normal, saved before config.json changes: config-guard reacts to that write
     # and would otherwise put a removed path straight back
     subprocess.run(["config-guard", "--save"], capture_output=True)
-    xuilive.apply(t, old)                               # outbound, probe port, rule: live
+    xuilive.apply(t, old, allow_restart)                # outbound, probe port, rule: live
     time.sleep(2)
     return backup
 
@@ -341,7 +343,7 @@ def listing():
                     "network": (o.get("streamSettings") or {}).get("network", "—"),
                     "iface": p.get("iface") or "", "peer": p.get("peer") or "",
                     "probe": probes.get("guard-" + name.lower()), "in_use": name == on,
-                    "removable": i > 0 and name != on, "gone": name not in outs,
+                    "removable": i > 0, "gone": name not in outs,
                     "can_primary": i > 0 and name in outs})
     return out
 
@@ -501,6 +503,156 @@ def make_primary(name, as_json, force=False):
     print(json.dumps({"ok": True, "msg": msg, "backup": backup}, ensure_ascii=False) if as_json else msg)
 
 
+def move_users_off(name, c, t, as_json):
+    """Users are on backup NAME: send them to the primary when it answers, else to the next backup
+    that does (the guard does it, through a one-run hold), and wait for it."""
+    probes = {i.get("tag"): i.get("port") for i in t.get("inbounds", []) if (i.get("tag") or "").startswith("guard-")}
+    outs = {o.get("tag") for o in t.get("outbounds", [])}
+    prim = c.get("primary")
+    for target in [prim] + [b for b in c.get("backups") or [] if b != name]:
+        port = probes.get("guard-" + (target or "").lower())
+        if target in outs and port and try_path(port, tries=2)["ok"]:
+            break
+    else:
+        die("کاربرها روی %s هستند و هیچ مسیر دیگری جواب نمی‌دهد؛ حذف نشد" % name, as_json)
+    hold = "/var/lib/tunnel-guard/hold"
+    had = open(hold).read().strip() if os.path.exists(hold) else None
+    with open(hold, "w") as f:
+        f.write(target)
+    subprocess.run(["systemctl", "start", "tunnel-guard.service"], capture_output=True, timeout=120)
+    if had and had != name:
+        with open(hold, "w") as f:
+            f.write(had)
+    else:
+        os.remove(hold)
+    try:
+        on = json.load(open(GUARD_STATE)).get("on")
+    except (OSError, ValueError):
+        on = None
+    if on == name:
+        die("کاربرها از %s جابجا نشدند؛ حذف نشد" % name, as_json)
+    return target
+
+
+def rename_tag(tag, name, new):
+    """NAME's tags under NEW: NAME, NAME-mux, mix~NAME~2b, mix-NAME, up~NAME, guard-name(-mux),
+    main-name, split-name-*. Anything else stays."""
+    if not tag:
+        return tag
+    lo, nlo = name.lower(), new.lower()
+    for a, b in ((name, new), (name + "-mux", new + "-mux")):
+        if tag == a:
+            return b
+        for pre in ("mix-", "up~"):
+            if tag == pre + a:
+                return pre + b
+        if tag.startswith("mix~" + a + "~"):
+            return "mix~" + b + tag[len("mix~" + a):]
+    for a, b in ((lo, nlo), (lo + "-mux", nlo + "-mux")):
+        for pre in ("guard-", "main-"):
+            if tag == pre + a:
+                return pre + b
+    if tag.startswith("split-%s-" % lo):
+        return "split-%s-" % nlo + tag[len("split-%s-" % lo):]
+    return tag
+
+
+def rename_in(t, name, new):
+    """The template (or config.json) with NAME's tags renamed."""
+    rt = lambda x: rename_tag(x, name, new)
+    for o in t.get("outbounds", []):
+        o["tag"] = rt(o.get("tag"))
+        sock = (o.get("streamSettings") or {}).get("sockopt") or {}
+        if sock.get("dialerProxy"):
+            sock["dialerProxy"] = rt(sock["dialerProxy"])
+    for i in t.get("inbounds", []):
+        if (i.get("tag") or "").startswith("guard-"):
+            i["tag"] = rt(i["tag"])
+    routing = t.get("routing") or {}
+    for r in routing.get("rules") or []:
+        for k in ("outboundTag", "balancerTag", "ruleTag"):
+            if r.get(k):
+                r[k] = rt(r[k])
+        if isinstance(r.get("inboundTag"), list):
+            r["inboundTag"] = [rt(x) for x in r["inboundTag"]]
+    for b in routing.get("balancers") or []:
+        b["tag"], b["fallbackTag"] = rt(b.get("tag")), rt(b.get("fallbackTag"))
+        b["selector"] = ["mix~%s~" % new + s[len("mix~%s~" % name):] if s.startswith("mix~%s~" % name) else
+                         "mix~%s-mux~" % new if s == "mix~%s-mux~" % name else s for s in b.get("selector") or []]
+        if b["fallbackTag"] is None:
+            b.pop("fallbackTag")
+    return t
+
+
+def rename(name, new, as_json):
+    t, c = template(), conf()
+    order = [c.get("primary")] + (c.get("backups") or [])
+    if name not in order:
+        die("مسیری به اسم %s در نگهبان نیست" % name, as_json)
+    if not NAME_OK.match(new) or new.endswith("-mux") or new.startswith(("mix", "up~")):
+        die("نام فقط حروف و عدد و - و _ (۲ تا ۲۴ کاراکتر)، بدون -mux در آخر", as_json)
+    taken = {o.get("tag") for o in t.get("outbounds", [])} | set(order) | set(c.get("paths") or {})
+    if new in taken or new + "-mux" in taken or new.lower() in {x.lower() for x in taken if x}:
+        die("اسم %s از قبل هست" % new, as_json)
+    old_t = json.loads(json.dumps(t))
+    t = rename_in(t, name, new)
+    if t["outbounds"] and old_t["outbounds"] and t["outbounds"][0].get("tag") != old_t["outbounds"][0].get("tag"):
+        die("%s اولین اوت‌باند (مسیر پیش‌فرض Xray) است؛ تغییر نامش ری‌استارت Xray می‌خواهد و انجام نشد" % name, as_json)
+    ok, detail = test_config(t)
+    if not ok:
+        die("Xray کانفیگ با نام تازه را رد کرد: " + detail, as_json)
+    # the guard's own failover rules live only in the running Xray: renamed there too, so the
+    # one replacement of the rules keeps them pointed at the right outbound
+    cfg = json.load(open(CFG))
+    mine = {json.dumps(r, sort_keys=True) for r in xuilive.as_panel_writes(old_t["routing"]["rules"])}
+    for r in cfg.get("routing", {}).get("rules", []):
+        if json.dumps(r, sort_keys=True) not in mine:
+            for k in ("outboundTag", "balancerTag"):
+                if r.get(k):
+                    r[k] = rename_tag(r[k], name, new)
+    with open(CFG + ".tmp", "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CFG + ".tmp", 0o600)
+    os.replace(CFG + ".tmp", CFG)
+    try:
+        backup = apply(t, "rename %s %s" % (name, new), allow_restart=False)
+    except xuilive.Failed as e:
+        die("در Xray در حال اجرا اعمال نشد (%s)" % e, as_json)
+    rn = lambda x: rename_tag(x, name, new)
+    rekey = lambda d: {rn(k): v for k, v in (d or {}).items()}
+    c["primary"] = rn(c.get("primary"))
+    c["backups"] = [rn(b) for b in c.get("backups") or []]
+    c["paths"] = rekey(c.get("paths"))
+    if "tunnels" in c:
+        c["tunnels"] = rekey(c["tunnels"])
+    write_conf(c)
+    for path, fix in (("/etc/xui-split.json", lambda d: dict(d, groups=rekey(d.get("groups")))),
+                      ("/var/lib/tunnel-guard/tunnels.json", rekey),
+                      (GUARD_STATE, lambda d: dict(d, **{k: rekey(d[k]) for k in ("fails", "oks", "down", "last", "restart_told", "lights")
+                                                         if isinstance(d.get(k), dict)},
+                                                  on=rn(d.get("on")),
+                                                  outages=[dict(o, path=rn(o.get("path"))) for o in d.get("outages") or []]))):
+        try:
+            d = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        with open(path + ".tmp", "w") as f:
+            json.dump(fix(d), f, indent=2, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+    hold = "/var/lib/tunnel-guard/hold"
+    if os.path.exists(hold) and open(hold).read().strip() == name:
+        with open(hold, "w") as f:
+            f.write(new)
+    db = xuidb.connect()                          # the panel's own traffic may leave through it
+    if (db.execute("select value from settings where key='panelOutbound'").fetchone() or [""])[0] == name:
+        db.execute("update settings set value=? where key='panelOutbound'", (new,))
+        db.commit()
+    db.close()
+    subprocess.run(["config-guard", "--save"], capture_output=True)
+    msg = "%s حالا %s است" % (name, new)
+    print(json.dumps({"ok": True, "msg": msg, "backup": backup}, ensure_ascii=False) if as_json else msg)
+
+
 def remove(name, as_json):
     t, c = template(), conf()
     if name == c.get("primary"):
@@ -508,10 +660,18 @@ def remove(name, as_json):
     if name not in (c.get("backups") or []):
         die("مسیری به اسم %s در نگهبان نیست" % name, as_json)
     try:
-        if json.load(open(GUARD_STATE)).get("on") == name:
-            die("کاربرها همین حالا روی این مسیر هستند - اول برشان گردانید", as_json)
-    except OSError:
-        pass
+        on = json.load(open(GUARD_STATE)).get("on")
+    except (OSError, ValueError):
+        on = None
+    moved = ""
+    if on == name:
+        if c.get("primary") not in {o.get("tag") for o in t.get("outbounds", [])}:
+            # no primary to fail back to: users ride the panel's own rules, not a failover to NAME
+            st = json.load(open(GUARD_STATE))
+            st["on"] = c.get("primary")
+            json.dump(st, open(GUARD_STATE, "w"))
+        else:
+            moved = move_users_off(name, c, t, as_json)
     tag = "guard-" + name.lower()
     xuimix.remove(t, name)                              # its per-tunnel copies and balancer go too
     t["outbounds"] = [o for o in t.get("outbounds", []) if o.get("tag") not in (name, name + "-mux")]
@@ -528,7 +688,7 @@ def remove(name, as_json):
     c.get("paths", {}).pop(name + "-mux", None)
     (c.get("tunnels") or {}).pop(name, None)
     write_conf(c)
-    msg = "مسیر %s حذف شد" % name
+    msg = "مسیر %s حذف شد%s" % (name, " (کاربرها اول به %s رفتند)" % moved if moved else "")
     print(json.dumps({"ok": True, "msg": msg, "backup": backup}, ensure_ascii=False) if as_json else msg)
 
 
@@ -603,6 +763,8 @@ def main():
             [a.strip() for a in opt.get("--addrs", "").split(",") if a.strip()])
     elif mode == "remove" and len(args) >= 2:
         remove(args[1], as_json)
+    elif mode == "rename" and len(args) >= 3:
+        rename(args[1], args[2], as_json)
     elif mode == "primary" and len(args) >= 2:
         make_primary(args[1], as_json, "--force" in args)
     elif mode == "prune":

@@ -1394,6 +1394,12 @@ def action(name, body):
         got = str(body.get("name") or "").strip()
         r = jrun_any("xui-path", "remove", got, "--json", timeout=180)
         return r or {"ok": False, "msg": "حذف نشد"}
+    if name == "path-rename":                    # live: every tag of the path, and the settings that name it
+        got, new = str(body.get("name") or "").strip(), str(body.get("new") or "").strip()
+        if got not in path_order() or not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,23}$", new):
+            return {"ok": False, "msg": "نام نامعتبر"}
+        r = jrun_any("xui-path", "rename", got, new, "--json", timeout=180)
+        return r or {"ok": False, "msg": "انجام نشد"}
     if name == "path-primary":                   # live: the catch-all and DNS upstream move to it
         got = str(body.get("name") or "").strip()
         if got not in path_order():
