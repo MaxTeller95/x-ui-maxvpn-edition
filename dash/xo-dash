@@ -1415,6 +1415,15 @@ def action(name, body):
             return {"ok": False, "msg": "این مسیر در فهرست نیست"}
         r = jrun_any("xui-path", "primary", got, "--json", timeout=180)
         return r or {"ok": False, "msg": "انجام نشد"}
+    if name == "split-smart":                   # the timer's measuring, for every path
+        on = bool(body.get("on"))
+        rc, out = run("xui-split", "smart", "on" if on else "off", timeout=20)
+        _split_cache[0] = 0
+        if rc == 0 and on:
+            run("systemctl", "enable", "--now", "xui-split-tune.timer", timeout=15)
+            run("systemctl", "start", "--no-block", "xui-split-tune.service", timeout=15)
+        return {"ok": rc == 0, "msg": ("mux هوشمند برای همه‌ی مسیرها روشن شد؛ اندازه‌گیری شروع شد (چند دقیقه)" if on
+                                       else "mux هوشمند خاموش شد؛ هر مسیر روی همان تنظیم فعلی می‌ماند") if rc == 0 else out[-200:]}
     if name == "split-set":                     # one exit's own settings, then build or repair
         _split_cache[0] = 0
         grp = str(body.get("group") or "")

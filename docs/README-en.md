@@ -205,6 +205,13 @@ live through the API (mixed copies too, never re-adding one out for loss), and s
 Telegram. `xui-split-tune.timer` runs it every 30 minutes; a concurrency set by hand
 (`xui-split set G --concurrency N`, or a number on the page) is locked, `--auto` unlocks.
 
+Every path, not only the exits: each backup tunnel-guard may fail over to gets its own mux copy
+and probe (a standby mux), and a failover builds the primary's split on the backup (heavy, UDP,
+Telegram to the path, light traffic to its mux; a stalled mux only sends light traffic plain).
+Backups are measured too, and "no mux" (0) is a candidate, chosen only when clearly best (a tie
+keeps mux). `xui-split smart on|off` (the page's switch) turns the measuring on or off for all;
+`--concurrency 0` locks a path without mux.
+
 ## tunnel-guard - failover without observatory
 
 Xray's balancer + observatory (and the panel's UI for it) proved unreliable, so this

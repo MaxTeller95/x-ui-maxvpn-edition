@@ -672,22 +672,28 @@ function renderStatus(s) {
   if (!$("#ads").disabled) $("#ads").checked = !!s.features.ad_block;
   const sc = s.features.split_check;
   const general = sc ? (sc.problems || []).filter((p) => !p.group) : [];
+  const muxName = (c) => +c ? "mux " + c : "بدون mux";
   $("#split-state").innerHTML = !sc ? "" : (general.length ? `<div class="muted">${esc(general[0].msg)}
       <button data-fix="split-fix">بساز</button></div>` : "")
+    + `<div class="row" style="padding:4px 0"><div>mux هوشمند برای همه‌ی مسیرها<div class="muted sm">هر ۳۰ دقیقه برای هر مسیر (پشتیبان‌ها هم)
+        اندازه می‌گیرد چند اتصال روی یک اتصال تانل بهتر است، یا اصلاً بدون mux؛ و بدون ری‌استارت اعمال می‌کند. مسیری که دستی قفل شده دست نمی‌خورد.</div></div>
+        <label class="switch"><input type="checkbox" id="smartmux" ${sc.smart !== false ? "checked" : ""}><span></span></label></div>`
     + (sc.groups || []).map((g) => {
       const st = !g.enabled ? '<span class="chip off">خاموش</span>'
         : g.problems.length ? `<span class="chip bad">${g.built ? "mux کار نمی‌کند" : "ساخته نشده"}</span>`
         : g.light === "direct" ? '<span class="chip warn">موقتاً بدون mux</span>'
+        : !+g.concurrency ? '<span class="chip">بدون mux (سریع‌تر بود)</span>'
+        : g.standby ? '<span class="chip ok" title="کاربرها فقط بعد از failover روی این مسیرند">mux آماده</span>'
         : '<span class="chip ok">mux فعال</span>';
       return `<div class="sg"><div class="th"><b dir="ltr">${esc(g.out)}</b>
           <input class="sg-label" data-sglabel="${esc(g.out)}" value="${esc(g.label)}" placeholder="برچسب، مثل کشور یک">
           ${st}
           <label class="mini"><input type="checkbox" data-sgon="${esc(g.out)}" ${g.enabled ? "checked" : ""}>فعال</label>
           <select data-sgconc="${esc(g.out)}" title="concurrency: چند اتصال روی یک اتصال تانل. خودکار: هر ۳۰ دقیقه اندازه‌گیری می‌شود؛ عدد = قفل دستی">
-            <option value="auto" ${g.auto ? "selected" : ""}>خودکار · mux ${g.concurrency}</option>
-            ${[2, 4, 8, 16].map((n) => `<option value="${n}" ${!g.auto && +g.concurrency === n ? "selected" : ""}>🔒 mux ${n}</option>`).join("")}</select>
+            <option value="auto" ${g.auto ? "selected" : ""}>خودکار · ${muxName(g.concurrency)}</option>
+            ${[0, 2, 4, 8, 16].map((n) => `<option value="${n}" ${!g.auto && +g.concurrency === n ? "selected" : ""}>🔒 ${muxName(n)}</option>`).join("")}</select>
           <button class="ic" data-sgtune="${esc(g.out)}" title="همین حالا اندازه بگیر (حدود یک دقیقه)">⟳</button></div>
-        <div class="muted sm"><span dir="ltr">${esc(g.mux)}</span> · ${esc(g.inbounds.join("، "))}
+        <div class="muted sm"><span dir="ltr">${esc(g.mux)}</span> · ${g.standby ? "پشتیبان: ترافیک سبک بعد از failover" : esc(g.inbounds.join("، "))}
           ${g.problems.length ? " · " + esc(g.problems[0].msg) : g.note ? " · " + esc(g.note) : ""}</div>
         ${g.tune && g.tune.results ? `<div class="muted sm" title="${esc(Object.entries(g.tune.results).map(([c, v]) => "mux " + c + ": " + v.ms + "ms" + (v.fails ? " (" + v.fails + " خطا)" : "")).join(" · "))}">
           اندازه‌گیری ${ago(g.tune.at)}: ${esc(g.tune.note || "")}${g.tune.loss != null ? " · پکت لاست تانل " + g.tune.loss + "٪" : ""}</div>` : ""}</div>`;
@@ -1387,6 +1393,14 @@ $("#mux-run").onclick = async () => {
   muxPoll();
 };
 document.addEventListener("change", async (e) => {
+  if (e.target.id === "smartmux") {
+    e.target.disabled = true;
+    const r = await post("split-smart", { on: e.target.checked });
+    e.target.disabled = false;
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadStatus();
+    return;
+  }
   const sg = e.target.closest("[data-sgon],[data-sgconc],[data-sglabel]");
   if (sg) {
     const group = sg.dataset.sgon || sg.dataset.sgconc || sg.dataset.sglabel;

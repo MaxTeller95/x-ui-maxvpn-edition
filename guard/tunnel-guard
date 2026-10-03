@@ -217,6 +217,8 @@ def in_config_order(tags):
 
 
 RESTORE = group_tags(PRIMARY, dns=True)
+FO = ["fo-dns", "fo-udp", "fo-heavy", "fo-telegram", "fo-light", "fo-main"]
+LIGHTS = {}          # the light-traffic state of each mux copy (st["lights"]), for failover()
 
 
 def failover(target):
@@ -224,18 +226,30 @@ def failover(target):
     if not main:
         log(f"failover: no main-{PRIMARY.lower()} rule in config.json - nothing to move")
         return False
-    rm_rules(RESTORE + ["fo-dns", "fo-main"])
-    to = xuimix.route(json.load(open(CFG)), target)      # {"outboundTag": X} or its mix balancer
-    ok = add_rules([
-        dict({"type": "field", "ruleTag": "fo-dns", "inboundTag": ["dns-internal"]}, **to),
-        dict({"type": "field", "ruleTag": "fo-main", "inboundTag": main[0]["inboundTag"]}, **to),
-    ])
+    rm_rules(RESTORE + FO)
+    cfg = json.load(open(CFG))
+    to = xuimix.route(cfg, target)      # {"outboundTag": X} or its mix balancer
+    # the primary's split, on the backup: heavy, UDP and Telegram to it, light traffic to its own
+    # mux copy (xui-split builds one for every backup) unless that mux is stalled
+    split, mux = [], target + "-mux"
+    if any(o.get("tag") == mux for o in cfg.get("outbounds", [])):
+        by = {r.get("ruleTag"): r for r in cfg.get("routing", {}).get("rules", []) if r.get("ruleTag")}
+        g = PRIMARY.lower()
+        for k in ("udp", "heavy", "telegram", "light"):
+            r = by.get(f"split-{g}-{k}")
+            if not r or (k == "light" and LIGHTS.get(mux) == "direct"):
+                continue
+            keep = {kk: v for kk, v in r.items() if kk not in ("ruleTag", "outboundTag", "balancerTag")}
+            split.append(dict(keep, ruleTag=f"fo-{k}", **(xuimix.route(cfg, mux) if k == "light" else to)))
+    ok = add_rules(
+        [dict({"type": "field", "ruleTag": "fo-dns", "inboundTag": ["dns-internal"]}, **to)] + split +
+        [dict({"type": "field", "ruleTag": "fo-main", "inboundTag": main[0]["inboundTag"]}, **to)])
     log(f"failover to {target}: {'ok' if ok else 'FAILED'}")
     return ok
 
 
 def failback():
-    rm_rules(["fo-dns", "fo-main"])
+    rm_rules(FO)
     ok = add_rules(in_config_order(RESTORE))
     log(f"failback to {PRIMARY}: {'ok' if ok else 'FAILED'}")
     return ok
@@ -432,6 +446,8 @@ def main():
     # is watched separately and only the light rule moves.
     # Each exit's mux copy on its own: the primary's only while users are on the primary (a
     # failover takes its split rules out anyway), every other exit's always.
+    global LIGHTS
+    LIGHTS = st["lights"]
     for mux in MUXES:
         if mux not in res:
             continue
@@ -439,6 +455,18 @@ def main():
             st["lights"][mux] = "mux"     # decide again after failback
             continue
         state = st["lights"].get(mux, "mux")
+        if mux[:-4] == st["on"] != PRIMARY:
+            # a backup's mux carries light traffic only while users are on that backup: its
+            # rule is fo-light, put back by the failover rules themselves
+            if state == "mux" and st["fails"][mux] >= FAILS_TO_SWITCH:
+                rm_rules(["fo-light"])
+                st["lights"][mux] = "direct"
+                send(f"⚠️ مسیر {mux} جواب نمی‌دهد — ترافیک سبک فعلاً بدون mux از {mux[:-4]} می‌رود (بدون قطعی).")
+            elif state == "direct" and st["oks"][mux] >= OKS_TO_RETURN:
+                st["lights"][mux] = "mux"
+                if failover(st["on"]):
+                    send(f"✅ مسیر {mux} برگشت — ترافیک سبک دوباره روی mux.")
+            continue
         if state == "mux" and st["fails"][mux] >= FAILS_TO_SWITCH:
             if light_bypass(mux):
                 st["lights"][mux] = "direct"

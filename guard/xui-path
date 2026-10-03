@@ -480,7 +480,8 @@ def make_primary(name, as_json, force=False):
         die("Xray کانفیگ جدید را رد کرد: " + detail, as_json)
     backup = apply(t, "primary " + name)
     # the guard's own failover rules pointed users at a backup; the catch-all does it now
-    subprocess.run([XRAY, "api", "rmrules", "--server=" + xuilive.api_addr(json.load(open(CFG))), "fo-main", "fo-dns"],
+    subprocess.run([XRAY, "api", "rmrules", "--server=" + xuilive.api_addr(json.load(open(CFG))),
+                    "fo-main", "fo-dns", "fo-udp", "fo-heavy", "fo-telegram", "fo-light"],
                    capture_output=True)
     c["primary"] = name
     c["backups"] = [b for b in backups if b != name] + ([old] if old and not old_gone else [])

@@ -10,8 +10,10 @@ separately for every exit the hub sends users to.
                       [--auto]        one group's own settings (then apply, or fix for mux-only);
                                       --concurrency locks it there, --auto lets tune choose again
     xui-split tune [GROUP] [--apply] [--json]
-                                      measure which mux concurrency serves each exit best and,
-                                      with --apply, switch to it live (xui-split-tune.timer)
+                                      measure which mux concurrency serves each path best (or
+                                      no mux at all) and, with --apply, switch to it live
+                                      (xui-split-tune.timer)
+    xui-split smart on|off            smart mux for every path, or not (the timer's measuring)
     xui-split check [--json]          is every group really working? outbound, mux, rules, probe, live Xray
     xui-split fix [--auto] [--json]   repair what check found: through Xray's API when only a mux
                                       outbound is wrong (no restart), else a full rebuild (restart);
@@ -29,6 +31,9 @@ the server in one country, BACKUP for the one in another). Every group gets its 
 
 Outbounds that are only other routes to the same server (a second tunnel, a sing-box route,
 a Reality path) are not groups: nothing routes users to them until tunnel-guard fails over.
+Every backup path tunnel-guard may fail over to still gets its own <OUT>-mux copy and probe
+(a standby mux): on a failover the guard sends that exit's light traffic to it, heavy traffic,
+UDP and Telegram to the path itself, the same split as on the primary.
 
 Light traffic (web pages, messengers, APIs) rides an existing tunnel connection instead of
 paying a TCP handshake across the link. Heavy traffic (video, downloads, updates), UDP and
@@ -44,7 +49,10 @@ warm-up, and scores the median time with failures as a heavy penalty. Settings w
 best count as equal, and then the current one (or else the lowest) wins; with 2% or more packet
 loss on the tunnel nothing above 4 is chosen. It switches only for a 25% gain, or a 10% gain
 seen twice in a row, and applies through Xray's API (the mixed tunnels' copies too) with no
-restart. An exit whose concurrency was set by hand is locked and left alone.
+restart. "No mux" (0) is measured too, and chosen only when it is clearly best (a tie keeps mux):
+then the mux copy runs without mux and light traffic gets plain connections. Every path is
+measured, backups included. A path whose concurrency was set by hand (a number, or off) is locked
+and left alone; `xui-split smart off` stops the measuring for all of them.
 
 Also, for tunnel-guard: Xray's RoutingService is enabled so routes can be switched without a
 restart, and every proxy outbound gets a local-only probe port (socks, 127.0.0.1:10808, ...).
@@ -66,7 +74,7 @@ KINDS = ("udp", "heavy", "telegram")
 DEFAULT = {"enabled": True, "concurrency": 4, "xudp": 8, "label": "", "heavy": [], "lock": False}
 TUNNEL_STATE = "/var/lib/tunnel-guard/tunnels.json"
 TUNE_STATE = "/var/lib/xui-split/tune.json"
-TUNE_CANDIDATES = (2, 4, 8, 16)
+TUNE_CANDIDATES = (0, 2, 4, 8, 16)     # 0 = no mux at all
 TUNE_ROUNDS = 4
 TUNE_URLS = """www.google.com/generate_204 www.gstatic.com/generate_204 cp.cloudflare.com/generate_204
 connectivitycheck.gstatic.com/generate_204 detectportal.firefox.com/success.txt www.microsoft.com/favicon.ico
@@ -126,6 +134,8 @@ def group_conf(s, out):
 
 
 def mux_block(conf):
+    if not int(conf["concurrency"]):                 # measured (or set) best without mux
+        return {"enabled": False}
     return {"enabled": True, "concurrency": int(conf["concurrency"]), "xudpConcurrency": int(conf["xudp"]),
             "xudpProxyUDP443": "skip"}
 
@@ -158,6 +168,17 @@ def groups(t):
             if ob not in out or len(r["inboundTag"]) > len(out[ob]["inboundTag"]):
                 out[ob] = r
     return out
+
+
+def standby(t):
+    """Paths tunnel-guard may fail over to that are not an exit of their own: each gets a mux copy
+    and a probe too, so light traffic keeps its mux after a failover (see the top)."""
+    c = load_json(GUARD_CONF, {}) or {}
+    outs = {o.get("tag"): o for o in t["outbounds"]}
+    found = groups(t)
+    return [n for n in [c.get("primary")] + (c.get("backups") or [])
+            if n and n in outs and n not in found and (outs[n].get("protocol") or "") not in NOT_PROXY
+            and not n.endswith("-mux") and not xuimix.is_clone(n) and not _flow(outs[n])]
 
 
 def _flow(o):
@@ -198,6 +219,8 @@ def patch(t, remove=False):
     t["inbounds"] = [i for i in t["inbounds"] if not i.get("tag", "").startswith("guard-")]
     targets = [o["tag"] for o in t["outbounds"] if o.get("protocol") not in NOT_PROXY and o.get("tag")
                and not xuimix.is_clone(o["tag"])]                   # a mix's per-tunnel copies: no probe
+    if not remove:                    # backups: a mux copy for after a failover, no rules of their own
+        want.update({ob: None for ob in standby(t) if group_conf(s, ob)["enabled"]})
     for ob in want:
         base = next(o for o in t["outbounds"] if o.get("tag") == ob)
         mux = json.loads(json.dumps(base))
@@ -216,6 +239,8 @@ def patch(t, remove=False):
     rules[at:at] = probe_rules
 
     for ob, main in want.items():
+        if main is None:
+            continue
         tg, conf, ib = tags_of(ob), group_conf(s, ob), main["inboundTag"]
         heavy = HEAVY + [d if ":" in d else f"domain:{d}" for d in conf.get("heavy") or []]
         new = [
@@ -311,7 +336,8 @@ def check(t, live=True):
     outs = {o.get("tag"): o for o in t["outbounds"]}
     lo = live_outbounds()[0] if live else None
     lights = (load_json(GUARD_STATE, {}) or {}).get("lights") or {}
-    report = {"on": any(t.startswith("split-") for t in by_tag if t), "groups": [], "problems": []}
+    report = {"on": any(t.startswith("split-") for t in by_tag if t), "groups": [], "problems": [],
+              "smart": s.get("smart") is not False}
     legacy = [tag for tag in LEGACY if tag in by_tag]
     if legacy:
         report["problems"].append({"group": "", "code": "legacy", "hot": False,
@@ -340,7 +366,7 @@ def check(t, live=True):
         if not mux:
             bad("mux-missing", f"{ob}: اوت‌باند {tg['mux']} نیست ولی قانون {tg['light']} به آن می‌رود", hot=True)
         else:
-            if not (mux.get("mux") or {}).get("enabled"):
+            if not (mux.get("mux") or {}).get("enabled") and int(conf["concurrency"]):
                 bad("mux-off", f"{ob}: {tg['mux']} هست ولی mux رویش خاموش است", hot=True)
             elif mux.get("mux") != mux_block(conf):
                 bad("mux-settings", f"{ob}: تنظیم mux با تنظیمات این خروجی یکی نیست", hot=True)
@@ -371,6 +397,25 @@ def check(t, live=True):
             g["mixed"] = True
         if g["light"] == "direct":
             g["note"] = "نگهبان ترافیک سبک این خروجی را موقتاً از mux برداشته (mux گیر کرده بود)"
+    tunes = load_json(TUNE_STATE, {}) or {}
+    for ob in standby(t):            # backups: only a mux copy, used after a failover
+        tg, conf = tags_of(ob), group_conf(s, ob)
+        mux = outs.get(tg["mux"])
+        g = {"out": ob, "label": conf["label"], "enabled": conf["enabled"], "mux": tg["mux"], "inbounds": [],
+             "standby": True, "concurrency": conf["concurrency"], "xudp": conf["xudp"], "built": bool(mux),
+             "light": lights.get(tg["mux"], "mux"), "problems": [], "auto": not conf.get("lock"), "tune": tunes.get(ob)}
+        report["groups"].append(g)
+        if not conf["enabled"] or not report["on"]:
+            continue
+        bad = lambda code, msg, hot=False: g["problems"].append({"group": ob, "code": code, "msg": msg, "hot": hot})
+        if not mux:                  # with its probe port: a full build, which goes in live
+            bad("mux-missing", f"{ob}: پشتیبان هنوز کپی mux ندارد (برای بعد از failover)")
+        elif mux.get("mux") != mux_block(conf):
+            bad("mux-settings", f"{ob}: تنظیم mux با تنظیمات این مسیر یکی نیست", hot=True)
+        elif {k: v for k, v in mux.items() if k not in ("tag", "mux")} != {k: v for k, v in outs[ob].items() if k not in ("tag", "mux")}:
+            bad("mux-drift", f"{ob}: {tg['mux']} با {ob} یکی نیست", hot=True)
+        elif not any(i.get("tag") == tg["probe"] for i in t.get("inbounds", [])):
+            bad("probe-missing", f"{ob}: پورت probe {tg['probe']} نیست")
     report["problems"] += [p for g in report["groups"] for p in g["problems"]]
     return report
 
@@ -517,6 +562,8 @@ def tune(only=None, apply=False):
     s, t, cfg = settings(), template(), json.load(open(f"{BIN}/config.json"))
     state = load_json(TUNE_STATE, {}) or {}
     report = []
+    if s.get("smart") is False and not only:
+        return [{"out": "", "current": None, "locked": True, "changed": False, "note": "mux هوشمند خاموش است"}]
     for g in check(t, live=False)["groups"]:
         out = g["out"]
         if only and out != only or not g["enabled"] or not g["built"]:
@@ -540,15 +587,16 @@ def tune(only=None, apply=False):
         score = lambda c: res[c]["score"]
         best = min(allowed, key=score)
         near = [c for c in allowed if score(c) <= score(best) * 1.05]
-        pick = cur if cur in near else min(near)
+        pick = cur if cur in near else min(near, key=lambda c: (c == 0, c))   # a tie keeps mux on
         gain = (score(cur) - score(pick)) / float(score(cur)) if score(cur) else 0.0
         prev = (state.get(out) or {}).get("pick")
         forced = cur not in allowed                       # a lossy tunnel and a high setting
         go = pick != cur and (forced or gain >= 0.25 or (gain >= 0.10 and prev == pick))
         row.update(tunnel=tunnel, loss=loss, results={str(c): res[c] for c in cands}, pick=pick,
                    gain=round(gain * 100), at=int(time.time()))
-        row["note"] = ("%d بهتر است (%d٪ سریع‌تر%s)" % (pick, round(gain * 100), "، به خاطر پکت لاست" if forced else "")
-                       if pick != cur else "همین %d بهترین است" % cur)
+        name = lambda c: "بدون mux" if c == 0 else "mux %d" % c
+        row["note"] = ("%s بهتر است (%d٪ سریع‌تر%s)" % (name(pick), round(gain * 100), "، به خاطر پکت لاست" if forced else "")
+                       if pick != cur else "همین %s بهترین است" % name(cur))
         state[out] = {k: row[k] for k in ("pick", "gain", "loss", "results", "at", "tunnel", "current")}
         state[out]["note"] = row["note"]
         if go and apply and not row["locked"]:
@@ -556,8 +604,8 @@ def tune(only=None, apply=False):
             if row["changed"]:
                 state[out]["current"] = pick
                 state[out]["changed_at"] = int(time.time())
-                tell("⚙️ mux %s: concurrency از %d به %d رفت؛ %s (پکت لاست تانل: %s)." % (
-                    g["label"] or out, cur, pick, "برای پکت لاست" if forced else "%d٪ سریع‌تر در اندازه‌گیری" % round(gain * 100),
+                tell("⚙️ mux %s: از %s به %s رفت؛ %s (پکت لاست تانل: %s)." % (
+                    g["label"] or out, name(cur), name(pick), "برای پکت لاست" if forced else "%d٪ سریع‌تر در اندازه‌گیری" % round(gain * 100),
                     "%s٪" % loss if loss is not None else "نامعلوم"))
         elif go:
             row["note"] += " - با --apply اعمال می‌شود"
@@ -652,7 +700,8 @@ def fix(auto=False):
 
 def set_group(name):
     """xui-split set GROUP [--on|--off] [--concurrency N] [--xudp N] [--label TEXT] [--heavy a,b]"""
-    found = groups(template())
+    t = template()
+    found = list(groups(t)) + standby(t)
     if name not in found:
         print(json.dumps({"ok": False, "msg": "گروهی به اسم %s نیست؛ گروه‌ها: %s" % (name, "، ".join(found) or "-")},
                          ensure_ascii=False) if as_json else "no group %s (groups: %s)" % (name, ", ".join(found)))
@@ -667,8 +716,8 @@ def set_group(name):
     for flag, key in (("--concurrency", "concurrency"), ("--xudp", "xudp")):
         if opt(flag) is not None:
             v = int(opt(flag))
-            if not 1 <= v <= 128:
-                sys.exit(f"{flag} must be 1..128")
+            if not (0 if key == "concurrency" else 1) <= v <= 128:     # concurrency 0: no mux
+                sys.exit(f"{flag} must be 0..128" if key == "concurrency" else f"{flag} must be 1..128")
             g[key] = v
             if key == "concurrency":
                 g["lock"] = True          # chosen by hand: tune leaves it alone
@@ -698,6 +747,12 @@ def main():
                 g["out"], g["label"] or "-", "on " if g["enabled"] else "off",
                 g["mux"] if g["built"] else "(not built)", g["concurrency"], ", ".join(g["inbounds"])))
         return
+    if mode == "smart":
+        on = (args[args.index("smart") + 1:] or ["on"])[0] == "on"
+        s = settings()
+        s["smart"] = on
+        save_json(SETTINGS, s)
+        return say({"ok": True, "msg": "mux هوشمند برای همه‌ی مسیرها " + ("روشن شد" if on else "خاموش شد")})
     if mode == "set":
         name = next((a for a in args[args.index("set") + 1:] if not a.startswith("--")), None)
         return set_group(name) if name else sys.exit(set_group.__doc__)
