@@ -145,6 +145,12 @@
   table th { text-align: right; font-weight: 600; color: var(--muted); font-size: 12px; padding: 4px 0; }
   table td { padding: 5px 0; border-top: 1px solid var(--line); }
   table td.n { direction: ltr; text-align: left; white-space: nowrap; }
+  .spd { padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .spd:last-child { border-bottom: 0; }
+  .spd .sh { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 4px; }
+  table.kv { width: 100%; max-width: 420px; }
+  table.kv td { padding: 2px 0; border: 0; }
+  table.kv td.v { direction: ltr; text-align: left; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .bar { height: 6px; border-radius: 6px; background: var(--line); overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--accent); }
   .bars { display: grid; gap: 10px; }
@@ -846,20 +852,20 @@ function renderSpeeds(s) {
   if (!s || !s.rows || !s.rows.length) { el.textContent = "هنوز داده‌ای جمع نشده؛ چند دقیقه بعد دوباره نگاه کنید."; return; }
   el.classList.remove("muted");
   const mb = (v) => v ? (v / 1e6).toFixed(v < 1e7 ? 1 : 0) : null;
-  const sp = (v) => v == null ? '<span class="muted">—</span>' : `<span dir="ltr" style="white-space:nowrap"><b>${mb(v)}</b> <span class="muted sm">Mb/s</span></span>`;
-  const few = (x) => x && x.n && x.n < 5 ? ' <span class="muted sm" title="کمتر از ۵ کاربر؛ عدد قابل اتکا نیست">(نمونه کم)</span>' : "";
-  el.innerHTML = `<div style="overflow-x:auto"><table><tbody>
-    <tr><th>اینباند</th><th class="n">کاربر</th>
-      <th class="n">دانلود<div class="muted sm">کاربر معمولی</div></th><th class="n">دانلود<div class="muted sm">سریع‌ترین‌ها</div></th>
-      <th class="n">آپلود<div class="muted sm">کاربر معمولی</div></th><th class="n">آپلود<div class="muted sm">سریع‌ترین‌ها</div></th></tr>
-    ${s.rows.map((r) => `<tr><td><b>${esc(r.remark)}</b><div class="muted sm" dir="ltr">${r.multi
-        ? esc("ports " + r.ports.filter(Boolean).join(" + "))
-        : (r.port ? r.port + " · " : "") + esc([r.protocol, r.network, r.security !== "none" ? r.security : ""].filter(Boolean).join(" / "))}</div></td>
-      <td class="n" title="کاربرانی که در ۲۴ ساعت اخیر ترافیک قابل سنجش داشتند، از کل کاربران">${r.measured} از ${r.users}</td>
-      ${r.measured ? `<td class="n">${sp(r.down.p50)}${few(r.down)}</td><td class="n">${sp(r.down.p90)}</td>
-      <td class="n">${sp(r.up.p50)}${few(r.up)}</td><td class="n">${sp(r.up.p90)}</td>`
-        : '<td class="n muted" colspan="4">در ۲۴ ساعت اخیر ترافیک قابل سنجش نداشته</td>'}</tr>`).join("")}
-  </tbody></table></div>`;
+  const fa = (n) => String(n).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[d]);
+  const val = (v) => v == null ? '<span class="muted">—</span>' : `<b>${mb(v)}</b> <span class="muted">Mb/s</span>`;
+  const line = (label, v) => `<tr><td>${label}</td><td class="v">${val(v)}</td></tr>`;
+  el.innerHTML = s.rows.map((r) => {
+    const few = r.measured && r.measured < 5 ? ' <span class="chip warn" title="کمتر از ۵ کاربر؛ عدد قابل اتکا نیست">نمونه کم</span>' : "";
+    const how = r.multi ? "ports " + r.ports.filter(Boolean).join(" + ")
+      : (r.port ? r.port + " · " : "") + [r.protocol, r.network, r.security !== "none" ? r.security : ""].filter(Boolean).join(" / ");
+    return `<div class="spd"><div class="sh"><b>${esc(r.remark)}</b> <span class="muted sm" dir="ltr">${esc(how)}</span>
+        <span class="chip" title="کاربرانی که در ۲۴ ساعت اخیر ترافیک قابل سنجش داشتند، از کل کاربران">${fa(r.measured)} نفر از ${fa(r.users)}</span>${few}</div>
+      ${r.measured ? `<table class="kv"><tbody>
+        ${line("دانلود · کاربر معمولی", r.down.p50)}${line("دانلود · سریع‌ترین‌ها", r.down.p90)}
+        ${line("آپلود · کاربر معمولی", r.up.p50)}${line("آپلود · سریع‌ترین‌ها", r.up.p90)}</tbody></table>`
+        : '<div class="muted sm">در ۲۴ ساعت اخیر ترافیک قابل سنجش نداشته</div>'}</div>`;
+  }).join("");
 }
 async function loadSpeeds() { const s = await get("speeds"); renderSpeeds(s); }
 async function loadUsers() { const u = await get("users"); if (u) { U = u; renderUsers(u); } }
