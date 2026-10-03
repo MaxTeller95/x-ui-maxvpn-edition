@@ -20,14 +20,18 @@ and restarts only the core), not the whole panel.
     import xuilive
     how = xuilive.apply(new_template, old_template)   # "live", "restart", or raises xuilive.Failed
 
-config.json is rewritten to match, as the tools read it as "what runs". tunnel-guard re-asserts a
-failover or a mux bypass on its next run when the rules were replaced (as after a restart);
-it is started at once.
+config.json is rewritten to match, as the tools read it as "what runs" (with the template's rules
+as the panel writes them). What tunnel-guard changed at runtime - a failover's fo-* rules and the
+rules it took out, a stalled mux's light rule - is in no config: it keeps a note of it
+(/var/lib/tunnel-guard/runtime.json), and a rules replacement sends the rules with those changes
+still applied, as far as the running Xray still has them, so a failover is never undone in
+between. tunnel-guard is started at once after a replacement anyway.
 """
 import glob, json, os, subprocess, tempfile, time
 
 BIN = "/usr/local/x-ui/bin"
 CFG = BIN + "/config.json"
+RUNTIME = "/var/lib/tunnel-guard/runtime.json"
 XRAY = (glob.glob(BIN + "/xray-linux-*") or [None])[0]
 NOT_LIVE = ("dns", "burstObservatory", "observatory", "policy", "stats", "api", "log", "fakedns", "reverse", "transport")
 
@@ -114,6 +118,35 @@ def injected(cfg, old, where="top"):
     return [r for r in (cfg.get("routing") or {}).get("rules", []) if keep(r)]
 
 
+def live_rule_tags(cfg):
+    """The ruleTags in the running Xray, or None when its API does not answer."""
+    rc, out = _api(cfg, "lsrules")
+    if rc:
+        return None
+    try:
+        return {r.get("ruleTag") for r in json.loads(out).get("rules", []) if r.get("ruleTag")}
+    except (ValueError, AttributeError):
+        return None
+
+
+def guard_runtime(cfg):
+    """(rule tags tunnel-guard took out, fo-* rules it added) that are still in force: a tag counts
+    as out only while Xray really lacks it, an fo-* rule only while Xray has it - after a restart
+    (all rules back, none of its own) nothing of the note applies until the guard acts again."""
+    try:
+        with open(RUNTIME) as f:
+            rt = json.load(f)
+    except (OSError, ValueError):
+        return set(), []
+    if not (rt.get("removed") or rt.get("fo")):
+        return set(), []
+    live = live_rule_tags(cfg)
+    if live is None:
+        return set(), []
+    return ({t for t in rt.get("removed", []) if t not in live},
+            [r for r in rt.get("fo", []) if r.get("ruleTag") in live])
+
+
 def plan(tpl, old, cfg=None):
     """What applying the change old -> tpl (both the panel's template) to the running Xray takes:
     {"restart": [reasons], "outbounds": (add, drop), "inbounds": (add, drop), "rules": [...] or
@@ -135,9 +168,15 @@ def plan(tpl, old, cfg=None):
     add_i = [t for t, i in new_i.items() if t not in live_i or not _same(i, live_i[t])]
     drop_i = [t for t in live_i if t not in new_i]
     rules = injected(cfg, old) + as_panel_writes(new_r.get("rules", [])) + injected(cfg, old, "end")
-    same_rules = _same(rules, (cfg.get("routing") or {}).get("rules", [])) and         _same(new_r.get("balancers") or [], (cfg.get("routing") or {}).get("balancers") or [])
+    same_rules = _same(rules, (cfg.get("routing") or {}).get("rules", [])) and \
+        _same(new_r.get("balancers") or [], (cfg.get("routing") or {}).get("balancers") or [])
+    live = None
+    if not same_rules:              # what goes to Xray: the same, with tunnel-guard's changes kept
+        out, fo = guard_runtime(cfg)
+        tags = {r.get("ruleTag") for r in fo}
+        live = [r for r in rules if r.get("ruleTag") not in out and r.get("ruleTag") not in tags] + fo
     return {"restart": why, "outbounds": (add_o, drop_o), "inbounds": (add_i, drop_i),
-            "rules": None if same_rules else rules,
+            "rules": None if same_rules else rules, "live_rules": live,
             "nothing": not (why or add_o or drop_o or add_i or drop_i or not same_rules)}
 
 
@@ -192,7 +231,7 @@ def apply(tpl, old, allow_restart=True):
         rc, out = _api(cfg, "adi", payload={"inbounds": [guard_new[t]]})
         ok = ok and rc == 0
     if ok and p["rules"] is not None:
-        rc, out = _api(cfg, "adrules", payload={"routing": {"rules": new["routing"]["rules"],
+        rc, out = _api(cfg, "adrules", payload={"routing": {"rules": p["live_rules"],
                                                             "balancers": new["routing"].get("balancers", [])}})
         ok = rc == 0
     if ok:

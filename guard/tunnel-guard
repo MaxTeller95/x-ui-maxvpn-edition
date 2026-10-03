@@ -211,6 +211,28 @@ def rm_rules(tags):
     run(XRAY, "api", "rmrules", f"--server={API}", *tags)
 
 
+RUNTIME = "/var/lib/tunnel-guard/runtime.json"
+
+
+def runtime(removed=(), restored=(), fo=None, fo_drop=()):
+    """What the guard changed in the running rules and no config holds: the rule tags it took out
+    (a failover's primary rules, a stalled mux's light rule) and the fo-* rules it added. xuilive
+    reads this so a live rules replacement by another tool keeps a failover in force instead of
+    undoing it until the guard's next run (the panel's own config.json never has these)."""
+    try:
+        rt = json.load(open(RUNTIME))
+    except (OSError, ValueError):
+        rt = {}
+    gone = [t for t in rt.get("removed", []) if t not in restored]
+    gone += [t for t in removed if t not in gone]
+    rules = rt.get("fo", []) if fo is None else fo
+    rules = [r for r in rules if r.get("ruleTag") not in fo_drop]
+    os.makedirs(os.path.dirname(RUNTIME), exist_ok=True)
+    with open(RUNTIME + ".tmp", "w") as f:
+        json.dump({"removed": gone, "fo": rules, "t": int(time.time())}, f)
+    os.replace(RUNTIME + ".tmp", RUNTIME)
+
+
 def group_tags(out, dns=False):
     """The rules one exit is made of, as xui-split tagged them: its split rules and its
     catch-all (plus the DNS cache's upstream when the primary moves)."""
@@ -240,6 +262,7 @@ def failover(target):
         log(f"failover: no main-{PRIMARY.lower()} rule in config.json - nothing to move")
         return False
     rm_rules(RESTORE + FO)
+    runtime(removed=RESTORE, fo=[])
     cfg = json.load(open(CFG))
     to = xuimix.route(cfg, target)      # {"outboundTag": X} or its mix balancer
     # the primary's split, on the backup: heavy, UDP and Telegram to it, light traffic to its own
@@ -254,16 +277,21 @@ def failover(target):
                 continue
             keep = {kk: v for kk, v in r.items() if kk not in ("ruleTag", "outboundTag", "balancerTag")}
             split.append(dict(keep, ruleTag=f"fo-{k}", **(xuimix.route(cfg, mux) if k == "light" else to)))
-    ok = add_rules(
-        [dict({"type": "field", "ruleTag": "fo-dns", "inboundTag": ["dns-internal"]}, **to)] + split +
-        [dict({"type": "field", "ruleTag": "fo-main", "inboundTag": main[0]["inboundTag"]}, **to)])
+    fo = ([dict({"type": "field", "ruleTag": "fo-dns", "inboundTag": ["dns-internal"]}, **to)] + split +
+          [dict({"type": "field", "ruleTag": "fo-main", "inboundTag": main[0]["inboundTag"]}, **to)])
+    ok = add_rules(fo)
+    if ok:
+        runtime(fo=fo)
     log(f"failover to {target}: {'ok' if ok else 'FAILED'}")
     return ok
 
 
 def failback():
     rm_rules(FO)
+    runtime(fo=[])
     ok = add_rules(in_config_order(RESTORE))
+    if ok:
+        runtime(restored=RESTORE)
     log(f"failback to {PRIMARY}: {'ok' if ok else 'FAILED'}")
     return ok
 
@@ -277,6 +305,7 @@ def light_bypass(mux):
     """This exit's light traffic stops going through its mux copy: with its light rule gone it
     falls through to the exit's catch-all, which is the same tunnel without mux."""
     rm_rules(light_tags(mux))
+    runtime(removed=light_tags(mux))
     log(f"light traffic moved off {mux} to {mux[:-4]}")
     return True
 
@@ -285,6 +314,8 @@ def light_restore(mux):
     tags = group_tags(mux[:-4])
     rm_rules(tags)
     ok = add_rules(in_config_order(tags))
+    if ok:
+        runtime(restored=tags)
     log(f"light traffic back on {mux}: {'ok' if ok else 'FAILED'}")
     return ok
 
@@ -473,6 +504,7 @@ def main():
             # rule is fo-light, put back by the failover rules themselves
             if state == "mux" and st["fails"][mux] >= FAILS_TO_SWITCH:
                 rm_rules(["fo-light"])
+                runtime(fo_drop=["fo-light"])
                 st["lights"][mux] = "direct"
                 send(f"⚠️ مسیر {mux} جواب نمی‌دهد — ترافیک سبک فعلاً بدون mux از {mux[:-4]} می‌رود (بدون قطعی).")
             elif state == "direct" and st["oks"][mux] >= OKS_TO_RETURN:
