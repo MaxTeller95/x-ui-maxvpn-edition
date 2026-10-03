@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""xui-upgrade - update the 3x-ui panel unattended: backed up, checked, rolled back on failure.
+
+    xui-upgrade status [--json]          installed version, what is scheduled, the last run
+    xui-upgrade fetch VERSION            download the release now and check it against GitHub's
+                                         sha256 (so the night run needs no download)
+    xui-upgrade run VERSION              update now
+    xui-upgrade schedule VERSION WHEN    fetch now, update once at WHEN (systemd OnCalendar,
+                                         e.g. "2026-10-04 04:00 Asia/Tehran")
+    xui-upgrade cancel                   drop what is scheduled
+
+A run, step by step:
+  1. the release archive is checked (sha256, its x-ui and Xray binaries start and report the
+     right version) before anything is touched
+  2. the hub's routing tools are paused (tunnel-guard would see the restart as an outage and
+     fail users over; config-guard would "repair" a config the panel is migrating)
+  3. what runs now is written down: the ports x-ui and Xray listen on
+  4. backup: /usr/local/x-ui (binaries, lists, config), the x-ui command, the unit, and the
+     database copied after x-ui has stopped - in /var/backups/xui-upgrade-<time>
+  5. the panel's own update steps, without its menu: new x-ui, x-ui.sh, Xray, mtg, unit;
+     the geo lists the hub keeps fresh itself (xui-geo) are left in place
+  6. x-ui starts; within 3 minutes it must run the new version, its Xray must be up, the
+     panel must answer, and every port from step 3 must be listening again
+  7. any of that failing: everything from step 4 is put back and the old version started
+  8. the tools resume; tunnel-guard runs once at once; config-guard takes the migrated config
+     as its new baseline; a Telegram message says how it went
+
+Only SQLite panels are handled (a PostgreSQL panel's database would need its own dump).
+"""
+import glob, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tarfile, time, urllib.request
+
+XUI, BIN, DB = "/usr/local/x-ui", "/usr/local/x-ui/bin", "/etc/x-ui/x-ui.db"
+UNIT = "/etc/systemd/system/x-ui.service"
+WORK = "/var/lib/xui-upgrade"
+LOG = "/var/log/xui-upgrade.log"
+STATE = WORK + "/state.json"
+REPO = "MHSanaei/3x-ui"
+PAUSE = ["tunnel-guard.timer", "xui-tunnel.timer", "config-guard.path", "config-guard.timer",
+         "xui-split-tune.timer", "xui-route.timer", "xui-mtu.timer", "xui-geo.timer"]
+KEEP_LISTS = re.compile(r"^geo(site|ip)_IR\.dat$")          # xui-geo keeps these; the rest come new
+ARCH = {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "armv7", "i686": "386", "s390x": "s390x"}
+
+
+class Stop(Exception):
+    pass
+
+
+def log(msg):
+    line = time.strftime("%F %T ") + msg
+    print(line, flush=True)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def run(*cmd, timeout=60):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def tell(text):
+    """Telegram through tunnel-guard's delivery (it tries every path); best effort."""
+    log("telegram: " + text.replace("\n", " | "))
+    run("tunnel-guard", "--say", text, timeout=60)
+
+
+def arch():
+    m = os.uname().machine
+    return ARCH.get(m, m)
+
+
+def norm(v):
+    return v.lstrip("v")
+
+
+def installed():
+    rc, out = run(XUI + "/x-ui", "-v", timeout=20)
+    m = re.search(r"\d+\.\d+\.\d+\S*", out)
+    return m.group(0) if rc == 0 and m else ""
+
+
+# ---------------------------------------------------------------- the release
+def archive(version):
+    return "%s/x-ui-%s-linux-%s.tar.gz" % (WORK, norm(version), arch())
+
+
+def asset(version):
+    url = "https://api.github.com/repos/%s/releases/tags/v%s" % (REPO, norm(version))
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "xui-upgrade"}), timeout=30) as r:
+        rel = json.load(r)
+    name = "x-ui-linux-%s.tar.gz" % arch()
+    a = next((a for a in rel.get("assets", []) if a.get("name") == name), None)
+    if not a:
+        raise Stop("release v%s has no %s" % (norm(version), name))
+    return a["browser_download_url"], (a.get("digest") or "").replace("sha256:", ""), a.get("size")
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def fetch(version):
+    os.makedirs(WORK, exist_ok=True)
+    path, meta = archive(version), WORK + "/release.json"
+    url, digest, size = asset(version)
+    if not digest:
+        raise Stop("GitHub gives no sha256 for this release; not downloading blind")
+    if os.path.exists(path) and sha256(path) == digest:
+        log("v%s already downloaded and verified" % norm(version))
+    else:
+        log("downloading %s" % url)
+        rc, out = run("curl", "-fsSL", "--retry", "3", "-o", path + ".part", url, timeout=900)
+        if rc:
+            raise Stop("download failed: " + out[-200:])
+        got = sha256(path + ".part")
+        if got != digest:
+            os.remove(path + ".part")
+            raise Stop("sha256 mismatch: %s, GitHub says %s" % (got, digest))
+        os.replace(path + ".part", path)
+        log("verified sha256 %s" % digest)
+    save(meta, {"version": norm(version), "sha256": digest, "file": path})
+    return path
+
+
+def unpack(version):
+    """The archive (fetched before, re-checked now) unpacked into a staging folder, its
+    binaries tried: they must start and say the right version."""
+    path, meta = archive(version), load(WORK + "/release.json", {})
+    if not (os.path.exists(path) and meta.get("version") == norm(version) and sha256(path) == meta.get("sha256")):
+        path = fetch(version)
+    stage = WORK + "/stage"
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    with tarfile.open(path) as t:
+        for m in t.getmembers():                      # nothing outside the folder
+            if m.name.startswith("/") or ".." in m.name.split("/") or not m.name.startswith("x-ui"):
+                raise Stop("odd path in the archive: " + m.name)
+        t.extractall(stage)
+    new = stage + "/x-ui"
+    xray = "%s/bin/xray-linux-%s" % (new, arch())
+    for f in (new + "/x-ui", xray, new + "/x-ui.sh"):
+        if not os.path.exists(f):
+            raise Stop("archive lacks " + os.path.basename(f))
+    os.chmod(new + "/x-ui", 0o755)
+    os.chmod(xray, 0o755)
+    rc, out = run(new + "/x-ui", "-v", timeout=20)
+    if norm(version) not in out:
+        raise Stop("the new x-ui says %r, not %s" % (out[:80], norm(version)))
+    rc, out = run(xray, "version", timeout=20)
+    if rc:
+        raise Stop("the new Xray does not start: " + out[:200])
+    log("staged v%s (%s)" % (norm(version), out.splitlines()[0][:60]))
+    return new
+
+
+# ---------------------------------------------------------------- what runs
+def pids():
+    rc, main = run("systemctl", "show", "-p", "MainPID", "--value", "x-ui", timeout=10)
+    main = main.strip()
+    out = {main} if main and main != "0" else set()
+    for p in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open("/proc/%s/stat" % p) as f:
+                if f.read().rsplit(")", 1)[1].split()[1] == main:
+                    out.add(p)
+        except (OSError, IndexError):
+            pass
+    return out
+
+
+def xray_up():
+    for p in pids():
+        try:
+            if os.path.basename(os.readlink("/proc/%s/exe" % p)).startswith("xray"):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def ports():
+    """{"tcp:443", "udp:8443", ...} that x-ui and its children listen on."""
+    mine, got = pids(), set()
+    for proto, flag in (("tcp", "-Htlnp"), ("udp", "-Hulnp")):
+        rc, out = run("ss", flag, timeout=10)
+        for line in out.splitlines():
+            m = re.search(r"pid=(\d+)", line)
+            if m and m.group(1) in mine:
+                local = line.split()[3]
+                got.add("%s:%s" % (proto, local.rpartition(":")[2]))
+    return got
+
+
+def panel_answers():
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True, timeout=10)
+        s = dict(con.execute("select key, value from settings where key in ('webPort','webBasePath','webListen')").fetchall())
+        con.close()
+    except sqlite3.Error:
+        s = {}
+    port, base = s.get("webPort") or "2053", s.get("webBasePath") or "/"
+    for scheme in ("https", "http"):
+        rc, code = run("curl", "-sk", "-o", "/dev/null", "-m", "8", "-w", "%{http_code}",
+                       "%s://127.0.0.1:%s%s" % (scheme, port, base), timeout=15)
+        if code.strip() not in ("", "000"):
+            return True
+    return False
+
+
+def healthy(version, want_ports, wait=180):
+    """Up to `wait` s for: the version, active, Xray up, the panel answering, the ports back."""
+    end, why = time.time() + wait, "?"
+    while time.time() < end:
+        time.sleep(5)
+        rc, st = run("systemctl", "is-active", "x-ui", timeout=10)
+        if st.strip() != "active":
+            why = "x-ui " + st.strip()
+            continue
+        if norm(version) not in installed():
+            why = "version is %s" % installed()
+            continue
+        if not xray_up():
+            why = "Xray is not running"
+            continue
+        if not panel_answers():
+            why = "the panel does not answer"
+            continue
+        missing = want_ports - ports()
+        if missing:
+            why = "not listening: " + ", ".join(sorted(missing))
+            continue
+        return True, ""
+    return False, why
+
+
+# ---------------------------------------------------------------- backup and swap
+def backup_files(bk):
+    os.makedirs(bk, exist_ok=True)
+    with tarfile.open(bk + "/x-ui.tar", "w") as t:
+        t.add(XUI, arcname="x-ui", filter=lambda m: None if m.name.endswith((".log",)) else m)
+    for src in ("/usr/bin/x-ui", UNIT):
+        if os.path.exists(src):
+            shutil.copy2(src, bk + "/" + os.path.basename(src) + (".unit" if src == UNIT else ".cmd"))
+    log("backed up %s, /usr/bin/x-ui and the unit to %s" % (XUI, bk))
+
+
+def backup_db(bk):
+    """With x-ui stopped: one consistent copy, the WAL folded in."""
+    src = sqlite3.connect(DB, timeout=30)
+    dst = sqlite3.connect(bk + "/x-ui.db")
+    src.backup(dst)
+    dst.close()
+    src.close()
+    con = sqlite3.connect(bk + "/x-ui.db")
+    ok = con.execute("pragma integrity_check").fetchone()[0]
+    con.close()
+    if ok != "ok":
+        raise Stop("database backup failed its integrity check: " + ok)
+    log("database backed up (%d bytes)" % os.path.getsize(bk + "/x-ui.db"))
+
+
+def swap(new):
+    """The panel's update.sh steps: its files and binaries replaced, its leftovers removed,
+    data and the hub's own lists kept."""
+    a = arch()
+    run("pkill", "-f", "mtg-linux-[^ ]* run ")
+    run("pkill", "-f", r"tuic-server.*-c .*bin/tuic/tuic_[0-9]+\.json")
+    for f in ("x-ui", "x-ui.sh", "x-ui.service.debian", "x-ui.service.arch", "x-ui.service.rhel"):
+        if os.path.exists(os.path.join(new, f)):
+            shutil.copy2(os.path.join(new, f), os.path.join(XUI, f))
+    for f in ("bin/tuic-server",):
+        if os.path.exists(os.path.join(XUI, f)):
+            os.remove(os.path.join(XUI, f))
+    shutil.rmtree(XUI + "/bin/tuic", ignore_errors=True)
+    for f in os.listdir(new + "/bin"):
+        dst = os.path.join(BIN, f)
+        if KEEP_LISTS.match(f) and os.path.exists(dst):
+            continue                                  # xui-geo keeps these fresh
+        shutil.copy2(os.path.join(new, "bin", f), dst)
+    for f in ("x-ui", "bin/xray-linux-" + a, "bin/mtg-linux-" + a):
+        if os.path.exists(os.path.join(XUI, f)):
+            os.chmod(os.path.join(XUI, f), 0o755)
+    shutil.copy2(XUI + "/x-ui.sh", "/usr/bin/x-ui")
+    os.chmod("/usr/bin/x-ui", 0o755)
+    unit = XUI + "/x-ui.service.debian"
+    if os.path.exists(unit) and os.path.exists(UNIT):
+        if open(unit).read() != open(UNIT).read():
+            shutil.copy2(unit, UNIT)
+            log("x-ui.service updated from the release")
+    run("systemctl", "daemon-reload")
+    if os.path.exists(BIN + "/config.json"):
+        os.chmod(BIN + "/config.json", 0o640)
+    log("files replaced")
+
+
+def roll_back(bk):
+    log("rolling back from " + bk)
+    run("systemctl", "stop", "x-ui", timeout=60)
+    shutil.rmtree(XUI, ignore_errors=True)
+    with tarfile.open(bk + "/x-ui.tar") as t:
+        t.extractall(os.path.dirname(XUI))
+    for f in (DB + "-wal", DB + "-shm"):
+        if os.path.exists(f):
+            os.remove(f)
+    shutil.copy2(bk + "/x-ui.db", DB)
+    os.chmod(DB, 0o600)
+    if os.path.exists(bk + "/x-ui.cmd"):
+        shutil.copy2(bk + "/x-ui.cmd", "/usr/bin/x-ui")
+    if os.path.exists(bk + "/x-ui.service.unit"):
+        shutil.copy2(bk + "/x-ui.service.unit", UNIT)
+    run("systemctl", "daemon-reload")
+    run("systemctl", "start", "x-ui", timeout=60)
+
+
+# ---------------------------------------------------------------- the run
+def upgrade(version):
+    os.makedirs(WORK, exist_ok=True)
+    lock = WORK + "/lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        raise Stop("another run holds %s" % lock)
+    st = load(STATE, {})
+    result = {"version": norm(version), "at": int(time.time())}
+    paused = []
+    try:
+        old = installed()
+        result["from"] = old
+        if norm(version) == old:
+            result.update(ok=True, msg="already on v%s" % old)
+            log(result["msg"])
+            return result
+        if not os.path.exists(DB):
+            raise Stop("no SQLite database at %s (PostgreSQL panels are not handled)" % DB)
+        if shutil.disk_usage("/").free < 1 << 30:
+            raise Stop("less than 1 GB free")
+        log("=== upgrade %s -> v%s" % (old, norm(version)))
+        new = unpack(version)
+        want = ports()
+        log("listening now: " + ", ".join(sorted(want)))
+        if not xray_up():
+            raise Stop("Xray is not running before the upgrade; not touching a broken panel")
+        for u in PAUSE:
+            rc, s = run("systemctl", "is-active", u, timeout=10)
+            if s.strip() == "active":
+                run("systemctl", "stop", u, timeout=30)
+                paused.append(u)
+        log("paused: " + ", ".join(paused))
+        bk = "/var/backups/xui-upgrade-" + time.strftime("%Y%m%d-%H%M%S")
+        result["backup"] = bk
+        backup_files(bk)
+        t0 = time.time()
+        rc, out = run("systemctl", "stop", "x-ui", timeout=90)
+        if rc:
+            raise Stop("x-ui did not stop: " + out[-200:])
+        try:
+            backup_db(bk)
+        except Exception:
+            run("systemctl", "start", "x-ui", timeout=60)
+            raise
+        try:
+            swap(new)
+            run("systemctl", "start", "x-ui", timeout=90)
+            ok, why = healthy(version, want)
+        except Exception as e:
+            ok, why = False, "swap failed: %s" % e
+        result["down_s"] = round(time.time() - t0)
+        if ok:
+            result.update(ok=True, msg="x-ui %s -> v%s, users offline about %d s" % (old, norm(version), result["down_s"]))
+            log(result["msg"])
+            return result
+        log("NOT healthy: " + why)
+        roll_back(bk)
+        back, why2 = healthy(old, want, wait=120)
+        result.update(ok=False, rolled_back=True, msg="v%s was not healthy (%s); rolled back to %s - %s" %
+                      (norm(version), why, old, "running again" if back else "STILL NOT HEALTHY: " + why2))
+        log(result["msg"])
+        return result
+    except Stop as e:
+        result.update(ok=False, msg=str(e))
+        log("stopped: %s" % e)
+        return result
+    finally:
+        for u in paused:
+            run("systemctl", "start", u, timeout=30)
+        if paused:
+            log("resumed: " + ", ".join(paused))
+        if result.get("ok") and result.get("from") != result.get("version"):
+            run("config-guard", "--save", timeout=60)              # the migrated config is the baseline
+            run("systemctl", "start", "tunnel-guard.service", timeout=120)
+            rc, r = run("systemctl", "show", "tunnel-guard.service", "-p", "Result", "--value", timeout=10)
+            result["guard"] = r.strip()
+            rc, sc = run("xui-split", "check", "--json", timeout=60)
+            try:
+                probs = json.loads(sc).get("problems") or []
+                result["split_problems"] = [p.get("msg") for p in probs][:5]
+            except ValueError:
+                pass
+        st["last"] = result
+        save(STATE, st)
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+        shutil.rmtree(WORK + "/stage", ignore_errors=True)
+
+
+def report(r):
+    if r.get("ok") and r.get("from") == r.get("version"):
+        return "ℹ️ آپدیت پنل: از قبل روی نسخه‌ی %s است؛ کاری نشد." % r["version"]
+    if r.get("ok"):
+        extra = ""
+        if r.get("guard") and r["guard"] != "success":
+            extra += "\n⚠️ اجرای نگهبان تانل بعد از آپدیت: " + r["guard"]
+        if r.get("split_problems"):
+            extra += "\n⚠️ تقسیم mux: " + "؛ ".join(r["split_problems"])
+        return ("✅ پنل از %s به %s آپدیت شد. قطعی کاربران حدود %s ثانیه. همه‌ی پورت‌ها دوباره باز است.\nبکاپ: %s%s"
+                % (r.get("from"), r["version"], r.get("down_s"), r.get("backup"), extra))
+    if r.get("rolled_back"):
+        return "❌ آپدیت پنل به %s سالم بالا نیامد و به %s برگردانده شد.\n%s\nبکاپ: %s" % (
+            r["version"], r.get("from"), r["msg"], r.get("backup"))
+    return "❌ آپدیت پنل به %s انجام نشد (چیزی عوض نشد): %s" % (r["version"], r["msg"])
+
+
+# ---------------------------------------------------------------- scheduling
+def schedule(version, when):
+    rc, out = run("systemd-analyze", "calendar", when, timeout=10)
+    if rc:
+        raise Stop("systemd does not understand the time %r: %s" % (when, out[-200:]))
+    fetch(version)
+    exe = os.path.realpath(__file__)
+    with open("/etc/systemd/system/xui-upgrade.service", "w") as f:
+        f.write("[Unit]\nDescription=Update the 3x-ui panel to v%s (backed up, checked, rolled back on failure)\n"
+                "After=network-online.target\n\n[Service]\nType=oneshot\nExecStart=%s run %s --notify\n"
+                "TimeoutStartSec=1800\n" % (norm(version), exe, norm(version)))
+    with open("/etc/systemd/system/xui-upgrade.timer", "w") as f:
+        f.write("[Unit]\nDescription=One panel update at a set time\n\n[Timer]\nOnCalendar=%s\nPersistent=false\n"
+                "AccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n" % when)
+    run("systemctl", "daemon-reload")
+    rc, out = run("systemctl", "enable", "--now", "xui-upgrade.timer", timeout=30)
+    if rc:
+        raise Stop(out)
+    st = load(STATE, {})
+    st["scheduled"] = {"version": norm(version), "when": when}
+    save(STATE, st)
+    rc, nxt = run("systemctl", "show", "xui-upgrade.timer", "-p", "NextElapseUSecRealtime", "--value", timeout=10)
+    log("scheduled v%s for %s (next: %s)" % (norm(version), when, nxt.strip()))
+    return {"ok": True, "msg": "v%s scheduled for %s" % (norm(version), when), "next": nxt.strip()}
+
+
+def cancel():
+    run("systemctl", "disable", "--now", "xui-upgrade.timer", timeout=30)
+    for f in ("/etc/systemd/system/xui-upgrade.timer", "/etc/systemd/system/xui-upgrade.service"):
+        if os.path.exists(f):
+            os.remove(f)
+    run("systemctl", "daemon-reload")
+    st = load(STATE, {})
+    st.pop("scheduled", None)
+    save(STATE, st)
+    return {"ok": True, "msg": "nothing scheduled"}
+
+
+def status():
+    st = load(STATE, {})
+    rc, nxt = run("systemctl", "show", "xui-upgrade.timer", "-p", "NextElapseUSecRealtime", "--value", timeout=10)
+    return {"installed": installed(), "scheduled": st.get("scheduled"), "next": nxt.strip() or None,
+            "last": st.get("last")}
+
+
+def main(a):
+    js = "--json" in a
+    a = [x for x in a if x not in ("--json", "--notify")]
+    notify = "--notify" in sys.argv
+    if os.geteuid():
+        sys.exit("run as root")
+    try:
+        if a[:1] == ["fetch"] and len(a) == 2:
+            out = {"ok": True, "file": fetch(a[1])}
+        elif a[:1] == ["run"] and len(a) == 2:
+            out = upgrade(a[1])
+            if notify:                               # the scheduled run: report, and it is done
+                tell(report(out))
+                cancel()
+        elif a[:1] == ["schedule"] and len(a) == 3:
+            out = schedule(a[1], a[2])
+        elif a[:1] == ["cancel"]:
+            out = cancel()
+        elif a[:1] in (["status"], []):
+            out = status()
+        else:
+            print(__doc__)
+            return 2
+    except Stop as e:
+        out = {"ok": False, "msg": str(e)}
+        log("stopped: %s" % e)
+        if notify:
+            tell("❌ آپدیت پنل انجام نشد (چیزی عوض نشد): %s" % e)
+    print(json.dumps(out, ensure_ascii=False, indent=None if js else 1))
+    return 0 if out.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

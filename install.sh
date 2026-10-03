@@ -30,7 +30,7 @@ DEST=/usr/local/sbin
 TOOLS="xui-optimizer split/xui-split abroad/abroad-tune
        guard/tunnel-guard guard/config-guard guard/xui-path guard/xui-tunnel guard/xui-mtu guard/awg-hop guard/awg-port
        tools/mux-bench tools/xui-fix-inbound-lists tools/xui-probe-client tools/path-score
-       tools/xui-reach tools/xui-geo tools/xui-cert tools/xui-subpage tools/xui-route"
+       tools/xui-reach tools/xui-geo tools/xui-cert tools/xui-subpage tools/xui-route tools/xui-upgrade"
 UNITS="guard/tunnel-guard.service guard/tunnel-guard.timer
        guard/config-guard.service guard/config-guard.path guard/config-guard.timer
        guard/xui-tunnel.service guard/xui-tunnel.timer guard/xui-mtu.service guard/xui-mtu.timer

@@ -517,6 +517,20 @@ one list (merged), and the API/probe/DNS-upstream rules back at the top. Shown f
 a rule whose outbound is gone, a rule after every path's catch-all, a rule a tool's rule covers,
 a rule switched off.
 
+## xui-upgrade - unattended panel update
+
+    xui-upgrade schedule 3.9.0 "2026-10-04 04:00 Asia/Tehran"   # download + sha256 now, update once then
+    xui-upgrade run 3.9.0 | fetch 3.9.0 | status | cancel
+
+The release is downloaded ahead, checked against GitHub's sha256, and its binaries tried. At the
+set time the routing tools pause (so tunnel-guard does not take the restart for an outage), the
+listening ports are noted, /usr/local/x-ui, the x-ui command, the unit and the database (copied
+after x-ui stops) are backed up, and the panel's own update.sh steps are done (the Iran lists
+xui-geo keeps fresh are left alone). Within 3 minutes x-ui must run the new version with Xray up,
+the panel answering and every earlier port listening, or everything is restored from the backup.
+Then the tools resume, config-guard takes the new baseline, and Telegram gets the outcome.
+SQLite panels only.
+
 ## xui-mtu - MTU guard, both ends of every tunnel
 
 A tunnel whose MTU is larger than its path carries passes pings and small packets and loses
