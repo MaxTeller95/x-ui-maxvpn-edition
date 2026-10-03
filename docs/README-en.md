@@ -510,6 +510,13 @@ split, catch-alls, DNS cache, ad/QUIC/security blocks, heavy-upload moves) are r
 own can be added, edited, moved, switched off and deleted. Every change is xray-tested, backed up
 and put into the running Xray through its API.
 
+Order and clean-up (`xui-route tidy`, hourly with the page's "auto" switch, `xui-route.timer`):
+safe fixes only - your rules that an earlier rule of yours fully covers or that repeat one,
+inbound names that no longer exist, entries repeated in a list, neighbouring rules that differ in
+one list (merged), and the API/probe/DNS-upstream rules back at the top. Shown for you to decide:
+a rule whose outbound is gone, a rule after every path's catch-all, a rule a tool's rule covers,
+a rule switched off.
+
 ## xui-mtu - MTU guard, both ends of every tunnel
 
 A tunnel whose MTU is larger than its path carries passes pings and small packets and loses

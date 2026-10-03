@@ -1,0 +1,11 @@
+[Unit]
+Description=Tidy the routing rules every hour
+
+[Timer]
+OnBootSec=600
+OnActiveSec=600
+OnUnitActiveSec=3600
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

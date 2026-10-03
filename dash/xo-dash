@@ -1485,6 +1485,11 @@ def action(name, body):
             return {"ok": False, "msg": "نام نامعتبر"}
         _split_cache[0] = 0
         return jrun_any("xui-route", "assign", ib, ex, "--json", timeout=300) or {"ok": False, "msg": "انجام نشد"}
+    if name == "route-tidy":                     # the safe order / clean-up fixes, or the timer's switch
+        if "auto" in body:
+            return jrun_any("xui-route", "tidy", "auto", "on" if body.get("auto") else "off", "--json", timeout=30) \
+                or {"ok": False, "msg": "انجام نشد"}
+        return jrun_any("xui-route", "tidy", "--apply", "--json", timeout=120) or {"ok": False, "msg": "انجام نشد"}
     if name == "route-rule":                     # the operator's own rules: live, never a restart
         op = str(body.get("op") or "")
         if op not in ("add", "edit", "del", "move", "toggle"):

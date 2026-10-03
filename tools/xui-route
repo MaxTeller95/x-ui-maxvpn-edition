@@ -11,6 +11,10 @@
     xui-route rule del N SHA                delete it
     xui-route rule move N SHA up|down       one place up or down
     xui-route rule toggle N SHA             switch it on or off (the panel's "enabled")
+    xui-route tidy [--apply]                order and clean-up: what is dead, duplicated, merged, misplaced;
+                                            --apply makes the safe fixes (nothing a user reaches changes)
+    xui-route tidy --auto                   what the hourly timer runs: the safe fixes, when switched on
+    xui-route tidy auto on|off              the timer's switch
     options: --json
 
 Paths are kept apart by inbound: each inbound's users go to exactly one exit, through that
@@ -22,6 +26,15 @@ The rules the tools keep (probe ports, the split, the catch-alls, the DNS cache,
 security blocks, heavy-upload moves) are shown with their owner and are not edited here: their
 tool rebuilds them. Every other rule is yours. N and SHA come from `show` (SHA is the rule's
 fingerprint: a rule that changed since the page loaded is not touched).
+
+Order and clean-up (tidy) walks the rules the way Xray does. Safe, done by itself when the
+timer is on: a rule of yours an earlier rule of yours fully covers (it can never match) or that
+repeats one, inbound names that no longer exist (a rule left with none goes), entries repeated in
+a list, two neighbouring rules of yours that differ in one list only (merged), and the API,
+probe and DNS-upstream rules back at the top (each matches only its own inbound). Only shown,
+for you to decide, as they would change what users get: a rule whose outbound is gone (Xray
+drops what it matches), a rule after every path's catch-all (it reaches no user), a rule a
+tool's rule covers now, a rule switched off.
 
 Every change: the template is tested with xray -test, backed up, saved, accepted by config-guard
 and put into the running Xray through its API (xuilive) - never a restart.
@@ -153,7 +166,9 @@ def show():
         x["exit"] = w.get(x["tag"], "")
     guard = load("/var/lib/tunnel-guard/state.json", {})
     c = load(GUARD_CONF, {})
+    found, _ = analyze(t)
     return {"rules": rules, "inbounds": ib, "exits": exits(t), "primary": c.get("primary"),
+            "tidy": {"findings": found, "auto": load(ROUTE_CONF, {}).get("auto_tidy", False)},
             "failover": live_extra, "on": guard.get("on"),
             "outbounds": [{"tag": o.get("tag"), "protocol": o.get("protocol")} for o in t.get("outbounds", [])],
             "balancers": [b.get("tag") for b in (t["routing"].get("balancers") or [])],
@@ -318,6 +333,182 @@ def rule_op(op, args):
     backup = commit(t, old, "rule " + op)
     return {"ok": True, "msg": what + " (بدون ری‌استارت)", "backup": backup}
 
+# ---------------------------------------------------------------- order and clean-up
+
+ROUTE_CONF = "/etc/xui-optimizer/route.json"     # {"auto_tidy": true}
+LISTS = ("inboundTag", "domain", "ip", "protocol", "user", "source")
+
+
+def valid_inbounds(t):
+    """Inbound tags a rule can name: the panel's, the template's own (probe ports, api), the DNS
+    module's, the panel's egress."""
+    got = {x["tag"] for x in inbound_rows()} | {i.get("tag") for i in t.get("inbounds", [])}
+    return got | {"api", "dns-internal", "panel-egress", (t.get("dns") or {}).get("tag") or "dns-internal"}
+
+
+def covers(e, r):
+    """Every connection rule r matches, rule e (earlier) matches too: e names no condition r does
+    not have, and on each it allows at least what r asks for."""
+    for k in FIELDS:
+        if k not in e:
+            continue
+        if k not in r:
+            return False
+        a, b = e[k], r[k]
+        if k == "network":
+            if not set(str(b).split(",")) <= set(str(a).split(",")):
+                return False
+        elif isinstance(a, list) and isinstance(b, list):
+            if not set(b) <= set(a):
+                return False
+        elif a != b:
+            return False
+    return True
+
+
+def same_but_one(a, b):
+    """The one list field two rules differ in (everything else, target included, equal), or None."""
+    keys = set(a) | set(b)
+    diff = [k for k in keys if a.get(k) != b.get(k)]
+    if len(diff) == 1 and diff[0] in LISTS and isinstance(a.get(diff[0]), list) and isinstance(b.get(diff[0]), list):
+        return diff[0]
+    return None
+
+
+def analyze(t):
+    """Findings on the template's rules, in Xray's order: each says what is wrong, whether it is
+    safe to fix by itself (nothing a user can reach changes), and the fixed rule list."""
+    k, rules = kinds(t), t["routing"]["rules"]
+    bal = {b.get("tag") for b in (t["routing"].get("balancers") or [])}
+    valid = valid_inbounds(t)
+    users_in = {x["tag"] for x in inbound_rows() if x["enabled"]}
+    found, keep, caught, seen, at = [], [], set(), [], []
+    for i, r in enumerate(rules):
+        o = owner(r, k)
+        new = json.loads(json.dumps(r))
+        label = r.get("ruleTag") or "بی‌نام"
+        if r.get("enabled") is False:
+            if not o:
+                found.append({"i": i, "kind": "off", "safe": False, "tag": label,
+                              "msg": "خاموش است؛ کاری نمی‌کند (اگر لازم نیست، حذفش کنید)"})
+            keep.append(new)
+            at.append(i)
+            continue
+        for f in LISTS:                                   # the same entry twice in one list
+            if isinstance(new.get(f), list) and len(set(new[f])) != len(new[f]):
+                new[f] = list(dict.fromkeys(new[f]))
+                found.append({"i": i, "kind": "dup-entry", "safe": True, "tag": label,
+                              "msg": "در فهرست %s موارد تکراری داشت" % RT_NAMES.get(f, f)})
+        if new.get("inboundTag"):                         # inbounds that no longer exist
+            gone = [x for x in new["inboundTag"] if x not in valid]
+            if gone:
+                new["inboundTag"] = [x for x in new["inboundTag"] if x in valid]
+                found.append({"i": i, "kind": "gone-inbound", "safe": True, "tag": label,
+                              "msg": "اینباند(های) %s دیگر وجود ندارد%s" % ("، ".join(gone),
+                                                                        "؛ قانون خالی شد و حذف می‌شود" if not new["inboundTag"] else "")})
+                if not new["inboundTag"]:
+                    continue
+        to = new.get("outboundTag")
+        if to and to not in k and to != (t.get("api") or {}).get("tag", "api"):      # api: Xray's own service
+            found.append({"i": i, "kind": "no-outbound", "safe": False, "tag": label,
+                          "msg": "اوت‌باند %s وجود ندارد؛ Xray ترافیکی را که به این قانون بخورد دور می‌ریزد. "
+                                 "اوت‌باند را برگردانید یا قانون را حذف کنید" % to})
+        if new.get("balancerTag") and new["balancerTag"] not in bal:
+            found.append({"i": i, "kind": "no-outbound", "safe": False, "tag": label,
+                          "msg": "بالانسر %s وجود ندارد" % new["balancerTag"]})
+        m = {f: new[f] for f in FIELDS if f in new}
+        cover = next((e for e in seen if covers(e["m"], m)), None)
+        if cover and not o and cover["owner"]:
+            # a tool's rule covers it now; if that tool's rule goes (a feature switched off), this
+            # one would apply again - so it is reported, not removed
+            found.append({"i": i, "kind": "shadowed", "safe": False, "tag": label,
+                          "msg": "الان قانون %d («%s») جلوتر همه‌ی این ترافیک را می‌گیرد و این اجرا نمی‌شود" % (cover["i"], cover["owner"])})
+        elif cover and not o:
+            same = cover["to"] == (new.get("outboundTag") or new.get("balancerTag"))
+            found.append({"i": i, "kind": "dead", "safe": True, "tag": label,
+                          "msg": ("تکراریِ قانون %d است" if same and cover["m"] == m else
+                                  "قانون %d قبل از آن همه‌ی این ترافیک را می‌گیرد؛ هیچ‌وقت اجرا نمی‌شود") % cover["i"]
+                                 + " - حذف می‌شود"})
+            continue
+        if not o and not new.get("inboundTag") and users_in and users_in <= caught:
+            found.append({"i": i, "kind": "after-paths", "safe": False, "tag": label,
+                          "msg": "بعد از قانون اصلی همه‌ی مسیرهاست، پس به هیچ کاربری نمی‌رسد. اگر باید اعمال شود، "
+                                 "آن را بالاتر از قانون‌های مسیر ببرید (رفتار عوض می‌شود)"})
+        if catch_all(new, k):
+            caught |= set(new["inboundTag"])
+        seen.append({"i": i, "m": m, "to": new.get("outboundTag") or new.get("balancerTag"), "owner": o})
+        keep.append(new)
+        at.append(i)
+    # two neighbouring rules of yours that differ in one list only: one rule
+    merged, j = [], 0
+    while j < len(keep):
+        a = keep[j]
+        if j + 1 < len(keep) and not owner(a, k) and not owner(keep[j + 1], k) and a.get("enabled") is not False:
+            b = keep[j + 1]
+            f = same_but_one({x: y for x, y in a.items() if x != "ruleTag"}, {x: y for x, y in b.items() if x != "ruleTag"})
+            if f and (not b.get("ruleTag") or not a.get("ruleTag")):
+                c = dict(a)
+                c[f] = list(dict.fromkeys(a[f] + b[f]))
+                if b.get("ruleTag") and not a.get("ruleTag"):
+                    c["ruleTag"] = b["ruleTag"]
+                found.append({"i": at[j], "kind": "merge", "safe": True,
+                              "tag": a.get("ruleTag") or b.get("ruleTag") or "بی‌نام",
+                              "msg": "با قانون بعدی فقط در %s فرق داشت؛ یکی شدند" % RT_NAMES.get(f, f)})
+                merged.append(c)
+                j += 2
+                continue
+        merged.append(a)
+        j += 1
+    # the tools' fixed places: API first, probe ports next, the DNS cache's upstream after them
+    # (each matches only its own inbound, so moving them changes nothing else)
+    head = [r for r in merged if r.get("inboundTag") == ["api"]]
+    probes = [r for r in merged if (r.get("ruleTag") or "").startswith("guard-")]
+    dns = [r for r in merged if r.get("inboundTag") == ["dns-internal"] and not (r.get("outboundTag") or "").startswith("up~")]
+    rest = [r for r in merged if r not in head and r not in probes and r not in dns]
+    ordered = head + probes + dns + rest
+    if [json.dumps(r, sort_keys=True) for r in ordered] != [json.dumps(r, sort_keys=True) for r in merged]:
+        found.append({"i": None, "kind": "order", "safe": True, "tag": "",
+                      "msg": "قانون API، probeهای نگهبان و upstream کش DNS به بالای فهرست برگشتند (فقط اینباند خودشان را دارند)"})
+    return found, ordered
+
+
+RT_NAMES = {"inboundTag": "اینباندها", "domain": "دامنه‌ها", "ip": "IPها", "protocol": "پروتکل‌ها", "user": "کاربران",
+            "source": "IPهای مبدأ"}
+
+
+def tidy(apply=False, auto=False):
+    t = template()
+    old = json.loads(json.dumps(t))
+    found, fixed = analyze(t)
+    safe = [f for f in found if f["safe"]]
+    out = {"ok": True, "findings": found, "safe": len(safe), "auto": load(ROUTE_CONF, {}).get("auto_tidy", False)}
+    if auto and not out["auto"]:
+        return dict(out, msg="پاکسازی خودکار خاموش است")
+    if not apply:
+        out["msg"] = ("%d اصلاح امن آماده است" % len(safe) if safe else "اصلاح امنی لازم نیست") + \
+            ("؛ %d مورد تصمیم شما را می‌خواهد" % (len(found) - len(safe)) if len(found) > len(safe) else "")
+        return out
+    if not safe:
+        return dict(out, msg="اصلاح امنی لازم نیست")
+    if auto and subprocess.run(["systemctl", "is-active", "--quiet", "x-ui"]).returncode:
+        return dict(out, msg="x-ui در حال اجرا نیست")
+    t["routing"]["rules"] = fixed
+    out["backup"] = commit(t, old, "tidy")
+    out["msg"] = "%d اصلاح امن اعمال شد (بدون ری‌استارت): %s" % (len(safe), "، ".join(sorted({f["kind"] for f in safe})))
+    if auto:
+        subprocess.run(["logger", "-t", "xui-route", "tidy: " + "; ".join(f["msg"] for f in safe)[:900]])
+    return out
+
+
+def set_auto(on):
+    subprocess.run(["systemctl", "enable" if on else "disable", "--now", "xui-route.timer"], capture_output=True)
+    c = load(ROUTE_CONF, {})
+    c["auto_tidy"] = bool(on)
+    os.makedirs(os.path.dirname(ROUTE_CONF), exist_ok=True)
+    with open(ROUTE_CONF, "w") as f:
+        json.dump(c, f)
+    return {"ok": True, "msg": "پاکسازی خودکار قانون‌ها " + ("روشن شد (هر ساعت، فقط اصلاح‌های امن)" if on else "خاموش شد")}
+
 
 def main():
     args = sys.argv[1:]
@@ -340,6 +531,16 @@ def main():
             say(assign(args[1], args[2]))
         elif mode == "rule" and len(args) >= 2:
             say(rule_op(args[1], args[2:]))
+        elif mode == "tidy":
+            if len(args) >= 3 and args[1] == "auto":
+                return say(set_auto(args[2] == "on"))
+            d = tidy(apply="--apply" in args or "--auto" in args, auto="--auto" in args)
+            if as_json:
+                return print(json.dumps(d, ensure_ascii=False))
+            for f in d["findings"]:
+                print("%s %-4s %-12s %-22s %s" % ("safe" if f["safe"] else "ask ", f["i"] if f["i"] is not None else "-",
+                                                f["kind"], f["tag"], f["msg"]))
+            print(d["msg"])
         else:
             print(__doc__)
             sys.exit(2)

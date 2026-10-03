@@ -394,6 +394,7 @@
       <div class="card wide">
         <h2>قانون‌ها <span class="muted" id="rt-count"></span>
           <span><button id="rt-add" class="primary">+ قانون تازه</button></span></h2>
+        <div id="rt-tidy"></div>
         <div id="rt-edit"></div>
         <div id="rt-fo"></div>
         <div id="rt-rules" class="muted">...</div>
@@ -1169,7 +1170,23 @@ function renderRoute(v) {
         → <b dir="ltr">${esc(r.to)}</b>${r.balancer ? ' <span class="muted sm">(بالانسر)</span>' : ""}${r.enabled ? "" : ' <span class="chip off">خاموش</span>'}
         <div class="m">${rtMatch(r.match)}</div></div>
       <div class="acts">${r.mine ? `<button data-rtop="move" data-dir="up" data-i="${r.i}" data-sha="${r.sha}" title="بالاتر">▲</button><button data-rtop="move" data-dir="down" data-i="${r.i}" data-sha="${r.sha}" title="پایین‌تر">▼</button><button data-rtop="toggle" data-i="${r.i}" data-sha="${r.sha}" title="خاموش/روشن">⏻</button><button data-rtop="edit" data-i="${r.i}" data-sha="${r.sha}" title="ویرایش">✎</button><button data-rtop="del" data-i="${r.i}" data-sha="${r.sha}" title="حذف">×</button>` : "خودکار"}</div></div>`).join("");
+  renderRtTidy();
   renderRtEdit();
+}
+const TIDY_KIND = { dead: "اجرا نمی‌شود", "dup-entry": "مورد تکراری", "gone-inbound": "اینباند حذف‌شده", merge: "یکی‌کردن",
+  order: "ترتیب", "no-outbound": "اوت‌باند نیست", "after-paths": "بعد از مسیرها", shadowed: "پوشیده", off: "خاموش" };
+function renderRtTidy() {
+  const td = RT.tidy || { findings: [] }, f = td.findings || [], safe = f.filter((x) => x.safe), ask = f.filter((x) => !x.safe);
+  $("#rt-tidy").innerHTML = `<div class="rt-form" style="border-color:var(--line)">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><b>ترتیب و پاکسازی</b>
+      ${!f.length ? '<span class="chip ok">همه‌چیز مرتب است</span>' : ""}
+      ${safe.length ? `<span class="chip warn">${safe.length} اصلاح امن</span><button class="primary" id="rt-tidy-go">اعمال اصلاح‌های امن</button>` : ""}
+      ${ask.length ? `<span class="chip">${ask.length} مورد برای تصمیم شما</span>` : ""}
+      <span class="mini" style="margin-inline-start:auto" title="هر ساعت فقط اصلاح‌های امن، بدون ری‌استارت"><label class="switch"><input type="checkbox" id="rt-tidy-auto" ${td.auto ? "checked" : ""}><span></span></label>خودکار</span></div>
+    ${f.map((x) => `<div class="sm"><span class="chip ${x.safe ? "accent" : ""}">${TIDY_KIND[x.kind] || x.kind}</span>
+      ${x.i != null ? `قانون ${x.i} <b dir="ltr">${esc(x.tag)}</b>: ` : ""}${esc(x.msg)}${x.safe ? "" : ' <span class="muted">(دستی)</span>'}</div>`).join("")}
+    <div class="muted sm">اصلاح امن یعنی چیزی که به کاربر می‌رسد عوض نمی‌شود: قانونی که هیچ‌وقت اجرا نمی‌شود یا تکراری است حذف، اینباندهای
+      حذف‌شده پاک، موارد تکراری و قانون‌های هم‌شکل یکی، و قانون‌های API/probe/DNS به بالا. بقیه را خودتان با دکمه‌های هر قانون تصمیم بگیرید.</div></div>`;
 }
 function renderRtEdit() {
   const el = $("#rt-edit");
@@ -1312,6 +1329,13 @@ document.addEventListener("click", async (e) => {
   }
   const w = e.target.closest("[data-probe]");
   if (w) { document.querySelector('nav.tabs button[data-tab="users"]').click(); probeUser(w.dataset.probe); return; }
+  if (e.target.id === "rt-tidy-go") {
+    e.target.disabled = true; toast("در حال اعمال...");
+    const r = await post("route-tidy", {});
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadRoute();
+    return;
+  }
   if (e.target.id === "rt-add") { RTEDIT = { i: null, rule: { type: "field" } }; renderRtEdit(); return; }
   const ro = e.target.closest("[data-rtop]");
   if (ro) {
@@ -1554,6 +1578,12 @@ $("#mux-run").onclick = async () => {
   muxPoll();
 };
 document.addEventListener("change", async (e) => {
+  if (e.target.id === "rt-tidy-auto") {
+    const r = await post("route-tidy", { auto: e.target.checked });
+    toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+    loadRoute();
+    return;
+  }
   if (e.target.dataset && e.target.dataset.rtassign) {
     const ib = e.target.dataset.rtassign, ex = e.target.value;
     const was = ((RT && RT.inbounds) || []).find((x) => x.tag === ib) || {};

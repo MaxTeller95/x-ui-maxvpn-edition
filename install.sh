@@ -35,8 +35,9 @@ UNITS="guard/tunnel-guard.service guard/tunnel-guard.timer
        guard/config-guard.service guard/config-guard.path guard/config-guard.timer
        guard/xui-tunnel.service guard/xui-tunnel.timer guard/xui-mtu.service guard/xui-mtu.timer
        tools/xui-reach.service tools/xui-reach.timer tools/xui-geo.service tools/xui-geo.timer
-       tools/xui-subpage.service tools/xui-subpage.path split/xui-split-tune.service split/xui-split-tune.timer"
-TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer xui-mtu.timer xui-reach.timer xui-geo.timer xui-subpage.path xui-split-tune.timer"
+       tools/xui-subpage.service tools/xui-subpage.path split/xui-split-tune.service split/xui-split-tune.timer
+       tools/xui-route.service tools/xui-route.timer"
+TIMERS="tunnel-guard.timer config-guard.path config-guard.timer xui-tunnel.timer xui-mtu.timer xui-reach.timer xui-geo.timer xui-subpage.path xui-split-tune.timer xui-route.timer"
 
 red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 inf() { printf '\033[36m==>\033[0m %s\n' "$*"; }

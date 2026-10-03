@@ -1,0 +1,8 @@
+[Unit]
+Description=Routing rules: the safe order and clean-up fixes (when switched on)
+After=x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xui-route tidy --auto
+TimeoutStartSec=300
