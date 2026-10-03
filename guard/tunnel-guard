@@ -98,9 +98,22 @@ def fetch(port, url, t=8):
 
 
 def handshake_age(iface):
-    r = run("awg", "show", iface, "latest-handshakes")
-    ts = [int(x.split()[1]) for x in r.stdout.splitlines() if len(x.split()) == 2]
-    return int(time.time()) - max(ts) if ts and max(ts) else 10 ** 6
+    # AmneziaWG interfaces answer to `awg`; plain WireGuard ones only to `wg` (awg: "Operation not supported")
+    for tool in ("awg", "wg"):
+        r = run(tool, "show", iface, "latest-handshakes")
+        ts = [int(x.split()[1]) for x in r.stdout.splitlines() if len(x.split()) == 2]
+        if r.returncode == 0 and ts:
+            return int(time.time()) - max(ts) if max(ts) else 10 ** 6
+    return 10 ** 6
+
+
+def quick_unit(iface):
+    """The systemd unit that really owns IFACE: awg-quick@ for AmneziaWG, wg-quick@ for plain WireGuard."""
+    if os.path.exists(f"/etc/amnezia/amneziawg/{iface}.conf"):
+        return f"awg-quick@{iface}"
+    if os.path.exists(f"/etc/wireguard/{iface}.conf"):
+        return f"wg-quick@{iface}"
+    return f"awg-quick@{iface}"
 
 
 def is_local(host):
@@ -423,8 +436,8 @@ def main():
         if iface and r["hs"] > HANDSHAKE_STALE and now - st["restart"].get(iface, 0) > RESTART_COOLDOWN:
             st["restart"][iface] = now
             run("systemctl", "try-restart", f"wstunnel-{iface}.service", timeout=30)  # AWG over TCP, if used
-            run("systemctl", "restart", f"awg-quick@{iface}", timeout=30)
-            log(f"{iface}: handshake {r['hs']}s old, restarted awg-quick@{iface}")
+            run("systemctl", "restart", quick_unit(iface), timeout=30)
+            log(f"{iface}: handshake {r['hs']}s old, restarted {quick_unit(iface)}")
             if not st["restart_told"].get(n):   # once per outage; the rest go to the log only
                 st["restart_told"][n] = now
                 send(f"🔄 تانل {iface} ({n}) handshake نداشت ({r['hs']}s) — ری‌استارت شد.\n"
