@@ -1077,7 +1077,9 @@ def checkup():
 
     def dns():
         if not any(o.get("protocol") == "dns" for o in cfg.get("outbounds", [])):
-            return add("warn", "کش DNS", "روشن نیست", "با دستور xui-optimizer روشن می‌شود.")
+            return add("warn", "کش DNS", "روشن نیست",
+                       "DNS کاربرها روی همین هاب جواب داده می‌شود و فقط دامنه‌های تازه از راه تانل پرسیده می‌شوند؛ "
+                       "با دکمه روشن می‌شود (Xray یک بار ری‌استارت می‌شود، چند ثانیه).", "dns-cache")
         port, extra = ports.get(c.get("primary")), ""
         if port:
             r = probe_https(port, "https://1.1.1.1/dns-query?name=example.com&type=A")
@@ -1301,6 +1303,13 @@ def action(name, body):
     if name == "steer":
         rc, out = run("xui-tunnel", "steer", "on" if body.get("on") else "off", timeout=20)
         return {"ok": rc == 0, "msg": "جابجایی آپلودهای سنگین " + ("روشن شد" if body.get("on") else "خاموش شد")}
+    if name in ("dns-cache", "dns-cache-off"):    # the dns block is not live: Xray restarts once (the page asks)
+        on = name == "dns-cache" if "on" not in body else bool(body.get("on"))
+        rc, out = run("xui-optimizer", "--dns", "on" if on else "off", timeout=150)
+        lines = [l for l in out.splitlines() if l.strip()]
+        msg = next((l for l in lines if l.startswith("DNS cache") or "already" in l), lines[-1] if lines else "")
+        return {"ok": rc == 0, "msg": ("کش DNS روشن شد" if on else "کش DNS خاموش شد") if rc == 0 and "already" not in msg
+                else msg}
     if name == "dns-fast":  # restarts x-ui: the page asks first
         rc, out = run("xui-optimizer", "--dns-fast", "on" if body.get("on") else "off", timeout=150)
         lines = [l for l in out.splitlines() if l.strip()]

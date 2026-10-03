@@ -12,6 +12,9 @@ to a proxy outbound (another server, usually through a tunnel):
     xui-optimizer --quic block|allow  refuse QUIC (UDP 443) for users: YouTube, Instagram and
                                 browsers fall back to HTTPS over TCP within a second, which inside
                                 a TCP tunnel is usually faster and steadier than UDP carried in it
+    xui-optimizer --dns on|off  only the DNS cache: users' DNS answered by Xray here, misses by DoH
+                                through the main path; the ad block, QUIC block and every other rule
+                                stay as they are (what the Optimizer page's button and switch run)
     xui-optimizer --dns-fast on|off  only the DNS cache's behaviour: answer from an expired entry
                                 at once and refresh it behind the scenes (serveStale, up to an
                                 hour), and ask both DoH servers together, taking the faster
@@ -277,6 +280,70 @@ def dns_fast(db_path, on, restart=True, dry=False):
     print(f"backup in {backup}")
 
 
+def is_dns_rule(r):
+    return (r.get("inboundTag") == [DNS_TAG] or r.get("outboundTag") == "dns-out"
+            or r.get("ruleTag") == f"{TAG}-dns-cache")
+
+
+def dns_only(db_path, on, restart=True, dry=False):
+    """Add or take out the DNS cache alone (the dns block, the dns-out outbound, its two rules).
+    A full run would also rebuild the ad block and drop the QUIC and security rules."""
+    db = xuidb.connect(db_path)
+    tpl = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    old = json.loads(json.dumps(tpl))
+    has = (tpl.get("dns") or {}).get("tag") == DNS_TAG and any(o.get("tag") == "dns-out" for o in tpl["outbounds"])
+    if on and has:
+        print("DNS cache is already on")
+        return
+    if not on and not has and not any(is_dns_rule(r) for r in tpl["routing"]["rules"]):
+        print("DNS cache is already off")
+        return
+    if on and tpl.get("dns") and tpl["dns"].get("tag") != DNS_TAG:
+        die("the template already has its own 'dns' section; it is left alone")
+    fast = {k: (tpl.get("dns") or {}).get(k, v) for k, v in DNS_FAST.items()}     # keep a fast-mode choice
+    tpl["routing"]["rules"] = [r for r in tpl["routing"]["rules"] if not is_dns_rule(r)]
+    tpl["outbounds"] = [o for o in tpl["outbounds"] if o.get("tag") != "dns-out"]
+    tpl.pop("dns", None)
+    via = []
+    if on:
+        abroad, dns_via, _ = plan(tpl, None)
+        via = sorted(ib for ib, ob in abroad.items() if ob == dns_via)
+        if not via:
+            die(f"no inbound is routed to {dns_via}, so the DNS cache would serve nobody")
+        tpl["dns"] = dict({"tag": DNS_TAG, "queryStrategy": "UseIP", "servers": DOH}, **fast)
+        tpl["outbounds"].append({"tag": "dns-out", "protocol": "dns", "settings": {"nonIPQuery": "reject"}})
+        rules = tpl["routing"]["rules"]
+        at = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
+        # "dns-upstream" is the name xui-split, tunnel-guard (failover) and config-guard use
+        rules[at:at] = xuimix.point([{"type": "field", "ruleTag": "dns-upstream", "inboundTag": [DNS_TAG], "outboundTag": dns_via},
+                                     {"type": "field", "ruleTag": f"{TAG}-dns-cache", "inboundTag": via, "port": "53",
+                                      "outboundTag": "dns-out"}], tpl)
+    with open(f"{BIN}/config.json") as f:
+        cfg = json.load(f)
+    cfg.update({k: v for k, v in tpl.items() if k != "inbounds"})
+    if not on:
+        cfg.pop("dns", None)
+    xray_test(cfg)
+    if dry:
+        print("dry run - xray: Configuration OK; would turn the DNS cache %s%s"
+              % ("on for: " if on else "off", ", ".join(via)))
+        return
+    backup = f"/root/xui-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    os.makedirs(backup)
+    db.close()
+    backup_db(db_path, backup)
+    shutil.copy2(f"{BIN}/config.json", backup)
+    db = xuidb.connect(db_path)
+    db.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, indent=2),))
+    db.commit()
+    db.close()
+    accept_in_config_guard()
+    if restart:                                          # the dns block is not live in Xray: Xray alone restarts
+        print("xray: " + into_xray(tpl, old, []))
+    print(("DNS cache on for: %s" % ", ".join(via)) if on else "DNS cache off")
+    print(f"backup in {backup}")
+
+
 def accept_in_config_guard():
     """This tool removed or renamed tagged rules on purpose: make that config-guard's new
     baseline, or it would put them straight back (it watches config.json)."""
@@ -310,6 +377,7 @@ def main():
     ap.add_argument("--no-restart", action="store_true")
     ap.add_argument("--adblock", choices=("on", "off"), help="only switch the ad block")
     ap.add_argument("--quic", choices=("block", "allow"), help="only switch the QUIC (UDP 443) block")
+    ap.add_argument("--dns", choices=("on", "off"), help="only switch the DNS cache")
     ap.add_argument("--dns-fast", choices=("on", "off"), help="only switch the DNS cache's fast mode")
     a = ap.parse_args()
 
@@ -322,6 +390,8 @@ def main():
         return adblock_only(a.db, a.adblock == "on", not a.no_restart, a.dry_run)
     if a.quic:
         return toggle("quic", a.db, a.quic == "block", not a.no_restart, a.dry_run)
+    if a.dns:
+        return dns_only(a.db, a.dns == "on", not a.no_restart, a.dry_run)
     if a.dns_fast:
         return dns_fast(a.db, a.dns_fast == "on", not a.no_restart, a.dry_run)
 

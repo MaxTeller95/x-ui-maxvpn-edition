@@ -378,6 +378,11 @@
           <label class="switch"><input type="checkbox" id="ads"><span></span></label>
         </div>
         <div class="row">
+          <div>کش DNS<div class="muted">DNS کاربرها روی همین هاب جواب داده می‌شود؛ فقط دامنه‌های تازه با DoH از راه مسیر اصلی پرسیده
+            می‌شوند. باز شدن صفحه‌ها سریع‌تر و بدون نشت DNS. روشن/خاموش کردن، Xray را یک بار ری‌استارت می‌کند.</div></div>
+          <label class="switch"><input type="checkbox" id="dnscache"><span></span></label>
+        </div>
+        <div class="row">
           <div>DNS سریع<div class="muted">جواب تکراری از کش، حتی اگر مهلتش گذشته باشد، فوری داده می‌شود و پشت صحنه تازه می‌شود؛
             هر دو سرور DoH همزمان پرسیده می‌شوند. هر بار که یک دامنه‌ی پرکاربرد منقضی می‌شود ۱۰۰ تا ۴۰۰ میلی‌ثانیه صرفه‌جویی</div></div>
           <label class="switch"><input type="checkbox" id="dnsfast"><span></span></label>
@@ -695,6 +700,7 @@ function renderStatus(s) {
       + (gf.age_days > 14 ? " — قدیمی است" : "");
   if (!$("#sec").disabled) $("#sec").checked = !!geo.security;
   if (!$("#quic").disabled) $("#quic").checked = !!s.features.quic_block;
+  if (!$("#dnscache").disabled) $("#dnscache").checked = !!s.features.dns_cache;
   if (!$("#dnsfast").disabled) { $("#dnsfast").checked = !!s.features.dns_fast; $("#dnsfast").closest(".row").hidden = !s.features.dns_cache; }
   const q = s.features.quic || {};
   $("#quic-share").textContent = !q.total ? "" : s.features.quic_block
@@ -821,7 +827,7 @@ function renderCheckup(c) {
   $("#checks").innerHTML = c.checks.map((x) => `<div class="check"><span class="dot ${x.level}"></span><div>
     <b>${esc(x.title)}</b> — ${esc(x.detail)}
     ${x.hint ? `<div class="muted">${esc(x.hint)}</div>` : ""}
-    ${x.fix ? `<button data-fix="${esc(x.fix)}" style="margin-top:6px">${x.fix === "kernel-fix" || x.fix === "kernel-all" ? "اعمال و ثبت دائم" : "تعمیر کن"}</button>` : ""}</div></div>`).join("");
+    ${x.fix ? `<button data-fix="${esc(x.fix)}" style="margin-top:6px">${x.fix === "kernel-fix" || x.fix === "kernel-all" ? "اعمال و ثبت دائم" : x.fix === "dns-cache" ? "روشن کن" : "تعمیر کن"}</button>` : ""}</div></div>`).join("");
   try { localStorage.setItem("xo-checkup", JSON.stringify(c)); } catch (e) {}
 }
 
@@ -1310,6 +1316,7 @@ document.addEventListener("click", async (e) => {
     const cg = f.dataset.fix === "confguard-fix";
     if (!confirm(cg ? "قانون‌های گم‌شده برمی‌گردند و x-ui ری‌استارت می‌شود (چند ثانیه قطعی). ادامه؟"
                     : f.dataset.fix === "kernel-fix" ? "تنظیم‌های TCP کرنل همین حالا اعمال و در /etc/sysctl.d ذخیره می‌شوند تا بعد از ریبوت هم بمانند. ری‌استارت لازم نیست و کاربرها قطع نمی‌شوند. ادامه؟"
+                    : f.dataset.fix === "dns-cache" ? "کش DNS روشن بشه؟ فقط بخش DNS اضافه می‌شه، بقیه‌ی قانون‌ها دست نمی‌خورن، قبلش بکاپ گرفته می‌شه و Xray یک بار ری‌استارت می‌شه (چند ثانیه). ادامه؟"
                     : f.dataset.fix === "kernel-all" ? "تنظیم‌های TCP کرنل روی این هاب و همه‌ی سرورهای خارجی که کلید SSH هاب را دارند، فقط جایی که لازم است، اعمال و در /etc/sysctl.d ذخیره می‌شوند. ری‌استارت لازم نیست و کاربرها قطع نمی‌شوند. ادامه؟"
                     : f.dataset.fix === "split-fix" ? "اوت‌باند mux و قانون‌های تقسیم بررسی و تعمیر می‌شوند. اگر فقط اوت‌باند خراب باشد بدون ری‌استارت، وگرنه با ری‌استارت x-ui. قبلش بکاپ گرفته می‌شود. ادامه؟"
                     : "قبل از تعمیر بکاپ گرفته می‌شود. ادامه؟")) return;
@@ -1317,7 +1324,8 @@ document.addEventListener("click", async (e) => {
     const r = await post(f.dataset.fix);
     toast(r.ok ? (r.msg || "تعمیر شد") : "خطا: " + (r.msg || ""));
     if (cg || f.dataset.fix === "split-fix") { loadCG(); loadStatus(); }
-    if ((f.dataset.fix === "kernel-fix" || f.dataset.fix === "kernel-all") && r.ok) $("#run-checkup") && $("#run-checkup").click();
+    if ((f.dataset.fix === "kernel-fix" || f.dataset.fix === "kernel-all" || f.dataset.fix === "dns-cache") && r.ok) $("#run-checkup") && $("#run-checkup").click();
+    if (f.dataset.fix === "dns-cache") loadStatus();
     loadLint();
     return;
   }
@@ -1438,6 +1446,17 @@ $("#geo-update").onclick = async (e) => {
   const r = await post("geo-update");
   e.target.disabled = false;
   toast(r.ok ? r.msg : "خطا: " + (r.msg || ""));
+  loadStatus();
+};
+$("#dnscache").onchange = async (e) => {
+  const on = e.target.checked;
+  if (!confirm((on ? "کش DNS روشن بشه؟" : "کش DNS خاموش بشه؟") + " فقط بخش DNS عوض می‌شه، قبلش بکاپ گرفته می‌شه و Xray یک بار ری‌استارت می‌شه (چند ثانیه).")) {
+    e.target.checked = !on; return;
+  }
+  e.target.disabled = true; toast("در حال اعمال...");
+  const r = await post("dns-cache", { on });
+  e.target.disabled = false;
+  toast(r.ok ? (r.msg || "انجام شد") : "خطا: " + (r.msg || ""));
   loadStatus();
 };
 $("#dnsfast").onchange = async (e) => {

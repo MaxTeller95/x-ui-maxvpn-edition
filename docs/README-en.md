@@ -137,7 +137,9 @@ and up to 379 ms; a cached one 0.1 ms. Popular domains carry 1-5 minute TTLs, so
 miss over and over. Fast mode answers an expired entry at once for up to an hour while Xray
 refreshes it in the background (`serveStale`, `serveExpiredTTL: 3600`), and asks both DoH servers
 together, taking the faster (`enableParallelQuery`). `xui-optimizer --dns-fast on|off` switches
-only the dns block (backup, one restart); a new DNS cache starts in fast mode.
+only the dns block (backup, one restart); a new DNS cache starts in fast mode. `xui-optimizer
+--dns on|off` adds or takes out the DNS cache alone, leaving the ad block, QUIC and security rules
+as they are (the Optimizer page's switch and check-up button).
 
 ## xui-split - mux only where it helps
 
